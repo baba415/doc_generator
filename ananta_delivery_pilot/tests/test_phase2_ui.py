@@ -91,6 +91,10 @@ class Phase2UiRouteTests(unittest.TestCase):
         )
         try:
             _wait_for_route(port, "/v2/portfolio")
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as response:
+                self.assertEqual(200, response.status)
+                root_body = response.read().decode("utf-8")
+                self.assertIn("Phase 2 (Ledger UI)", root_body)
             routes = [
                 "/v2/portfolio",
                 "/v2/intake",

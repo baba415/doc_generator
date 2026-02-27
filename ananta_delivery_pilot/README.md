@@ -57,6 +57,12 @@ Open:
 - `http://127.0.0.1:8865/v2/intake`
 - `http://127.0.0.1:8865/v2/exceptions`
 
+UI route smoke test:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m unittest -v tests.test_phase2_ui
+```
+
 ### Primary UI flow
 
 1. **Intake** (`/v2/intake`)  

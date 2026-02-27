@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+"""Phase 2 workflow-first UI routes.
+
+Primary orchestration flow:
+  /v2/intake -> /v2/contracts/{id}/plan -> /v2/contracts/{id}/execute -> /v2/contracts/{id}/settle
+Global helper pages:
+  /v2/portfolio and /v2/exceptions
+"""
+
 import cgi
 import datetime as dt
 import html
