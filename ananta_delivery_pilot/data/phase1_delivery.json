@@ -1,0 +1,15 @@
+{
+  "contract_id": "__SET_CONTRACT_ID__",
+  "line_no": 1,
+  "delivery_ref": "DLV-2026-001",
+  "run_id": "RUN-20260223-01",
+  "batch_id": "AFL-RBDSO-20260223-01",
+  "delivery_date": "2026-02-23",
+  "delivered_qty": 30000.0,
+  "unit": "kgs",
+  "unit_price": 2270.0,
+  "truck_no": "T28162LA",
+  "driver_name": "Idowu Atanda",
+  "driver_phone": "08052803019",
+  "notes": "Phase 1 sample delivery"
+}

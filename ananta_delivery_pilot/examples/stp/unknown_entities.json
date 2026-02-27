@@ -1,0 +1,19 @@
+{
+  "lpo_no": "STP-UNKNOWN-001",
+  "issue_date": "2026-02-25",
+  "buyer_name": "NYCL LTD",
+  "vendor_of_record_name": "Anata Flowz",
+  "source_name": "Unknown Supplier Node",
+  "processor_name": "Partner Refinary",
+  "product_code": "RBDSO",
+  "expected_qty": 30000,
+  "unit": "kgs",
+  "unit_price": 2270,
+  "delivery_date": "2026-02-25",
+  "delivered_qty": 30000,
+  "allow_placeholder_tin": true,
+  "skip_pdf": true,
+  "coa_results": [
+    {"parameter": "Appearance", "result": "PASS"}
+  ]
+}

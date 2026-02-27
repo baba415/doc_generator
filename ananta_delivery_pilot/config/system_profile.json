@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "operator_entity_id": "guildgate",
+  "default_use_collection_account": true,
+  "collection_account": {
+    "bank_name": "BANK_PENDING",
+    "account_name": "Guildgate Global Ventures Ltd (Collections)",
+    "account_number": "0510572090",
+    "currency": "NGN"
+  },
+  "collection_notice_template": "Payments made to {operator_name} are received strictly as Collection Agent for {vendor_of_record_name} in respect of the referenced invoice(s) and will be applied according to the settlement waterfall.",
+  "assets": {
+    "logo_path": "assets/primary_logo.svg",
+    "seal_path": "assets/company_seal.png",
+    "signature_path": null
+  },
+  "features": {
+    "allow_vendor_on_behalf_generation": false,
+    "allow_mode_c_supplier_draft": true
+  }
+}
+

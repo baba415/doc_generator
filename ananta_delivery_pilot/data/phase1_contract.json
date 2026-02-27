@@ -1,0 +1,24 @@
+{
+  "contract_ref": "LPO-2026-001",
+  "lpo_no": "202570410",
+  "lpo_date": "2026-01-30",
+  "buyer_id": "buyer_nycil",
+  "vendor_of_record_id": "ananta_flows",
+  "operator_id": "guildgate",
+  "source_id": "ananta_flows",
+  "processor_id": "processor_partner_refinery",
+  "currency": "NGN",
+  "issue_date": "2026-02-23",
+  "due_date": "2026-03-09",
+  "due_terms": "14 days",
+  "expected_total_qty": 30000.0,
+  "lines": [
+    {
+      "product_code": "RBDSO",
+      "description": "Processing and supply of RBDSO linked to RUN-20260223-01",
+      "expected_qty": 30000.0,
+      "unit": "kgs",
+      "unit_price": 2270.0
+    }
+  ]
+}

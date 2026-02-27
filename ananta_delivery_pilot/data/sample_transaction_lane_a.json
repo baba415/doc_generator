@@ -1,0 +1,64 @@
+{
+  "invoice_date": "2026-02-23",
+  "due_date": "2026-03-09",
+  "currency": "NGN",
+  "payment_terms": "14 days",
+  "lpo_no": "202570410",
+  "lpo_date": "2026-01-30",
+  "mode": "normal_trade",
+  "funding_mode": "none",
+  "agreement_ref": "GGV-SUPPLY-2026-001",
+  "order_type": "Raw Materials",
+  "order_sub_type": "Refined Oil",
+  "product_name": "Refined Bleached Deodorized Soya Oil",
+  "product_code": "RBDSO",
+  "batch_id": "AFL-RBDSO-20260223-01",
+  "run_id": "RUN-20260223-01",
+  "manufacture_date": "2026-02-23",
+  "expiry_date": "2027-02-22",
+  "delivery_terms": "DAP",
+  "packaging": "Bulk",
+  "truck_no": "T28162LA",
+  "driver_name": "Idowu Atanda",
+  "driver_phone": "08052803019",
+  "buyer_id": "buyer_nycil",
+  "processor_id": "processor_partner_refinery",
+  "vendor_of_record_id": "guildgate",
+  "source_id": "ananta_flows",
+  "use_collection_account": true,
+  "buyer": {
+    "name": "NYCIL LIMITED",
+    "address": "Plot 5-8, Ogun State Housing Corporation Industrial Estate KM6, Idiroko Rd, Ota",
+    "contact_person": "OLUWASEUN OKE"
+  },
+  "ship_to": {
+    "name": "NYCIL LIMITED",
+    "address": "Plot 5-8, Ogun State Housing Corporation Industrial Estate KM6, Idiroko Rd, Ota",
+    "contact_person": "OLUWASEUN OKE"
+  },
+  "processor": {
+    "name": "Partner Refinery Ltd",
+    "address": "Ibadan, Oyo State",
+    "contact_person": "Operations Team"
+  },
+  "line_items": [
+    {
+      "description": "Supply of RBDSO linked to RUN-20260223-01",
+      "quantity": 30000,
+      "unit": "kgs",
+      "unit_price": 2270,
+      "amount": 68100000,
+      "tax_class": "agri_input"
+    }
+  ],
+  "transport_charges": 0,
+  "installation_charges": 0,
+  "vat_rate": 0,
+  "discount": 0,
+  "wht_rate": 0,
+  "wht_applicable": false,
+  "vat_exemption_reason": "Configured as exempt supply class for pilot. Validate with finance.",
+  "wht_exemption_reason": "Marked not applicable by transaction rule.",
+  "notes": "Lane A example: Vendor-of-record is Guildgate; Source/Producer is Ananta Flows."
+}
+

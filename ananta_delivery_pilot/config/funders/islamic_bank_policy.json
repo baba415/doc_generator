@@ -1,0 +1,21 @@
+{
+  "name": "Islamic Bank Node",
+  "allowed_funding_modes": [
+    "murabaha_supplier_direct",
+    "controlled_disbursement_on_behalf_of_merchant"
+  ],
+  "restricted_categories": [
+    "alcohol",
+    "tobacco",
+    "gambling",
+    "non_halal"
+  ],
+  "max_ticket_value": 2500000000,
+  "max_tenor_days": 180,
+  "documentation_requirements": [
+    "pfi_to_bank",
+    "supplier_invoice",
+    "delivery_pack",
+    "repayment_schedule"
+  ]
+}

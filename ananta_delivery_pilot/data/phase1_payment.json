@@ -1,0 +1,14 @@
+{
+  "payment_date": "2026-03-09",
+  "payment_method": "Bank Transfer",
+  "external_reference": "NYCIL-TRF-20260309-001",
+  "idempotency_key": "NYCIL-TRF-20260309-001",
+  "amount_received": 68100000.0,
+  "allocations": [
+    {
+      "sales_transaction_id": "__SET_SALES_TRANSACTION_ID__",
+      "allocated_amount": 68100000.0,
+      "notes": "Full settlement"
+    }
+  ]
+}

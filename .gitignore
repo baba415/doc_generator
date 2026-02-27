@@ -1,0 +1,13 @@
+.DS_Store
+.playwright-cli/
+output/
+tmp/
+
+**/__pycache__/
+**/*.pyc
+
+ananta_delivery_pilot/.state/
+ananta_delivery_pilot/output/
+ananta_delivery_pilot/output_v2/
+ananta_delivery_pilot/current_workstream_2026-02-26/
+ananta_delivery_pilot/current_workstream_2026-02-27/

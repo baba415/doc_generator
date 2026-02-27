@@ -1,0 +1,151 @@
+{
+  "invoice_date": "2026-02-23",
+  "due_date": "2026-03-09",
+  "currency": "NGN",
+  "payment_terms": "14 days",
+  "lpo_no": "202570410",
+  "lpo_date": "2026-01-30",
+  "mode": "contract_processing_pilot",
+  "funding_mode": "none",
+  "agreement_ref": "AFL-GGV-PRC-2026-001",
+  "order_type": "Raw Materials",
+  "order_sub_type": "Refined Oil",
+  "product_name": "Refined Bleached Deodorized Soya Oil",
+  "product_code": "RBDSO",
+  "material_identification_code": "BCRSOST01",
+  "batch_id": "AFL-RBDSO-20260223-01",
+  "run_id": "RUN-20260223-01",
+  "manufacture_date": "2026-02-23",
+  "expiry_date": "2027-02-22",
+  "delivery_terms": "DAP",
+  "packaging": "Bulk",
+  "truck_no": "T28162LA",
+  "driver_name": "Idowu Atanda",
+  "driver_phone": "08052803019",
+  "buyer_id": "buyer_nycil",
+  "processor_id": "processor_partner_refinery",
+  "vendor_of_record_id": "ananta_flows",
+  "source_id": "ananta_flows",
+  "producer_posture": true,
+  "buyer": {
+    "name": "NYCIL LIMITED",
+    "address": "Plot 5-8, Ogun State Housing Corporation Industrial Estate KM6, Idiroko Rd, Ota",
+    "contact_person": "OLUWASEUN OKE",
+    "phone": "",
+    "email": "",
+    "tin": ""
+  },
+  "ship_to": {
+    "name": "NYCIL LIMITED",
+    "address": "Plot 5-8, Ogun State Housing Corporation Industrial Estate KM6, Idiroko Rd, Ota",
+    "contact_person": "OLUWASEUN OKE",
+    "phone": "",
+    "email": "",
+    "tin": ""
+  },
+  "processor": {
+    "name": "Partner Refinery Ltd",
+    "address": "Ibadan, Oyo State",
+    "contact_person": "Operations Team",
+    "phone": "",
+    "email": "",
+    "tin": ""
+  },
+  "line_items": [
+    {
+      "description": "Processing and supply of RBDSO linked to RUN-20260223-01",
+      "quantity": 30000,
+      "unit": "kgs",
+      "unit_price": 2270,
+      "amount": 68100000,
+      "tax_class": "agri_input"
+    }
+  ],
+  "transport_charges": 0,
+  "installation_charges": 0,
+  "vat_rate": 0,
+  "discount": 0,
+  "wht_rate": 0,
+  "wht_applicable": false,
+  "vat_exemption_reason": "Configured as exempt supply class for pilot. Validate with finance.",
+  "wht_exemption_reason": "Producer/processing pilot position with evidence pack.",
+  "notes": "Pilot transaction. Settlement governed by processing agreement.",
+  "allocation_reference": "ALLOC-RUN-20260223-01",
+  "quality_parameters": [
+    {
+      "parameter": "Appearance",
+      "standard": "Characteristics of Refined Soya",
+      "result": "Characteristics of Refined Soya"
+    },
+    {
+      "parameter": "Smell",
+      "standard": "Characteristics of Refined Soya",
+      "result": "Characteristics of Refined Soya"
+    },
+    {
+      "parameter": "Taste",
+      "standard": "Bland",
+      "result": "Bland"
+    },
+    {
+      "parameter": "Color",
+      "standard": "3 Max",
+      "result": "2Y + 0.4R"
+    },
+    {
+      "parameter": "Moisture",
+      "standard": "0.1% max",
+      "result": "0.05"
+    },
+    {
+      "parameter": "Free Fatty Acid",
+      "standard": "0.1% max",
+      "result": "0.05"
+    },
+    {
+      "parameter": "Clarity",
+      "standard": "Clear",
+      "result": "Clear"
+    },
+    {
+      "parameter": "Specific Gravity @ 30℃",
+      "standard": "0.915 - 0.925",
+      "result": "0.920"
+    },
+    {
+      "parameter": "Refractive Index @ 30℃",
+      "standard": "1.471 - 1.475",
+      "result": "1.471"
+    },
+    {
+      "parameter": "Viscosity @ 30℃",
+      "standard": "22-23 secs",
+      "result": "22.5"
+    },
+    {
+      "parameter": "Acid value % (mg/KOH), max",
+      "standard": "0.5 Max mgKOH/g",
+      "result": "0.29 mgKOH/g"
+    },
+    {
+      "parameter": "Iodine value (wijs)",
+      "standard": "125 - 135g I2/100g",
+      "result": "126g I2/100g"
+    },
+    {
+      "parameter": "Peroxide Value",
+      "standard": "2 max MeqO2",
+      "result": "1.2"
+    },
+    {
+      "parameter": "Soap PPM",
+      "standard": "Nil",
+      "result": "Nil"
+    },
+    {
+      "parameter": "Foaming Test",
+      "standard": "Nil",
+      "result": "Nil"
+    }
+  ]
+}

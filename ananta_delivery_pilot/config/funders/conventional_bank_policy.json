@@ -1,0 +1,17 @@
+{
+  "name": "Conventional Bank Node",
+  "allowed_funding_modes": [
+    "direct_facility_to_merchant",
+    "controlled_disbursement_on_behalf_of_merchant",
+    "receivables_finance",
+    "hybrid_topup"
+  ],
+  "restricted_categories": [],
+  "max_ticket_value": 5000000000,
+  "max_tenor_days": 270,
+  "documentation_requirements": [
+    "supplier_invoice",
+    "delivery_pack",
+    "receivables_assignment_notice"
+  ]
+}

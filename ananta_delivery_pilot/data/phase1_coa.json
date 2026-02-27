@@ -1,0 +1,20 @@
+{
+  "delivery_id": "__SET_DELIVERY_ID__",
+  "results": [
+    { "parameter": "Appearance", "result": "Characteristics of Refined Soya" },
+    { "parameter": "Smell", "result": "Characteristics of Refined Soya" },
+    { "parameter": "Taste", "result": "Bland" },
+    { "parameter": "Moisture", "result": "0.05" },
+    { "parameter": "Free Fatty Acid", "result": "0.05" },
+    { "parameter": "Color", "result": "2Y + 0.4R" },
+    { "parameter": "Clarity", "result": "Clear" },
+    { "parameter": "Specific Gravity @ 30℃", "result": "0.920" },
+    { "parameter": "Refractive Index @ 30℃", "result": "1.471" },
+    { "parameter": "Viscosity @ 30℃", "result": "22.5" },
+    { "parameter": "Acid value % (mg/KOH), max", "result": "0.29 mgKOH/g" },
+    { "parameter": "Iodine value (wijs)", "result": "126g I2/100g" },
+    { "parameter": "Peroxide Value", "result": "1.2" },
+    { "parameter": "Soap PPM", "result": "Nil" },
+    { "parameter": "Foaming Test", "result": "Nil" }
+  ]
+}

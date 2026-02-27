@@ -1,0 +1,12 @@
+{
+  "known_complete": {
+    "manual_interventions_max": 1,
+    "auto_population_rate_min": 0.9
+  },
+  "known_partial": {
+    "manual_interventions_max": 3
+  },
+  "unknown_entities": {
+    "requires_identity_suggestions": true
+  }
+}

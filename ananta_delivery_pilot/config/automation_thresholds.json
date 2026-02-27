@@ -1,0 +1,24 @@
+{
+  "schema_version": "phase1_5.v1",
+  "confidence": {
+    "identity_auto_apply_min": 0.92,
+    "identity_review_min": 0.70,
+    "payment_auto_apply_min": 0.90
+  },
+  "over_delivery": {
+    "global_default_tolerance_pct": 5.0,
+    "buyer_overrides": {
+      "buyer_bosh": 5.0,
+      "buyer_sumal": 5.0,
+      "buyer_nycil": 5.0
+    }
+  },
+  "critical_step_matrix": {
+    "buyer_identity_unresolved": "BLOCK",
+    "vendor_identity_unresolved": "BLOCK",
+    "source_or_processor_unresolved": "EXCEPTION_CONTINUE",
+    "missing_run_or_batch": "BLOCK_PACK",
+    "missing_required_coa_rows": "BLOCK_PACK",
+    "ambiguous_payment_allocation": "EXCEPTION_REVIEW"
+  }
+}

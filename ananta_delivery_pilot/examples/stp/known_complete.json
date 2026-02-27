@@ -1,0 +1,52 @@
+{
+  "lpo_no": "STP-KNOWN-COMPLETE-001",
+  "lpo_date": "2026-02-23",
+  "issue_date": "2026-02-23",
+  "due_date": "2026-03-09",
+  "buyer_id": "buyer_nycil",
+  "vendor_of_record_id": "ananta_flows",
+  "source_id": "ananta_flows",
+  "processor_id": "processor_partner_refinery",
+  "product_code": "RBDSO",
+  "description": "Processing and supply of RBDSO linked to RUN-20260223-01",
+  "expected_qty": 30000,
+  "unit": "kgs",
+  "unit_price": 2270,
+  "delivery_date": "2026-02-23",
+  "delivered_qty": 30000,
+  "run_id": "RUN-20260223-01",
+  "batch_id": "AFL-RBDSO-20260223-01",
+  "truck_no": "T28162LA",
+  "driver_name": "Idowu Atanda",
+  "driver_phone": "08052803019",
+  "allow_placeholder_tin": true,
+  "skip_pdf": true,
+  "evidence_files": [
+    "examples/stp/evidence/lpo_known.txt",
+    "examples/stp/evidence/waybill_source.txt",
+    "examples/stp/evidence/coa_source.txt"
+  ],
+  "coa_results": [
+    {"parameter": "Appearance", "result": "PASS"},
+    {"parameter": "Smell", "result": "PASS"},
+    {"parameter": "Taste", "result": "PASS"},
+    {"parameter": "Moisture", "result": "PASS"},
+    {"parameter": "Free Fatty Acid", "result": "PASS"},
+    {"parameter": "Color", "result": "PASS"},
+    {"parameter": "Clarity", "result": "PASS"},
+    {"parameter": "Specific Gravity @ 30℃", "result": "PASS"},
+    {"parameter": "Refractive Index @ 30℃", "result": "PASS"},
+    {"parameter": "Viscosity @ 30℃", "result": "PASS"},
+    {"parameter": "Acid value % (mg/KOH), max", "result": "PASS"},
+    {"parameter": "Iodine value (wijs)", "result": "PASS"},
+    {"parameter": "Peroxide Value", "result": "PASS"},
+    {"parameter": "Soap PPM", "result": "PASS"},
+    {"parameter": "Foaming Test", "result": "PASS"}
+  ],
+  "payment": {
+    "payment_date": "2026-03-09",
+    "payment_method": "Bank Transfer",
+    "external_reference": "STP-KNOWN-COMPLETE-PAY-001",
+    "amount_received": 68100000
+  }
+}

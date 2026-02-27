@@ -1,0 +1,27 @@
+{
+  "legal_name": "Ananta Flows Ltd",
+  "rc_number": "9113379",
+  "tin": "TIN_PENDING",
+  "address": "Km 10, Abeokuta Road, Iyana-Aba Oke, Near Elesho",
+  "city_state_country": "Ibadan, Oyo State, Nigeria",
+  "phones": [
+    "07037072989"
+  ],
+  "emails": [
+    "contact@guildgate.org",
+    "baba@guildgate.org"
+  ],
+  "website": "www.guildgate.org",
+  "bank_name": "BANK_PENDING",
+  "bank_account_name": "Ananta Flows Ltd",
+  "bank_account_number": "ACCOUNT_PENDING",
+  "collection_account_name": "Guildgate Global Ventures Ltd",
+  "collection_account_number": "0510572090",
+  "collection_notice": "Payments received by Guildgate are received strictly as collection agent for Ananta Flows Ltd and are swept under assignment waterfall.",
+  "operator_name": "Guildgate Global Ventures Ltd",
+  "operator_tin": "31698929-0001",
+  "operator_rc": "7433878",
+  "logo_path": "assets/primary_logo.svg",
+  "seal_path": "assets/company_seal.png",
+  "signature_path": null
+}

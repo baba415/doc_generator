@@ -1,0 +1,28 @@
+{
+  "schema_version": "phase1_6.v1",
+  "policy_version": "2026-02-26",
+  "validity_backfill_policy": "null_if_missing",
+  "planning": {
+    "default_cadence": "daily",
+    "default_max_lots_per_day": 1,
+    "include_weekends": true
+  },
+  "products": {
+    "RBDPO": {
+      "delivery_mode": "bulk",
+      "default_lot_mt": 30
+    },
+    "RBDPKO": {
+      "delivery_mode": "bulk",
+      "default_lot_mt": 30
+    },
+    "RBDSO": {
+      "delivery_mode": "bulk",
+      "default_lot_mt": 30
+    },
+    "CPKO": {
+      "delivery_mode": "bulk",
+      "default_lot_mt": 30
+    }
+  }
+}

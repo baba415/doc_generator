@@ -1,0 +1,1 @@
+Sample LPO evidence for automation benchmark.

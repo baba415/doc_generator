@@ -1,0 +1,129 @@
+{
+  "invoice_date": "2026-02-23",
+  "due_date": "2026-05-24",
+  "currency": "NGN",
+  "payment_terms": "90 days",
+  "lpo_no": "00045467",
+  "lpo_date": "2025-01-25",
+  "mode": "normal_trade",
+  "funding_mode": "murabaha_supplier_direct",
+  "agreement_ref": "AFL-IBN-MRB-2026-004",
+  "order_type": "Raw Materials",
+  "order_sub_type": "Murabaha Funded",
+  "product_name": "Refined Bleached Deodorized Palm Kernel Oil",
+  "product_code": "RBDPKO",
+  "material_identification_code": "BCRPKOST01",
+  "batch_id": "AFL-RBDPKO-20260223-02",
+  "run_id": "RUN-20260223-02",
+  "manufacture_date": "2026-02-23",
+  "expiry_date": "2027-02-22",
+  "delivery_terms": "DAP",
+  "packaging": "Bulk",
+  "truck_no": "AKD-340XZ",
+  "driver_name": "Ibrahim Lawal",
+  "driver_phone": "08000000000",
+  "buyer_id": "buyer_sumal",
+  "processor_id": "processor_partner_refinery",
+  "vendor_of_record_id": "ananta_flows",
+  "source_id": "processor_partner_refinery",
+  "buyer": {
+    "name": "YALE FOODS LTD - IBADAN",
+    "address": "Plot 2B, Oluyole Industrial Estate, Oluyole, Ibadan",
+    "contact_person": "SUDARSAN V.P",
+    "phone": "",
+    "email": "",
+    "tin": ""
+  },
+  "ship_to": {
+    "name": "YALE FOODS LTD - IBADAN",
+    "address": "Yale 1 - Warehouse, Ibadan",
+    "contact_person": "SUDARSAN V.P",
+    "phone": "",
+    "email": "",
+    "tin": ""
+  },
+  "processor": {
+    "name": "Partner Refinery Ltd",
+    "address": "Ibadan, Oyo State",
+    "contact_person": "Ops",
+    "phone": "",
+    "email": "",
+    "tin": ""
+  },
+  "funder_id": "funder_islamic_bank_node",
+  "funder": {
+    "name": "Islamic Bank Node",
+    "address": "Lagos, Nigeria",
+    "contact_person": "Structured Trade Desk",
+    "phone": "",
+    "email": "",
+    "tin": ""
+  },
+  "line_items": [
+    {
+      "description": "RBDPKO supply under Murabaha funded procurement",
+      "quantity": 31960,
+      "unit": "kgs",
+      "unit_price": 2930,
+      "amount": 93642800,
+      "tax_class": "agri_input"
+    }
+  ],
+  "transport_charges": 80000,
+  "installation_charges": 0,
+  "vat_rate": 0,
+  "discount": 0,
+  "wht_rate": 0,
+  "wht_applicable": false,
+  "vat_exemption_reason": "Configured as exempt supply class. Validate with finance.",
+  "wht_exemption_reason": "Murabaha-funded flow; align withholding handling to bank-approved structure.",
+  "notes": "Supplier PFI issued to bank under Murabaha mode.",
+  "allocation_reference": "ALLOC-RUN-20260223-02",
+  "quality_parameters": [
+    {
+      "parameter": "Appearance",
+      "standard": "Clear and Bright",
+      "result": "Clear and Bright"
+    },
+    {
+      "parameter": "Odour",
+      "standard": "Neutral",
+      "result": "Neutral"
+    },
+    {
+      "parameter": "Moisture",
+      "standard": "0.10 max",
+      "result": "0.04"
+    },
+    {
+      "parameter": "Free Fatty Acid",
+      "standard": "0.10 max",
+      "result": "0.05"
+    },
+    {
+      "parameter": "Color (Lovibond 5 1/4\")",
+      "standard": "2.5R max",
+      "result": "1.8R"
+    },
+    {
+      "parameter": "Specific Gravity @ 30℃",
+      "standard": "0.900 - 0.910",
+      "result": "0.905"
+    },
+    {
+      "parameter": "Iodine Value",
+      "standard": "14 - 23",
+      "result": "18"
+    },
+    {
+      "parameter": "Peroxide Value",
+      "standard": "5 max",
+      "result": "2.1"
+    },
+    {
+      "parameter": "Soap PPM",
+      "standard": "Nil",
+      "result": "Nil"
+    }
+  ]
+}

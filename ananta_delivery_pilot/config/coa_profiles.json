@@ -1,0 +1,370 @@
+{
+  "CPKO": {
+    "coa_template_name": "Quality Control Certificate (BOSH Profile)",
+    "coa_document_no": "BOSH-QSPEC-CPKO",
+    "coa_version_no": "0.00.01 | 2023",
+    "material_identification_code": "CPKOST01",
+    "quality_parameters": [
+      {
+        "parameter": "Appearance on Packaging",
+        "standard": "Light Yellow",
+        "result": ""
+      },
+      {
+        "parameter": "Evidence of Contamination",
+        "standard": "None",
+        "result": ""
+      },
+      {
+        "parameter": "Moisture Content - %",
+        "standard": "0.1 - 0.28",
+        "result": ""
+      },
+      {
+        "parameter": "Free Fatty Acid as Lauric - %",
+        "standard": "<= 5 (MgKOH/g)",
+        "result": ""
+      },
+      {
+        "parameter": "Maximum Acid Value - %",
+        "standard": "10.0",
+        "result": ""
+      },
+      {
+        "parameter": "Maximum Peroxide Value - MeQ/Kg",
+        "standard": "2.0",
+        "result": ""
+      },
+      {
+        "parameter": "Slip Melting Point - deg C",
+        "standard": "20 - 23",
+        "result": ""
+      },
+      {
+        "parameter": "Iodine Value - WIJS",
+        "standard": "14 - 23",
+        "result": ""
+      },
+      {
+        "parameter": "Taste / Odour",
+        "standard": "Characteristics of CPKO",
+        "result": ""
+      },
+      {
+        "parameter": "Specific Gravity",
+        "standard": "0.895",
+        "result": ""
+      },
+      {
+        "parameter": "Refractive Index",
+        "standard": "",
+        "result": ""
+      }
+    ],
+    "buyer_overrides": {
+      "BOSH": {
+        "coa_template_name": "Quality Control Certificate (BOSH Profile)"
+      }
+    }
+  },
+  "CPO": {
+    "coa_template_name": "Quality Control Certificate (BOSH Profile)",
+    "coa_document_no": "BOSH-QSPEC-CPO",
+    "coa_version_no": "0.00.01 | 2023",
+    "material_identification_code": "CPOST01",
+    "quality_parameters": [
+      {
+        "parameter": "Appearance on Packaging",
+        "standard": "Golden Yellow",
+        "result": ""
+      },
+      {
+        "parameter": "Evidence of Contamination",
+        "standard": "None",
+        "result": ""
+      },
+      {
+        "parameter": "Moisture Content - %",
+        "standard": "0.1 - 0.28",
+        "result": ""
+      },
+      {
+        "parameter": "Free Fatty Acid as Lauric - %",
+        "standard": "<= 3 (MgKOH/g)",
+        "result": ""
+      },
+      {
+        "parameter": "Maximum Acid Value - %",
+        "standard": "6.0",
+        "result": ""
+      },
+      {
+        "parameter": "Maximum Peroxide Value - MeQ/Kg",
+        "standard": "2.0",
+        "result": ""
+      },
+      {
+        "parameter": "Slip Melting Point - deg C",
+        "standard": "21 - 22",
+        "result": ""
+      },
+      {
+        "parameter": "Iodine Value - WIJS",
+        "standard": "55 - 58",
+        "result": ""
+      },
+      {
+        "parameter": "Taste / Odour",
+        "standard": "Characteristics of CPKO",
+        "result": ""
+      },
+      {
+        "parameter": "Specific Gravity",
+        "standard": "0.914 - 0.916",
+        "result": ""
+      },
+      {
+        "parameter": "Refractive Index",
+        "standard": "",
+        "result": ""
+      }
+    ]
+  },
+  "RBDSO": {
+    "coa_template_name": "Quality Control Certificate",
+    "coa_document_no": "GG/FGRMQC/SPEC/RSO/001",
+    "coa_version_no": "01",
+    "material_identification_code": "BCRSOST01",
+    "quality_parameters": [
+      {
+        "parameter": "Appearance",
+        "standard": "Characteristics of Refined Soya",
+        "result": ""
+      },
+      {
+        "parameter": "Smell",
+        "standard": "Characteristics of Refined Soya",
+        "result": ""
+      },
+      {
+        "parameter": "Taste",
+        "standard": "Bland",
+        "result": ""
+      },
+      {
+        "parameter": "Moisture",
+        "standard": "0.1% max",
+        "result": ""
+      },
+      {
+        "parameter": "Free Fatty Acid",
+        "standard": "0.1% max",
+        "result": ""
+      },
+      {
+        "parameter": "Color",
+        "standard": "3 Max",
+        "result": ""
+      },
+      {
+        "parameter": "Clarity",
+        "standard": "Clear",
+        "result": ""
+      },
+      {
+        "parameter": "Specific Gravity @ 30℃",
+        "standard": "0.915 - 0.925",
+        "result": ""
+      },
+      {
+        "parameter": "Refractive Index @ 30℃",
+        "standard": "1.471 - 1.475",
+        "result": ""
+      },
+      {
+        "parameter": "Viscosity @ 30℃",
+        "standard": "22-23 secs",
+        "result": ""
+      },
+      {
+        "parameter": "Acid value % (mg/KOH), max",
+        "standard": "0.5 Max mgKOH/g",
+        "result": ""
+      },
+      {
+        "parameter": "Iodine value (wijs)",
+        "standard": "125 - 135g I2/100g",
+        "result": ""
+      },
+      {
+        "parameter": "Peroxide Value",
+        "standard": "2 max MeqO2",
+        "result": ""
+      },
+      {
+        "parameter": "Soap PPM",
+        "standard": "Nil",
+        "result": ""
+      },
+      {
+        "parameter": "Foaming Test",
+        "standard": "Nil",
+        "result": ""
+      }
+    ],
+    "buyer_overrides": {
+      "SUMAL": {
+        "coa_template_name": "Quality Control Certificate (SUMAL Profile)",
+        "coa_document_no": "GG/FGRMQC/SPEC/RSO/001",
+        "coa_version_no": "01",
+        "material_identification_code": "BCRSOST01",
+        "quality_parameters": [
+          {
+            "parameter": "Appearance",
+            "standard": "Characteristics of Refined Soya",
+            "result": ""
+          },
+          {
+            "parameter": "Smell",
+            "standard": "Characteristics of Refined Soya",
+            "result": ""
+          },
+          {
+            "parameter": "Taste",
+            "standard": "Bland",
+            "result": ""
+          },
+          {
+            "parameter": "Moisture",
+            "standard": "0.1% max",
+            "result": ""
+          },
+          {
+            "parameter": "Free Fatty Acid",
+            "standard": "0.1% max",
+            "result": ""
+          },
+          {
+            "parameter": "Color",
+            "standard": "3 Max",
+            "result": ""
+          },
+          {
+            "parameter": "Clarity",
+            "standard": "Clear",
+            "result": ""
+          },
+          {
+            "parameter": "Specific Gravity @ 30℃",
+            "standard": "0.915 - 0.925",
+            "result": ""
+          },
+          {
+            "parameter": "Refractive Index @ 30℃",
+            "standard": "1.471 - 1.475",
+            "result": ""
+          },
+          {
+            "parameter": "Viscosity @ 30℃",
+            "standard": "22-23 secs",
+            "result": ""
+          },
+          {
+            "parameter": "Acid value % (mg/KOH), max",
+            "standard": "0.5 Max mgKOH/g",
+            "result": ""
+          },
+          {
+            "parameter": "Iodine value (wijs)",
+            "standard": "125 - 135g I2/100g",
+            "result": ""
+          },
+          {
+            "parameter": "Peroxide Value",
+            "standard": "2 max MeqO2",
+            "result": ""
+          },
+          {
+            "parameter": "Soap PPM",
+            "standard": "Nil",
+            "result": ""
+          },
+          {
+            "parameter": "Foaming Test",
+            "standard": "Nil",
+            "result": ""
+          }
+        ]
+      },
+      "NYCIL": {
+        "coa_template_name": "Quality Control Certificate (NYCIL Profile)"
+      }
+    }
+  },
+  "RBDPKO": {
+    "coa_template_name": "Quality Control Certificate",
+    "coa_document_no": "GG/FGRMQC/SPEC/RPKO/001",
+    "coa_version_no": "01",
+    "material_identification_code": "BCRPKOST01",
+    "quality_parameters": [
+      {
+        "parameter": "Appearance",
+        "standard": "Clear and Bright",
+        "result": ""
+      },
+      {
+        "parameter": "Odour",
+        "standard": "Neutral",
+        "result": ""
+      },
+      {
+        "parameter": "Moisture",
+        "standard": "0.10 max",
+        "result": ""
+      },
+      {
+        "parameter": "Free Fatty Acid",
+        "standard": "0.10 max",
+        "result": ""
+      },
+      {
+        "parameter": "Color (Lovibond 5 1/4\")",
+        "standard": "2.5R max",
+        "result": ""
+      },
+      {
+        "parameter": "Specific Gravity @ 30℃",
+        "standard": "0.900 - 0.910",
+        "result": ""
+      },
+      {
+        "parameter": "Iodine Value",
+        "standard": "14 - 23",
+        "result": ""
+      },
+      {
+        "parameter": "Slip Melting Point",
+        "standard": "24 - 30℃",
+        "result": ""
+      },
+      {
+        "parameter": "Peroxide Value",
+        "standard": "5 max",
+        "result": ""
+      },
+      {
+        "parameter": "Soap PPM",
+        "standard": "Nil",
+        "result": ""
+      }
+    ],
+    "buyer_overrides": {
+      "YALE": {
+        "coa_template_name": "Quality Control Certificate (YALE Profile)"
+      },
+      "SUMAL": {
+        "coa_template_name": "Quality Control Certificate (SUMAL Profile)"
+      }
+    }
+  }
+}

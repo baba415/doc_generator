@@ -1,0 +1,9 @@
+{
+  "default_vat_rate": 7.5,
+  "default_wht_goods_rate": 2.0,
+  "notes": [
+    "Rules are conservative defaults only.",
+    "Use explicit transaction-level overrides with evidence and finance signoff.",
+    "Do not hard-code exemption decisions."
+  ]
+}

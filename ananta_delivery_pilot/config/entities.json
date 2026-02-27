@@ -1,0 +1,119 @@
+{
+  "schema_version": "1.0",
+  "entities": {
+    "guildgate": {
+      "code": "GGV",
+      "legal_name": "Guildgate Global Ventures Ltd",
+      "rc_number": "7433878",
+      "tin": "31698929-0001",
+      "address": "Km 10, Abeokuta Road, Iyana-Aba Oke, Near Elesho",
+      "city_state_country": "Ibadan, Oyo State, Nigeria",
+      "phones": [
+        "07037072989"
+      ],
+      "emails": [
+        "contact@guildgate.org",
+        "baba@guildgate.org"
+      ],
+      "website": "www.guildgate.org",
+      "bank": {
+        "bank_name": "BANK_PENDING",
+        "account_name": "Guildgate Global Ventures Ltd",
+        "account_number": "0510572090",
+        "currency": "NGN"
+      },
+      "aliases": [
+        "GUILDGATE"
+      ]
+    },
+    "ananta_flows": {
+      "code": "AFL",
+      "legal_name": "Ananta Flows Ltd",
+      "rc_number": "9113379",
+      "tin": "TIN_PENDING",
+      "address": "Km 10, Abeokuta Road, Iyana-Aba Oke, Near Elesho",
+      "city_state_country": "Ibadan, Oyo State, Nigeria",
+      "phones": [
+        "07037072989"
+      ],
+      "emails": [
+        "contact@guildgate.org"
+      ],
+      "website": "www.guildgate.org",
+      "bank": {
+        "bank_name": "BANK_PENDING",
+        "account_name": "Ananta Flows Ltd",
+        "account_number": "ACCOUNT_PENDING",
+        "currency": "NGN"
+      },
+      "aliases": [
+        "ANANTA FLOWS",
+        "ANANTA FLOWS LTD"
+      ]
+    },
+    "buyer_bosh": {
+      "code": "BOSH",
+      "legal_name": "Bosh Cornerstone Global Concept Ltd",
+      "rc_number": "1033550",
+      "address": "Km 10, Abeokuta Road, Iyana-Aba Oke, Near Elesho",
+      "city_state_country": "Ibadan, Oyo State, Nigeria",
+      "phones": [
+        "+2348104325461",
+        "+2348115695219"
+      ],
+      "emails": [
+        "boshcornerstone@gmail.com"
+      ],
+      "website": "www.boshcornerstone.com",
+      "aliases": [
+        "BOSH CORNERSTONE",
+        "BOSH CORNERSTONE GLOBAL CONCEPT",
+        "BOSH CORNERSTONE GLOBAL CONCEPT LTD"
+      ]
+    },
+    "buyer_sumal": {
+      "code": "SUMAL",
+      "legal_name": "Sumal Foods Ltd (Yale Foods - Ibadan)",
+      "address": "Plot 2B, Oluyole Industrial Estate, Oluyole, Ibadan",
+      "city_state_country": "Oyo State, Nigeria",
+      "aliases": [
+        "SUMAL FOODS",
+        "SUMAL FOODS LTD",
+        "YALE FOODS",
+        "YALE FOODS LTD",
+        "YALE FOODS LTD - IBADAN",
+        "YALE"
+      ]
+    },
+    "buyer_nycil": {
+      "code": "NYCIL",
+      "legal_name": "NYCIL LIMITED",
+      "address": "Plot 5-8, Ogun State Housing Corporation Industrial Estate KM6, Idiroko Rd, Ota",
+      "city_state_country": "Ogun State, Nigeria",
+      "aliases": [
+        "NYCIL",
+        "NYCIL LTD"
+      ]
+    },
+    "processor_partner_refinery": {
+      "code": "REF",
+      "legal_name": "Partner Refinery Ltd",
+      "address": "Ibadan, Oyo State",
+      "city_state_country": "Nigeria",
+      "aliases": [
+        "PARTNER REFINERY",
+        "PARTNER REFINERY LIMITED",
+        "PARTNER REFINERY LTD"
+      ]
+    },
+    "funder_islamic_bank_node": {
+      "code": "IBN",
+      "legal_name": "Islamic Bank Node",
+      "address": "Lagos, Nigeria",
+      "city_state_country": "Nigeria",
+      "aliases": [
+        "ISLAMIC BANK NODE"
+      ]
+    }
+  }
+}

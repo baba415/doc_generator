@@ -1,0 +1,31 @@
+{
+  "lpo_no": "STP-KNOWN-PARTIAL-001",
+  "lpo_date": "2026-02-24",
+  "issue_date": "2026-02-24",
+  "due_date": "2026-03-10",
+  "buyer_id": "buyer_nycil",
+  "vendor_of_record_id": "ananta_flows",
+  "source_id": "ananta_flows",
+  "processor_id": "processor_partner_refinery",
+  "product_code": "RBDSO",
+  "description": "Partial evidence test",
+  "expected_qty": 30000,
+  "unit": "kgs",
+  "unit_price": 2270,
+  "delivery_date": "2026-02-24",
+  "delivered_qty": 30000,
+  "allow_placeholder_tin": true,
+  "skip_pdf": true,
+  "evidence_files": [
+    "examples/stp/evidence/lpo_known.txt"
+  ],
+  "coa_results": [
+    {"parameter": "Appearance", "result": "PASS"}
+  ],
+  "payment": {
+    "payment_date": "2026-03-10",
+    "payment_method": "Bank Transfer",
+    "external_reference": "STP-KNOWN-PARTIAL-PAY-001",
+    "amount_received": 68100000
+  }
+}
