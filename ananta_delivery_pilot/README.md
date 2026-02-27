@@ -226,6 +226,12 @@ Focused Phase 2 regression run:
 PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m unittest tests.test_phase16_planning tests.test_phase15_automation tests.test_phase2_ui tests.test_phase1
 ```
 
+Backend fallback renderer proof:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m unittest -v tests.test_html_pdf_fallback
+```
+
 ## One-Command Acceptance Run
 
 Run the full Phase 1 acceptance flow (tests, legacy validate smoke, contract → delivery → COA → pack → payment → DREP export):
