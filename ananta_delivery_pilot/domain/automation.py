@@ -6,6 +6,7 @@ import time
 from datetime import date, timedelta
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from adapters.sqlite_repo import SQLiteRepo
@@ -369,7 +370,7 @@ class AutomationOrchestrator:
         as_of_date: str,
         out_dir: Path,
         lookback_window_days: int = 30,
-        benchmark_version: str = "phase2.pr7.v1",
+        benchmark_version: str = "phase2.pr8.v1",
     ) -> dict[str, Any]:
         if lookback_window_days <= 0:
             raise ValueError("lookback_window_days must be > 0")
@@ -436,11 +437,18 @@ class AutomationOrchestrator:
         open_count = len(cases_open)
         touchless_rate = round((total_intents - open_count) / total_intents, 4) if total_intents else 0.0
         auto_action_success_rate = round(success_exec / total_intents, 4) if total_intents else 0.0
+        intake_metrics = self._pr8_intake_metrics(
+            lookback_start_iso=lookback_start_iso,
+            as_of_date=as_of_date,
+            benchmark_version=benchmark_version,
+        )
+        generated_at_utc = utc_now_iso_z()
         metrics = {
             "as_of_date": as_of_date,
             "lookback_window_days": int(lookback_window_days),
             "lookback_window_start_date": lookback_start_iso,
             "benchmark_version": benchmark_version,
+            "generated_at_utc": generated_at_utc,
             "intents_total": total_intents,
             "executions_success_or_skipped": success_exec,
             "exceptions_open": open_count,
@@ -453,11 +461,184 @@ class AutomationOrchestrator:
             "manual_interactions_in_exceptions_rate": round(manual_interactions_in_exceptions_rate, 4),
             "manual_interactions_in_exceptions_gate_threshold": 0.80,
             "manual_interactions_in_exceptions_gate_pass": bool(manual_interactions_gate_pass),
+            "median_manual_fields_per_intake": intake_metrics["median_manual_fields_per_intake"],
+            "median_manual_fields_per_intake_gate_threshold": 6,
+            "median_manual_fields_per_intake_gate_pass": intake_metrics["median_manual_fields_per_intake_gate_pass"],
+            "autoplan_common_case_total": intake_metrics["autoplan_common_case_total"],
+            "autoplan_zero_edit_common_case_count": intake_metrics["autoplan_zero_edit_common_case_count"],
+            "autoplan_zero_edit_common_case_rate": intake_metrics["autoplan_zero_edit_common_case_rate"],
+            "autoplan_zero_edit_common_case_gate_target": 1.0,
+            "autoplan_zero_edit_common_case_gate_pass": intake_metrics["autoplan_zero_edit_common_case_gate_pass"],
+            "intake_runs_with_confirm_total": intake_metrics["intake_runs_with_confirm_total"],
+            "intake_decision_distribution": intake_metrics["intake_decision_distribution"],
+            "benchmark_version_expected_pr8": intake_metrics["benchmark_version_expected_pr8"],
+            "benchmark_version_match_pr8": intake_metrics["benchmark_version_match_pr8"],
+            "pr8_gate_pass": intake_metrics["pr8_gate_pass"],
+            "pr8_gate_reason_code": intake_metrics["pr8_gate_reason_code"],
         }
         out_dir.mkdir(parents=True, exist_ok=True)
         metrics_path = out_dir / f"autonomy_metrics_{as_of_date}.json"
         metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+        with self.repo.transaction() as conn:
+            self.repo.append_event(
+                conn,
+                entity_type="METRICS",
+                entity_id=f"AUTONOMY::{as_of_date}::{benchmark_version}",
+                event_type="AUTONOMY_METRICS_EXPORTED",
+                as_of_date=as_of_date,
+                payload={
+                    "metrics_path": str(metrics_path),
+                    "lookback_window_days": int(lookback_window_days),
+                    "benchmark_version": benchmark_version,
+                    "generated_at_utc": generated_at_utc,
+                    "pr8_gate_pass": bool(intake_metrics["pr8_gate_pass"]),
+                    "pr8_gate_reason_code": str(intake_metrics["pr8_gate_reason_code"]),
+                },
+                source="autonomy-metrics",
+            )
         return {"ok": True, "metrics": metrics, "metrics_path": str(metrics_path)}
+
+    def _pr8_intake_metrics(
+        self,
+        *,
+        lookback_start_iso: str,
+        as_of_date: str,
+        benchmark_version: str,
+    ) -> dict[str, Any]:
+        expected_benchmark_version = "phase2.pr8.v1"
+        benchmark_match = benchmark_version == expected_benchmark_version
+
+        distribution_rows = self.repo.fetch_all(
+            """
+            SELECT ad.decision, COUNT(*) AS cnt
+            FROM automation_decisions ad
+            JOIN automation_runs ar ON ar.run_id = ad.run_id
+            WHERE ad.stage = 'intake_parser'
+              AND ar.as_of_date BETWEEN ? AND ?
+            GROUP BY ad.decision
+            """,
+            (lookback_start_iso, as_of_date),
+        )
+        decision_distribution = {"auto_applied": 0, "needs_review": 0, "blocked": 0}
+        for row in distribution_rows:
+            key = str(row.get("decision") or "").strip()
+            if key in decision_distribution:
+                decision_distribution[key] = int(row.get("cnt") or 0)
+
+        confirm_rows = self.repo.fetch_all(
+            """
+            SELECT DISTINCT ad.run_id
+            FROM automation_decisions ad
+            JOIN automation_runs ar ON ar.run_id = ad.run_id
+            WHERE ad.stage = 'intake_confirm'
+              AND ar.as_of_date BETWEEN ? AND ?
+            ORDER BY ad.run_id
+            """,
+            (lookback_start_iso, as_of_date),
+        )
+        confirm_run_ids = [str(row.get("run_id") or "") for row in confirm_rows if str(row.get("run_id") or "").strip()]
+
+        corrected_rows = self.repo.fetch_all(
+            """
+            SELECT ad.run_id, COUNT(*) AS cnt
+            FROM automation_decisions ad
+            JOIN automation_runs ar ON ar.run_id = ad.run_id
+            WHERE ad.stage = 'intake_confirm'
+              AND ad.decision = 'user_corrected'
+              AND ar.as_of_date BETWEEN ? AND ?
+            GROUP BY ad.run_id
+            """,
+            (lookback_start_iso, as_of_date),
+        )
+        corrected_by_run = {
+            str(row.get("run_id") or ""): int(row.get("cnt") or 0)
+            for row in corrected_rows
+            if str(row.get("run_id") or "").strip()
+        }
+        corrected_counts = [int(corrected_by_run.get(run_id, 0)) for run_id in confirm_run_ids]
+        median_manual_fields = float(median(corrected_counts)) if corrected_counts else None
+        median_manual_gate_pass = bool(
+            median_manual_fields is not None and median_manual_fields < 6.0
+        )
+
+        lines = self.repo.fetch_all(
+            """
+            SELECT cli.contract_line_id, cli.product_code, cli.expected_qty_kg
+            FROM contracts c
+            JOIN contract_line_items cli ON cli.contract_id = c.contract_id
+            WHERE c.issue_date BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        )
+        products_policy = self.config.delivery_policies.get("products", {}) if isinstance(self.config.delivery_policies, dict) else {}
+        common_case_total = 0
+        zero_edit_count = 0
+        for line in lines:
+            product_code = str(line.get("product_code") or "").upper()
+            policy = products_policy.get(product_code) if isinstance(products_policy, dict) else None
+            if not isinstance(policy, dict):
+                continue
+            lot_mt = policy.get("default_lot_mt")
+            if lot_mt in (None, ""):
+                continue
+            lot_size_kg = mt_to_kg_int(lot_mt)
+            expected_qty_kg = int(line.get("expected_qty_kg") or 0)
+            if expected_qty_kg <= 0 or lot_size_kg <= 0 or expected_qty_kg % lot_size_kg != 0:
+                continue
+            common_case_total += 1
+            expected_lot_count = expected_qty_kg // lot_size_kg
+            planned_rows = self.repo.fetch_all(
+                """
+                SELECT planned_qty_kg, notes
+                FROM planned_deliveries
+                WHERE contract_line_id = ?
+                  AND status <> 'CANCELLED'
+                ORDER BY sequence_no ASC
+                """,
+                (line["contract_line_id"],),
+            )
+            if len(planned_rows) != expected_lot_count:
+                continue
+            all_default_qty = all(int(row.get("planned_qty_kg") or 0) == lot_size_kg for row in planned_rows)
+            no_manual_override = all("web_v2_edit" not in str(row.get("notes") or "").lower() for row in planned_rows)
+            if all_default_qty and no_manual_override:
+                zero_edit_count += 1
+
+        if common_case_total > 0:
+            zero_edit_rate_value = zero_edit_count / common_case_total
+            zero_edit_rate = round(zero_edit_rate_value, 4)
+            zero_edit_gate_pass = zero_edit_count == common_case_total
+        else:
+            zero_edit_rate = None
+            zero_edit_gate_pass = False
+
+        if not benchmark_match:
+            pr8_gate_pass = False
+            pr8_reason = "benchmark_version_mismatch"
+        elif not median_manual_gate_pass:
+            pr8_gate_pass = False
+            pr8_reason = "median_manual_fields_threshold_failed"
+        elif not zero_edit_gate_pass:
+            pr8_gate_pass = False
+            pr8_reason = "autoplan_zero_edit_common_case_failed"
+        else:
+            pr8_gate_pass = True
+            pr8_reason = "pass"
+
+        return {
+            "median_manual_fields_per_intake": median_manual_fields,
+            "median_manual_fields_per_intake_gate_pass": median_manual_gate_pass,
+            "autoplan_common_case_total": int(common_case_total),
+            "autoplan_zero_edit_common_case_count": int(zero_edit_count),
+            "autoplan_zero_edit_common_case_rate": zero_edit_rate,
+            "autoplan_zero_edit_common_case_gate_pass": bool(zero_edit_gate_pass),
+            "intake_runs_with_confirm_total": int(len(confirm_run_ids)),
+            "intake_decision_distribution": decision_distribution,
+            "benchmark_version_expected_pr8": expected_benchmark_version,
+            "benchmark_version_match_pr8": bool(benchmark_match),
+            "pr8_gate_pass": bool(pr8_gate_pass),
+            "pr8_gate_reason_code": pr8_reason,
+        }
 
     def _contracts_for_autonomy(self, *, contract_id: str | None) -> list[dict[str, Any]]:
         if contract_id:

@@ -129,7 +129,7 @@ python3 run.py auto-resume --run-id <run_id>
 python3 run.py run-autonomy --as-of 2026-03-31 --dry-run
 python3 run.py list-cases --status OPEN
 python3 run.py decide-case --case-id <case_id> --decision APPROVE --reason "override"
-python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --benchmark-version phase2.pr7.v1 --out-dir .state/automation_metrics
+python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --benchmark-version phase2.pr8.v1 --out-dir .state/automation_metrics
 ```
 
 Phase 1 state writes to:
@@ -250,6 +250,19 @@ python3 run.py export-drep --as-of 2026-03-31 --out-dir .state/exports/2026-03-3
 - Case queue and decisions: `list-cases`, `decide-case`
 - Deterministic metric export: `autonomy-metrics`
 - Persistent tables used: `gate_evaluations`, `action_intents`, `action_executions`, `exception_cases`, `event_log`
+
+## Phase 2 PR8.1 Intake/Planning KPI Closure
+
+`autonomy-metrics` now exports runtime-computed PR8 gates from DB records (not proof-only files), including:
+- `median_manual_fields_per_intake`
+- `autoplan_zero_edit_common_case_rate`
+- `intake_decision_distribution` (`auto_applied`, `needs_review`, `blocked`)
+- `pr8_gate_pass` + `pr8_gate_reason_code`
+- UTC metadata: `as_of_date`, `lookback_window_days`, `benchmark_version`, `generated_at_utc`
+
+Benchmark-version handling is explicit:
+- expected PR8 benchmark is `phase2.pr8.v1`
+- mismatch sets `benchmark_version_match_pr8=false` and `pr8_gate_pass=false`
 
 ## Phase 2 PR3 Entity Intelligence (Transport + MDM)
 
