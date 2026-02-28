@@ -129,7 +129,7 @@ python3 run.py auto-resume --run-id <run_id>
 python3 run.py run-autonomy --as-of 2026-03-31 --dry-run
 python3 run.py list-cases --status OPEN
 python3 run.py decide-case --case-id <case_id> --decision APPROVE --reason "override"
-python3 run.py autonomy-metrics --as-of 2026-03-31 --out-dir .state/automation_metrics
+python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --benchmark-version phase2.pr7.v1 --out-dir .state/automation_metrics
 ```
 
 Phase 1 state writes to:

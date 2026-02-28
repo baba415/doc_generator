@@ -143,6 +143,8 @@ def build_parser() -> argparse.ArgumentParser:
     autonomy_metrics = subparsers.add_parser("autonomy-metrics", help="Export Phase2 autonomy metrics snapshot")
     autonomy_metrics.add_argument("--as-of", required=True)
     autonomy_metrics.add_argument("--out-dir", default="")
+    autonomy_metrics.add_argument("--lookback-window-days", type=int, default=30)
+    autonomy_metrics.add_argument("--benchmark-version", default="phase2.pr7.v1")
 
     return parser
 
@@ -335,6 +337,8 @@ def main(argv: list[str] | None = None) -> None:
         result = orchestrator.autonomy_metrics(
             as_of_date=str(args.as_of),
             out_dir=out_dir,
+            lookback_window_days=int(args.lookback_window_days),
+            benchmark_version=str(args.benchmark_version),
         )
         print(json.dumps(result, indent=2))
         return

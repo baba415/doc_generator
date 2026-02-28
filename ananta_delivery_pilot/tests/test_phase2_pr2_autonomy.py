@@ -155,13 +155,21 @@ class Phase2PR2AutonomyTests(unittest.TestCase):
         contract_id = self._create_contract("PR2-LPO-METRICS")
         self.orchestrator.run_autonomy(as_of_date="2026-02-23", contract_id=contract_id, dry_run=True)
         out_dir = self.temp_dir / "metrics"
-        result = self.orchestrator.autonomy_metrics(as_of_date="2026-02-23", out_dir=out_dir)
+        result = self.orchestrator.autonomy_metrics(
+            as_of_date="2026-02-23",
+            out_dir=out_dir,
+            lookback_window_days=30,
+            benchmark_version="phase2.pr7.v1",
+        )
         self.assertTrue(result["ok"])
         metrics_path = Path(result["metrics_path"])
         self.assertTrue(metrics_path.exists())
         payload = json.loads(metrics_path.read_text(encoding="utf-8"))
         self.assertEqual("2026-02-23", payload["as_of_date"])
+        self.assertEqual(30, payload["lookback_window_days"])
+        self.assertEqual("phase2.pr7.v1", payload["benchmark_version"])
         self.assertIn("touchless_rate", payload)
+        self.assertIn("manual_interactions_in_exceptions_rate", payload)
 
     def test_cli_parser_supports_phase2_pr2_commands(self) -> None:
         parser = build_parser()
@@ -173,6 +181,8 @@ class Phase2PR2AutonomyTests(unittest.TestCase):
         self.assertEqual("decide-case", parsed.command)
         parsed = parser.parse_args(["autonomy-metrics", "--as-of", "2026-03-31"])
         self.assertEqual("autonomy-metrics", parsed.command)
+        self.assertEqual(30, parsed.lookback_window_days)
+        self.assertEqual("phase2.pr7.v1", parsed.benchmark_version)
 
     def test_non_dry_run_autonomy_executes_intents_with_evidence_present(self) -> None:
         contract_id = self._create_contract("PR2-LPO-NONDRY")

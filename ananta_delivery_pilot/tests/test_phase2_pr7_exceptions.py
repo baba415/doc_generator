@@ -7,6 +7,7 @@ from pathlib import Path
 
 from adapters.sqlite_repo import SQLiteRepo
 from core.config import RuntimeConfig
+from core.ids import new_ulid
 from domain.automation import AutomationOrchestrator
 from domain.services import Phase1Service
 
@@ -115,6 +116,68 @@ class Phase2Pr7ExceptionsTests(unittest.TestCase):
         activity = self.service.exception_case_activity(case_id=self.case_id)
         activity_types = [str(item.get("event_type") or "") for item in activity]
         self.assertIn("CASE_RESUME_COMPLETED", activity_types)
+
+    def test_manual_interactions_in_exceptions_rate_metric(self) -> None:
+        self.service.decide_exception_case(
+            case_id=self.case_id,
+            decision="APPROVE",
+            reason="kpi metric test",
+            resume=False,
+            dry_run_resume=True,
+        )
+        with self.repo.transaction() as conn:
+            row = conn.execute(
+                "SELECT human_decision_id FROM human_decisions WHERE exception_case_id = ? ORDER BY created_at DESC LIMIT 1",
+                (self.case_id,),
+            ).fetchone()
+            assert row is not None
+            human_decision_id = str(row["human_decision_id"])
+            conn.execute(
+                "UPDATE human_decisions SET decided_at = ?, created_at = ? WHERE human_decision_id = ?",
+                ("2026-02-20T10:00:00Z", "2026-02-20T10:00:00Z", human_decision_id),
+            )
+
+            run_id = new_ulid()
+            self.repo.create_automation_run(
+                conn,
+                run_id=run_id,
+                idempotency_key=f"kpi-run::{run_id}",
+                as_of_date="2026-02-20",
+                dry_run=True,
+                input_payload={"source": "pr7-kpi-test"},
+            )
+            self.repo.add_automation_decision(
+                conn,
+                run_id=run_id,
+                stage="intake",
+                field_name="buyer_id",
+                required_flag=True,
+                proposed_value="buyer_nycil",
+                source_type="ui",
+                source_ref="/v2/intake",
+                confidence=1.0,
+                decision="user_corrected",
+                reason_code="user_corrected",
+                rule_path="manual",
+            )
+            conn.execute(
+                "UPDATE automation_decisions SET created_at = ? WHERE run_id = ?",
+                ("2026-02-21T09:30:00Z", run_id),
+            )
+
+        out_dir = self.temp_dir / "kpi-metrics"
+        result = self.orchestrator.autonomy_metrics(
+            as_of_date="2026-02-23",
+            out_dir=out_dir,
+            lookback_window_days=30,
+            benchmark_version="phase2.pr7.v1",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, result["metrics"]["manual_interactions_via_exceptions"])
+        self.assertEqual(1, result["metrics"]["manual_interactions_user_overrides"])
+        self.assertEqual(2, result["metrics"]["manual_interactions_total"])
+        self.assertEqual(0.5, result["metrics"]["manual_interactions_in_exceptions_rate"])
+        self.assertFalse(result["metrics"]["manual_interactions_in_exceptions_gate_pass"])
 
 
 if __name__ == "__main__":

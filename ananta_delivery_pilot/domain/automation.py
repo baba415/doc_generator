@@ -3,7 +3,7 @@ from __future__ import annotations
 import difflib
 import json
 import time
-from datetime import date
+from datetime import date, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -363,7 +363,23 @@ class AutomationOrchestrator:
             "resume_result": resume_result,
         }
 
-    def autonomy_metrics(self, *, as_of_date: str, out_dir: Path) -> dict[str, Any]:
+    def autonomy_metrics(
+        self,
+        *,
+        as_of_date: str,
+        out_dir: Path,
+        lookback_window_days: int = 30,
+        benchmark_version: str = "phase2.pr7.v1",
+    ) -> dict[str, Any]:
+        if lookback_window_days <= 0:
+            raise ValueError("lookback_window_days must be > 0")
+        try:
+            as_of = date.fromisoformat(as_of_date)
+        except ValueError as error:
+            raise ValueError("as_of_date must be YYYY-MM-DD") from error
+        lookback_start = as_of - timedelta(days=lookback_window_days - 1)
+        lookback_start_iso = lookback_start.isoformat()
+
         intent_rows = self.repo.fetch_all(
             "SELECT action_intent_id, status FROM action_intents WHERE as_of_date = ?",
             (as_of_date,),
@@ -388,6 +404,33 @@ class AutomationOrchestrator:
             "SELECT human_decision_id FROM human_decisions WHERE substr(decided_at, 1, 10) = ?",
             (as_of_date,),
         )
+        decisions_in_exceptions_row = self.repo.fetch_one(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM human_decisions
+            WHERE substr(decided_at, 1, 10) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        )
+        user_override_row = self.repo.fetch_one(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM automation_decisions
+            WHERE decision IN ('user_corrected', 'user_confirmed')
+              AND substr(created_at, 1, 10) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        )
+        manual_via_exceptions = int((decisions_in_exceptions_row or {"cnt": 0})["cnt"] or 0)
+        manual_user_overrides = int((user_override_row or {"cnt": 0})["cnt"] or 0)
+        manual_total = manual_via_exceptions + manual_user_overrides
+        if manual_total == 0:
+            manual_interactions_in_exceptions_rate = 1.0
+            manual_interactions_gate_pass = True
+        else:
+            manual_interactions_in_exceptions_rate = manual_via_exceptions / manual_total
+            manual_interactions_gate_pass = manual_interactions_in_exceptions_rate >= 0.80
+
         total_intents = len(intent_rows)
         success_exec = sum(1 for row in exec_rows if str(row.get("status") or "").upper() in {"SUCCESS", "SKIPPED"})
         open_count = len(cases_open)
@@ -395,12 +438,21 @@ class AutomationOrchestrator:
         auto_action_success_rate = round(success_exec / total_intents, 4) if total_intents else 0.0
         metrics = {
             "as_of_date": as_of_date,
+            "lookback_window_days": int(lookback_window_days),
+            "lookback_window_start_date": lookback_start_iso,
+            "benchmark_version": benchmark_version,
             "intents_total": total_intents,
             "executions_success_or_skipped": success_exec,
             "exceptions_open": open_count,
             "manual_intervention_count": len(decisions),
             "touchless_rate": touchless_rate,
             "auto_action_success_rate": auto_action_success_rate,
+            "manual_interactions_via_exceptions": manual_via_exceptions,
+            "manual_interactions_user_overrides": manual_user_overrides,
+            "manual_interactions_total": manual_total,
+            "manual_interactions_in_exceptions_rate": round(manual_interactions_in_exceptions_rate, 4),
+            "manual_interactions_in_exceptions_gate_threshold": 0.80,
+            "manual_interactions_in_exceptions_gate_pass": bool(manual_interactions_gate_pass),
         }
         out_dir.mkdir(parents=True, exist_ok=True)
         metrics_path = out_dir / f"autonomy_metrics_{as_of_date}.json"
