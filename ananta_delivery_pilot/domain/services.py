@@ -1940,6 +1940,44 @@ class Phase1Service:
                 "status": updated["status"] if updated else row["status"],
             }
 
+    def approve_planned_deliveries(self, *, contract_id: str) -> dict[str, Any]:
+        with self.repo.transaction() as conn:
+            now = utc_now_iso_z()
+            contract_row = conn.execute(
+                "SELECT lpo_state FROM contracts WHERE contract_id = ?",
+                (contract_id,),
+            ).fetchone()
+            if not contract_row:
+                raise ValueError(f"Unknown contract_id: {contract_id}")
+            contract_row = dict(contract_row)
+            if str(contract_row.get("lpo_state") or "").upper() != "ACTIVE":
+                raise ValueError("Cannot approve plan for non-ACTIVE contract")
+            pending_rows = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM planned_deliveries
+                WHERE contract_id = ?
+                  AND status = 'PLANNED'
+                """,
+                (contract_id,),
+            ).fetchone()
+            scheduled_count = int((pending_rows or {"total": 0})["total"] or 0)
+            conn.execute(
+                """
+                UPDATE planned_deliveries
+                SET status = 'SCHEDULED',
+                    updated_at = ?
+                WHERE contract_id = ?
+                  AND status = 'PLANNED'
+                """,
+                (now, contract_id),
+            )
+            return {
+                "ok": True,
+                "contract_id": contract_id,
+                "scheduled_count": scheduled_count,
+            }
+
     def materialize_due_deliveries(
         self,
         *,

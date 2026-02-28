@@ -118,6 +118,7 @@ class Phase2UiRouteTests(unittest.TestCase):
                 body = response.read().decode("utf-8")
                 self.assertIn("Advanced intake fields", body)
                 self.assertIn("Parse LPO + Review", body)
+                self.assertIn("Critical fields", body.lower())
         finally:
             _stop_process(proc)
 
@@ -156,6 +157,8 @@ class Phase2UiRouteTests(unittest.TestCase):
             )
             self.assertIn("Intake Review", parse_html)
             self.assertIn("LPO-UI-PARSE-001", parse_html)
+            self.assertIn("Parser Diff + Decision Trace", parse_html)
+            self.assertIn("Expected Qty (KG)", parse_html)
             run_id = _hidden_value(parse_html, "intake_run_id")
             self.assertTrue(run_id)
 
@@ -181,6 +184,7 @@ class Phase2UiRouteTests(unittest.TestCase):
                 "product_code": "RBDSO",
                 "description": "UI parser contract corrected",
                 "expected_qty_mt": "150.000",
+                "expected_qty_kg": "150000",
                 "unit_price": "2270",
                 "unit_price_basis": "KG",
                 "currency": "NGN",
@@ -247,6 +251,60 @@ class Phase2UiRouteTests(unittest.TestCase):
             self.assertEqual(run_id_1, run_id_2)
             open_2 = self.repo.list_exceptions(run_id=run_id_2, status="OPEN")
             self.assertEqual(len(open_1), len(open_2))
+        finally:
+            _stop_process(proc)
+
+    def test_plan_rebuild_block_routes_to_exceptions(self) -> None:
+        contract = self.service.create_contract(
+            {
+                "contract_ref": "LPO-UI-PLAN-BLOCK-001",
+                "lpo_no": "LPO-UI-PLAN-BLOCK-001",
+                "lpo_date": "2026-02-23",
+                "buyer_id": "buyer_nycil",
+                "vendor_of_record_id": "ananta_flows",
+                "operator_id": "guildgate",
+                "source_id": "ananta_flows",
+                "processor_id": "processor_partner_refinery",
+                "currency": "NGN",
+                "issue_date": "2026-02-23",
+                "lpo_valid_from": "2026-02-23",
+                "lpo_valid_to": "2026-02-23",
+                "expected_total_qty": 150.0,
+                "expected_total_value": 340500000.0,
+                "lines": [
+                    {
+                        "product_code": "RBDPO",
+                        "description": "RBDPO short window",
+                        "expected_qty": 150.0,
+                        "unit": "mt",
+                        "unit_price": 2270.0,
+                        "unit_price_basis": "KG",
+                        "expected_value": 340500000.0,
+                    }
+                ],
+            },
+            allow_placeholder_tin=True,
+        )
+        contract_id = str(contract["contract_id"])
+        try:
+            port = _pick_free_port()
+        except PermissionError:
+            self.skipTest("socket bind not permitted in current sandbox")
+        proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
+        try:
+            _wait_for_route(port, f"/v2/contracts/{contract_id}/plan")
+            response_html = _post_form(
+                port=port,
+                path=f"/v2/contracts/{contract_id}/plan/rebuild",
+                fields={
+                    "start_date": "2026-02-23",
+                    "cadence": "daily",
+                    "max_lots_per_day": "1",
+                },
+            )
+            self.assertIn("Exceptions Queue", response_html)
+            self.assertIn(contract_id, response_html)
+            self.assertIn("planning_window_invalid", response_html)
         finally:
             _stop_process(proc)
 

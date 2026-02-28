@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 from adapters.lpo_parser import PARSER_VERSION, parse_lpo
 from adapters.sqlite_repo import SQLiteRepo
 from core.config import RuntimeConfig
+from core.hashing import canonical_json_sha256
 from core.ids import new_ulid
 from core.time import utc_now_iso_z, utc_today_iso
 from core.units import kg_to_mt_str, mt_to_kg_int
@@ -46,6 +47,72 @@ def _safe_filename(name: str) -> str:
     return cleaned or "upload"
 
 
+_INTAKE_FIELD_CLASS_MAP: dict[str, str] = {
+    "buyer_id": "identity",
+    "vendor_of_record_id": "identity",
+    "source_id": "identity",
+    "processor_id": "identity",
+    "product_code": "identity",
+    "lpo_no": "identity",
+    "expected_qty_kg": "quantity",
+    "expected_qty_mt": "quantity",
+    "unit_price": "pricing",
+    "unit_price_basis": "pricing",
+    "lpo_date": "date",
+    "issue_date": "date",
+    "lpo_valid_from": "date",
+    "lpo_valid_to": "date",
+}
+
+_INTAKE_DEFAULT_CONFIDENCE_MATRIX: dict[str, dict[str, float]] = {
+    "identity": {"auto_apply_min": 0.93, "review_min": 0.75},
+    "quantity": {"auto_apply_min": 0.95, "review_min": 0.75},
+    "pricing": {"auto_apply_min": 0.95, "review_min": 0.75},
+    "date": {"auto_apply_min": 0.93, "review_min": 0.75},
+    "document_linkage": {"auto_apply_min": 0.93, "review_min": 0.75},
+}
+
+
+def intake_field_class(field_name: str) -> str:
+    key = str(field_name or "").strip()
+    return _INTAKE_FIELD_CLASS_MAP.get(key, "identity")
+
+
+def resolve_intake_confidence_matrix(automation_thresholds: dict[str, object] | None) -> dict[str, dict[str, float]]:
+    matrix = {name: dict(values) for name, values in _INTAKE_DEFAULT_CONFIDENCE_MATRIX.items()}
+    root = automation_thresholds if isinstance(automation_thresholds, dict) else {}
+    intake_cfg = root.get("intake") if isinstance(root.get("intake"), dict) else {}
+    configured = intake_cfg.get("confidence_matrix") if isinstance(intake_cfg.get("confidence_matrix"), dict) else {}
+    for field_class, thresholds in configured.items():
+        if not isinstance(thresholds, dict):
+            continue
+        current = matrix.setdefault(str(field_class), {"auto_apply_min": 0.93, "review_min": 0.75})
+        auto_min = thresholds.get("auto_apply_min")
+        review_min = thresholds.get("review_min")
+        if auto_min not in (None, ""):
+            current["auto_apply_min"] = float(auto_min)
+        if review_min not in (None, ""):
+            current["review_min"] = float(review_min)
+    return matrix
+
+
+def intake_decision_for_confidence(
+    *,
+    field_name: str,
+    confidence: float,
+    matrix: dict[str, dict[str, float]],
+) -> tuple[str, str, str, float, float]:
+    field_class = intake_field_class(field_name)
+    thresholds = matrix.get(field_class) or matrix.get("identity") or _INTAKE_DEFAULT_CONFIDENCE_MATRIX["identity"]
+    auto_apply_min = float(thresholds.get("auto_apply_min", 0.93))
+    review_min = float(thresholds.get("review_min", 0.75))
+    if confidence >= auto_apply_min:
+        return ("auto_applied", "auto_threshold_met", field_class, auto_apply_min, review_min)
+    if confidence >= review_min:
+        return ("needs_review", "review_threshold", field_class, auto_apply_min, review_min)
+    return ("blocked", "below_review_threshold", field_class, auto_apply_min, review_min)
+
+
 def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> None:
     config = RuntimeConfig.load(root_dir)
     repo = SQLiteRepo(config.state_dir / "drep.sqlite")
@@ -59,6 +126,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
     route_intake_confirm = re.compile(r"^/v2/intake/confirm$")
     route_plan_rebuild = re.compile(r"^/v2/contracts/([^/]+)/plan/rebuild$")
     route_plan_update = re.compile(r"^/v2/contracts/([^/]+)/plan/update$")
+    route_plan_approve = re.compile(r"^/v2/contracts/([^/]+)/plan/approve$")
     route_execute_due = re.compile(r"^/v2/contracts/([^/]+)/execute/materialize-due$")
     route_execute_one = re.compile(r"^/v2/contracts/([^/]+)/execute/materialize-one$")
     route_generate_pack = re.compile(r"^/v2/contracts/([^/]+)/execute/generate-pack$")
@@ -153,6 +221,10 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 if match:
                     self._handle_plan_update(match.group(1))
                     return
+                match = route_plan_approve.match(route)
+                if match:
+                    self._handle_plan_approve(match.group(1))
+                    return
                 match = route_execute_due.match(route)
                 if match:
                     self._handle_execute_materialize_due(match.group(1))
@@ -192,8 +264,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
 
         def _render_intake(self, query: dict[str, list[str]]) -> None:
             msg, level = self._msg(query)
-            today = dt.date.today().isoformat()
-            due = (dt.date.today() + dt.timedelta(days=14)).isoformat()
+            today = utc_today_iso()
+            due = (dt.date.fromisoformat(today) + dt.timedelta(days=14)).isoformat()
             buyers = self._entity_options(prefix="buyer_")
             vendors = [("guildgate", config.registry.get("guildgate").name), ("ananta_flows", config.registry.get("ananta_flows").name)]
             processors = self._entity_options(prefix="processor_")
@@ -376,7 +448,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             msg, level = self._msg(query)
             contract = self._contract(contract_id)
             planned_rows = service.planned_rows(contract_id=contract_id, limit=500)
-            today = dt.date.today().isoformat()
+            today = utc_today_iso()
             parts = [
                 f"<h2>Plan - { _escape(contract.get('lpo_no') or contract_id) }</h2>",
                 "<p class='muted'>Auto-split and schedule preview. Edit quantity/date only for exceptions.</p>",
@@ -416,7 +488,12 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 parts.append("<tr><td colspan='6' class='muted'>No planned deliveries yet.</td></tr>")
             parts.append("</tbody></table>")
             parts.append(
-                f"<div class='actions'><a class='btn' href='/v2/contracts/{_escape(contract_id)}/execute'>Proceed to Execute</a></div>"
+                "<div class='actions'>"
+                f"<form method='POST' action='/v2/contracts/{_escape(contract_id)}/plan/approve' class='inline-form'>"
+                "<button type='submit'>Approve Plan + Continue</button>"
+                "</form>"
+                f"<a class='btn' href='/v2/contracts/{_escape(contract_id)}/execute'>Proceed to Execute</a>"
+                "</div>"
             )
             self._render_page("Plan", "".join(parts), active="plan", msg=msg, level=level)
 
@@ -432,7 +509,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 """,
                 (contract_id,),
             )
-            today = dt.date.today().isoformat()
+            today = utc_today_iso()
             run_id = str((query.get("run_id") or [""])[0] or "").strip()
             run_timeline = service.command_center_timeline(
                 autonomy_run_id=run_id,
@@ -551,7 +628,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 """,
                 (contract_id,),
             )
-            today = dt.date.today().isoformat()
+            today = utc_today_iso()
             sales_options = [(str(row["sales_transaction_id"]), f"{row['invoice_no']} | outstanding={row['outstanding_balance']}") for row in sales_rows]
             default_sale = sales_options[0][0] if sales_options else ""
             default_amount = float(sales_rows[0]["outstanding_balance"]) if sales_rows else 0.0
@@ -758,7 +835,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     *[str(code).upper() for code in (config.delivery_policies.get("products") or {}).keys()],
                 }
             )
-            today = dt.date.today().isoformat()
+            today = utc_today_iso()
             info = "Existing parse context reused (idempotent)." if reused else "Review auto-prefilled fields and confirm."
             row_index = {str(row.get("field_name") or ""): row for row in field_rows}
 
@@ -772,74 +849,119 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     f"<span class='muted'> {_escape(reason)}</span>"
                 )
 
+            def _value(name: str, fallback: object = "") -> str:
+                raw = prefill.get(name)
+                if raw in (None, ""):
+                    raw = fallback
+                return str(raw if raw is not None else "")
+
+            qty_kg_raw = _value("expected_qty_kg")
+            if not qty_kg_raw:
+                qty_mt_raw = _value("expected_qty_mt")
+                if qty_mt_raw:
+                    try:
+                        qty_kg_raw = str(mt_to_kg_int(float(qty_mt_raw)))
+                    except Exception:
+                        qty_kg_raw = ""
+            qty_mt_display = ""
+            if qty_kg_raw:
+                try:
+                    qty_mt_display = kg_to_mt_str(int(float(qty_kg_raw)))
+                except Exception:
+                    qty_mt_display = _value("expected_qty_mt")
+
+            def _registry_value(name: str) -> str:
+                if name in {"buyer_id", "vendor_of_record_id", "source_id", "processor_id"}:
+                    candidate = str(prefill.get(name) or "").strip()
+                    if not candidate:
+                        return "-"
+                    entity = config.registry.entities.get(candidate)
+                    if not entity:
+                        return candidate
+                    return f"{candidate} ({entity.name})"
+                if name == "unit_price_basis":
+                    return "KG"
+                if name == "currency":
+                    return "NGN"
+                return "-"
+
             body = [
                 "<h2>Intake Review</h2>",
                 f"<p class='muted'>{_escape(info)}</p>",
                 "<form method='POST' action='/v2/intake/confirm'>",
                 f"<input type='hidden' name='intake_run_id' value='{_escape(run_id)}' />",
                 f"<input type='hidden' name='intake_evidence_paths_json' value='{_escape(json.dumps(evidence_paths))}' />",
+                f"<input type='hidden' name='expected_qty_mt' value='{_escape(qty_mt_display)}' />",
+                "<h3>Critical Fields</h3>",
                 "<div class='grid'>",
-                f"<label>LPO No / Contract Ref</label><input type='text' name='lpo_no' value='{_escape(prefill.get('lpo_no') or '')}' required />",
+                f"<label>LPO No / Contract Ref</label><input type='text' name='lpo_no' value='{_escape(_value('lpo_no'))}' required />",
                 f"<label>Confidence</label><div>{_badge('lpo_no')}</div>",
-                f"<label>LPO Date</label><input type='date' name='lpo_date' value='{_escape(prefill.get('lpo_date') or '')}' />",
-                f"<label>Confidence</label><div>{_badge('lpo_date')}</div>",
-                f"<label>Issue Date</label><input type='date' name='issue_date' value='{_escape(prefill.get('issue_date') or today)}' required />",
-                f"<label>Confidence</label><div>{_badge('issue_date')}</div>",
-                f"<label>LPO Valid From</label><input type='date' name='lpo_valid_from' value='{_escape(prefill.get('lpo_valid_from') or prefill.get('issue_date') or today)}' />",
-                f"<label>Confidence</label><div>{_badge('lpo_valid_from')}</div>",
-                f"<label>LPO Valid To</label><input type='date' name='lpo_valid_to' value='{_escape(prefill.get('lpo_valid_to') or '')}' />",
-                f"<label>Confidence</label><div>{_badge('lpo_valid_to')}</div>",
-                f"<label>Buyer</label>{self._select('buyer_id', buyers, selected=str(prefill.get('buyer_id') or ''))}",
+                f"<label>Buyer</label>{self._select('buyer_id', buyers, selected=_value('buyer_id'))}",
                 f"<label>Confidence</label><div>{_badge('buyer_id')}</div>",
-                f"<label>Vendor-of-record</label>{self._select('vendor_of_record_id', vendors, selected=str(prefill.get('vendor_of_record_id') or 'ananta_flows'))}",
+                f"<label>Vendor-of-record</label>{self._select('vendor_of_record_id', vendors, selected=_value('vendor_of_record_id', 'ananta_flows'))}",
                 f"<label>Confidence</label><div>{_badge('vendor_of_record_id')}</div>",
-                f"<label>Source / Producer</label>{self._select('source_id', sources, selected=str(prefill.get('source_id') or 'ananta_flows'))}",
-                f"<label>Confidence</label><div>{_badge('source_id')}</div>",
-                f"<label>Processor</label>{self._select('processor_id', processors, selected=str(prefill.get('processor_id') or 'processor_partner_refinery'))}",
-                f"<label>Confidence</label><div>{_badge('processor_id')}</div>",
-                f"<label>Product Code</label>{self._select('product_code', [(item, item) for item in product_codes], selected=str(prefill.get('product_code') or ''))}",
+                f"<label>Product Code</label>{self._select('product_code', [(item, item) for item in product_codes], selected=_value('product_code'))}",
                 f"<label>Confidence</label><div>{_badge('product_code')}</div>",
-                f"<label>Description</label><input type='text' name='description' value='{_escape(prefill.get('description') or '')}' />",
-                f"<label>Confidence</label><div>{_badge('description')}</div>",
-                f"<label>Expected Qty (MT)</label><input type='number' step='0.001' name='expected_qty_mt' value='{_escape(prefill.get('expected_qty_mt') or '')}' required />",
-                f"<label>Confidence</label><div>{_badge('expected_qty_mt')}</div>",
-                f"<label>Unit Price</label><input type='number' step='0.01' name='unit_price' value='{_escape(prefill.get('unit_price') or '')}' required />",
+                f"<label>Expected Qty (KG)</label><input type='number' min='1' step='1' name='expected_qty_kg' value='{_escape(qty_kg_raw)}' required />",
+                f"<label>Confidence</label><div>{_badge('expected_qty_kg')} <span class='muted'>(display: {_escape(qty_mt_display)} MT)</span></div>",
+                f"<label>Unit Price</label><input type='number' step='0.01' name='unit_price' value='{_escape(_value('unit_price'))}' required />",
                 f"<label>Confidence</label><div>{_badge('unit_price')}</div>",
                 "<label>Unit Price Basis</label><select name='unit_price_basis'>"
-                f"<option value='KG'{' selected' if str(prefill.get('unit_price_basis') or 'KG').upper() == 'KG' else ''}>KG</option>"
-                f"<option value='MT'{' selected' if str(prefill.get('unit_price_basis') or '').upper() == 'MT' else ''}>MT</option>"
+                f"<option value='KG'{' selected' if _value('unit_price_basis', 'KG').upper() == 'KG' else ''}>KG</option>"
+                f"<option value='MT'{' selected' if _value('unit_price_basis').upper() == 'MT' else ''}>MT</option>"
                 "</select>",
                 f"<label>Confidence</label><div>{_badge('unit_price_basis')}</div>",
-                f"<label>Currency</label><input type='text' name='currency' value='{_escape(prefill.get('currency') or 'NGN')}' />",
+                "</div>",
+                "<details class='advanced'><summary>Advanced intake fields</summary>",
+                "<div class='grid'>",
+                f"<label>LPO Date</label><input type='date' name='lpo_date' value='{_escape(_value('lpo_date'))}' />",
+                f"<label>Confidence</label><div>{_badge('lpo_date')}</div>",
+                f"<label>Issue Date</label><input type='date' name='issue_date' value='{_escape(_value('issue_date', today))}' required />",
+                f"<label>Confidence</label><div>{_badge('issue_date')}</div>",
+                f"<label>LPO Valid From</label><input type='date' name='lpo_valid_from' value='{_escape(_value('lpo_valid_from', _value('issue_date', today)))}' />",
+                f"<label>Confidence</label><div>{_badge('lpo_valid_from')}</div>",
+                f"<label>LPO Valid To</label><input type='date' name='lpo_valid_to' value='{_escape(_value('lpo_valid_to'))}' />",
+                f"<label>Confidence</label><div>{_badge('lpo_valid_to')}</div>",
+                f"<label>Source / Producer</label>{self._select('source_id', sources, selected=_value('source_id', 'ananta_flows'))}",
+                f"<label>Confidence</label><div>{_badge('source_id')}</div>",
+                f"<label>Processor</label>{self._select('processor_id', processors, selected=_value('processor_id', 'processor_partner_refinery'))}",
+                f"<label>Confidence</label><div>{_badge('processor_id')}</div>",
+                f"<label>Description</label><input type='text' name='description' value='{_escape(_value('description'))}' />",
+                f"<label>Confidence</label><div>{_badge('description')}</div>",
+                f"<label>Currency</label><input type='text' name='currency' value='{_escape(_value('currency', 'NGN'))}' />",
                 f"<label>Confidence</label><div>{_badge('currency')}</div>",
-                f"<label>Plan Start Date</label><input type='date' name='start_date' value='{_escape(prefill.get('start_date') or prefill.get('issue_date') or today)}' />",
+                f"<label>Plan Start Date</label><input type='date' name='start_date' value='{_escape(_value('start_date', _value('issue_date', today)))}' />",
                 "<label>Cadence</label><select name='cadence'><option value='daily'>daily</option><option value='manual'>manual</option></select>",
                 "<label>Max Lots / Day</label><input type='number' min='1' name='max_lots_per_day' value='1' />",
-                f"<label>Tolerance %</label><input type='number' step='0.01' name='tolerance_pct' value='{_escape(prefill.get('tolerance_pct') or 5.0)}' />",
+                f"<label>Tolerance %</label><input type='number' step='0.01' name='tolerance_pct' value='{_escape(_value('tolerance_pct', 5.0))}' />",
                 "<label>Options</label><div>"
                 + _checkbox("allow_placeholder_tin", "Allow placeholder TIN (dev)", True)
                 + "</div>",
                 "</div>",
+                "</details>",
                 "<div class='actions'>"
                 "<button type='submit'>Confirm Intake + Create Contract + Plan</button>"
                 "<a class='btn' href='/v2/intake'>Back</a>"
                 "</div>",
                 "</form>",
-                "<h3>Parser Decision Trace</h3>",
-                "<table><thead><tr><th>Field</th><th>Proposed</th><th>Confidence</th><th>Decision</th><th>Reason</th></tr></thead><tbody>",
+                "<h3>Parser Diff + Decision Trace</h3>",
+                "<table><thead><tr><th>Field</th><th>Extracted</th><th>Registry</th><th>Final</th><th>Confidence</th><th>Decision</th><th>Reason</th></tr></thead><tbody>",
             ]
             for row in field_rows:
+                field_name = str(row.get("field_name") or "")
                 body.append(
                     "<tr>"
-                    f"<td>{_escape(row.get('field_name'))}</td>"
+                    f"<td>{_escape(field_name)}</td>"
                     f"<td>{_escape(row.get('proposed_value'))}</td>"
+                    f"<td>{_escape(_registry_value(field_name))}</td>"
+                    f"<td>{_escape(_value(field_name))}</td>"
                     f"<td>{_escape(row.get('confidence'))}</td>"
                     f"<td>{_escape(row.get('decision'))}</td>"
                     f"<td>{_escape(row.get('reason_code'))}</td>"
                     "</tr>"
                 )
             if not field_rows:
-                body.append("<tr><td colspan='5' class='muted'>No parser field rows available.</td></tr>")
+                body.append("<tr><td colspan='7' class='muted'>No parser field rows available.</td></tr>")
             body.append("</tbody></table>")
             self._render_page("Intake Review", "".join(body), active="intake")
 
@@ -888,8 +1010,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     path.unlink(missing_ok=True)
                 except Exception:
                     pass
-            auto_min = self._intake_auto_apply_min()
             critical_fields = self._intake_critical_fields()
+            confidence_matrix = self._intake_confidence_matrix()
             now = utc_now_iso_z()
             field_rows: list[dict[str, object]] = []
             exception_count = 0
@@ -898,7 +1020,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     conn,
                     run_id=run_id,
                     idempotency_key=idempotency_key,
-                    as_of_date=dt.date.today().isoformat(),
+                    as_of_date=utc_today_iso(),
                     dry_run=False,
                     input_payload={
                         "source": "web_v2_intake",
@@ -910,9 +1032,16 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 )
                 for field in parsed.fields:
                     confidence = float(field.confidence)
-                    decision = "auto_applied" if confidence >= auto_min else "needs_review"
+                    decision, threshold_reason, field_class, auto_apply_min, review_min = intake_decision_for_confidence(
+                        field_name=field.field_name,
+                        confidence=confidence,
+                        matrix=confidence_matrix,
+                    )
                     row = field.as_dict()
                     row["decision"] = decision
+                    row["field_class"] = field_class
+                    row["auto_apply_min"] = auto_apply_min
+                    row["review_min"] = review_min
                     field_rows.append(row)
                     repo.add_automation_decision(
                         conn,
@@ -925,12 +1054,14 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                         source_ref=field.source_ref,
                         confidence=confidence,
                         decision=decision,
-                        reason_code=field.reason_code,
+                        reason_code=f"{field.reason_code}:{threshold_reason}",
                         rule_path=f"intake_parser.{field.field_name}",
                     )
                     if decision == "auto_applied":
                         continue
-                    severity = "BLOCKER" if field.field_name in critical_fields else "REVIEW"
+                    is_missing = self._is_missing_field_value(field.proposed_value)
+                    is_critical = field.field_name in critical_fields
+                    severity = "BLOCKER" if is_critical and (decision == "blocked" or is_missing) else "REVIEW"
                     repo.add_exception(
                         conn,
                         run_id=run_id,
@@ -939,7 +1070,10 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                         severity=severity,
                         field_name=field.field_name,
                         proposed_value=field.proposed_value,
-                        reason=f"{field.field_name} confidence={confidence:.2f} ({field.reason_code})",
+                        reason=(
+                            f"{field.field_name} class={field_class} confidence={confidence:.2f} "
+                            f"(auto>={auto_apply_min:.2f}, review>={review_min:.2f}, parser={field.reason_code})"
+                        ),
                         suggestions=field.suggestions,
                     )
                     exception_count += 1
@@ -979,7 +1113,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 uploaded_paths = self._collect_temp_uploads(form=form, field_name="lpo_originals")
             else:
                 data = self._urlencoded_fields()
-            issue_date = data.get("issue_date") or dt.date.today().isoformat()
+            issue_date = data.get("issue_date") or utc_today_iso()
             expected_qty_kg_raw = str(data.get("expected_qty_kg") or "").strip()
             if expected_qty_kg_raw:
                 expected_qty_kg = int(float(expected_qty_kg_raw))
@@ -995,13 +1129,26 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             if unit_price_basis not in {"KG", "MT"}:
                 unit_price_basis = "KG"
 
+            critical_values = {
+                "lpo_no": str(data.get("lpo_no") or "").strip(),
+                "buyer_id": str(data.get("buyer_id") or "").strip(),
+                "vendor_of_record_id": str(data.get("vendor_of_record_id") or "").strip(),
+                "product_code": str(data.get("product_code") or "").strip(),
+                "expected_qty_kg": str(expected_qty_kg),
+                "unit_price": str(unit_price),
+                "unit_price_basis": str(unit_price_basis),
+            }
+            missing_critical = [name for name, value in critical_values.items() if not str(value or "").strip()]
+            if missing_critical:
+                raise ValueError(f"missing critical intake fields: {', '.join(missing_critical)}")
+
             qty_mt_value = float(expected_qty_kg) / 1000.0
             if unit_price_basis == "MT":
                 expected_total_value = round(qty_mt_value * unit_price, 2)
             else:
                 expected_total_value = round(expected_qty_kg * unit_price, 2)
 
-            lpo_no = str(data.get("lpo_no") or "").strip()
+            lpo_no = critical_values["lpo_no"]
             if not lpo_no:
                 raise ValueError("lpo_no is required")
 
@@ -1009,8 +1156,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 "contract_ref": lpo_no,
                 "lpo_no": lpo_no,
                 "lpo_date": data.get("lpo_date") or None,
-                "buyer_id": data.get("buyer_id"),
-                "vendor_of_record_id": data.get("vendor_of_record_id"),
+                "buyer_id": critical_values["buyer_id"],
+                "vendor_of_record_id": critical_values["vendor_of_record_id"],
                 "operator_id": config.system_profile.operator_entity_id or "guildgate",
                 "source_id": data.get("source_id") or None,
                 "processor_id": data.get("processor_id") or None,
@@ -1027,7 +1174,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 "unit_price_basis": unit_price_basis,
                 "lines": [
                     {
-                        "product_code": str(data.get("product_code") or "").upper(),
+                        "product_code": str(critical_values["product_code"]).upper(),
                         "description": data.get("description") or f"Supply linked to {lpo_no}",
                         "expected_qty": expected_qty_kg,
                         "unit": "kgs",
@@ -1037,6 +1184,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 ],
             }
             contract = service.create_contract(payload, allow_placeholder_tin=bool(data.get("allow_placeholder_tin")))
+            contract_id = str(contract["contract_id"])
             persisted_evidence = self._load_intake_evidence_paths(data=data) + [str(path) for path in uploaded_paths]
             evidence_count = 0
             try:
@@ -1046,7 +1194,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                         path = (config.root_dir / path).resolve()
                     if not path.exists():
                         continue
-                    service.capture_evidence_original(contract_id=str(contract["contract_id"]), source_path=path)
+                    service.capture_evidence_original(contract_id=contract_id, source_path=path)
                     evidence_count += 1
             finally:
                 for file_path in uploaded_paths:
@@ -1054,27 +1202,50 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                         file_path.unlink(missing_ok=True)
                     except Exception:
                         pass
-            start_date = data.get("start_date") or issue_date
-            plan_result = service.plan_deliveries(
-                contract_id=str(contract["contract_id"]),
-                start_date=start_date,
-                cadence=data.get("cadence") or "daily",
-                max_lots_per_day=int(data.get("max_lots_per_day") or 1),
-            )
+            data["expected_qty_kg"] = str(expected_qty_kg)
             self._record_intake_confirm_decisions(
                 run_id=str(data.get("intake_run_id") or "").strip(),
                 submitted=data,
             )
+            start_date = data.get("start_date") or issue_date
+            try:
+                plan_result = service.plan_deliveries(
+                    contract_id=contract_id,
+                    start_date=start_date,
+                    cadence=data.get("cadence") or "daily",
+                    max_lots_per_day=int(data.get("max_lots_per_day") or 1),
+                )
+            except Exception as error:
+                case = self._record_exception_case(
+                    contract_id=contract_id,
+                    case_type="planning_blocker",
+                    severity="BLOCKER",
+                    reason_code="planning_window_invalid",
+                    details={
+                        "as_of_date": utc_today_iso(),
+                        "stage": "intake_confirm",
+                        "start_date": str(start_date),
+                        "cadence": str(data.get("cadence") or "daily"),
+                        "max_lots_per_day": int(data.get("max_lots_per_day") or 1),
+                        "error": str(error),
+                    },
+                )
+                self._flash_redirect(
+                    f"/v2/exceptions?contract_id={quote_plus(contract_id)}&case_id={quote_plus(str(case['exception_case_id']))}",
+                    f"Planning blocked after intake confirm: {error}",
+                    level="error",
+                )
+                return
             message = (
-                f"Created contract {contract['contract_id']} and planned {plan_result['planned_count']} deliveries"
+                f"Created contract {contract_id} and planned {plan_result['planned_count']} deliveries"
                 + (f" ({evidence_count} evidence files captured)" if evidence_count else "")
             )
-            self._flash_redirect(f"/v2/contracts/{contract['contract_id']}/plan", message)
+            self._flash_redirect(f"/v2/contracts/{contract_id}/plan", message)
 
         def _handle_intake(self) -> None:
             form = self._multipart()
             data = self._form_values(form)
-            issue_date = data.get("issue_date") or dt.date.today().isoformat()
+            issue_date = data.get("issue_date") or utc_today_iso()
             expected_qty_mt = float(data.get("expected_qty_mt") or 0.0)
             if expected_qty_mt <= 0:
                 raise ValueError("expected_qty_mt must be > 0")
@@ -1118,26 +1289,49 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             }
 
             contract = service.create_contract(payload, allow_placeholder_tin=bool(data.get("allow_placeholder_tin")))
+            contract_id = str(contract["contract_id"])
             evidence_count = self._capture_uploaded_files(
                 form=form,
                 field_name="lpo_originals",
-                contract_id=str(contract["contract_id"]),
+                contract_id=contract_id,
             )
-            plan_result = service.plan_deliveries(
-                contract_id=str(contract["contract_id"]),
-                start_date=data.get("start_date") or issue_date,
-                cadence=data.get("cadence") or "daily",
-                max_lots_per_day=int(data.get("max_lots_per_day") or 1),
-            )
+            try:
+                plan_result = service.plan_deliveries(
+                    contract_id=contract_id,
+                    start_date=data.get("start_date") or issue_date,
+                    cadence=data.get("cadence") or "daily",
+                    max_lots_per_day=int(data.get("max_lots_per_day") or 1),
+                )
+            except Exception as error:
+                case = self._record_exception_case(
+                    contract_id=contract_id,
+                    case_type="planning_blocker",
+                    severity="BLOCKER",
+                    reason_code="planning_window_invalid",
+                    details={
+                        "as_of_date": utc_today_iso(),
+                        "stage": "manual_intake",
+                        "start_date": str(data.get("start_date") or issue_date),
+                        "cadence": str(data.get("cadence") or "daily"),
+                        "max_lots_per_day": int(data.get("max_lots_per_day") or 1),
+                        "error": str(error),
+                    },
+                )
+                self._flash_redirect(
+                    f"/v2/exceptions?contract_id={quote_plus(contract_id)}&case_id={quote_plus(str(case['exception_case_id']))}",
+                    f"Planning blocked after manual intake: {error}",
+                    level="error",
+                )
+                return
             message = (
-                f"Created contract {contract['contract_id']} and planned {plan_result['planned_count']} deliveries"
+                f"Created contract {contract_id} and planned {plan_result['planned_count']} deliveries"
                 + (f" ({evidence_count} evidence files captured)" if evidence_count else "")
             )
-            self._flash_redirect(f"/v2/contracts/{contract['contract_id']}/plan", message)
+            self._flash_redirect(f"/v2/contracts/{contract_id}/plan", message)
 
         def _handle_plan_rebuild(self, contract_id: str) -> None:
             fields = self._urlencoded_fields()
-            start_date = str(fields.get("start_date") or dt.date.today().isoformat()).strip()
+            start_date = str(fields.get("start_date") or utc_today_iso()).strip()
             cadence = str(fields.get("cadence") or "daily").strip()
             max_lots = int(fields.get("max_lots_per_day") or 1)
             with repo.transaction() as conn:
@@ -1150,12 +1344,33 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     """,
                     (contract_id,),
                 )
-            result = service.plan_deliveries(
-                contract_id=contract_id,
-                start_date=start_date,
-                cadence=cadence,
-                max_lots_per_day=max_lots,
-            )
+            try:
+                result = service.plan_deliveries(
+                    contract_id=contract_id,
+                    start_date=start_date,
+                    cadence=cadence,
+                    max_lots_per_day=max_lots,
+                )
+            except Exception as error:
+                case = self._record_exception_case(
+                    contract_id=contract_id,
+                    case_type="planning_blocker",
+                    severity="BLOCKER",
+                    reason_code="planning_window_invalid",
+                    details={
+                        "as_of_date": utc_today_iso(),
+                        "start_date": start_date,
+                        "cadence": cadence,
+                        "max_lots_per_day": max_lots,
+                        "error": str(error),
+                    },
+                )
+                self._flash_redirect(
+                    f"/v2/exceptions?contract_id={quote_plus(contract_id)}&case_id={quote_plus(str(case['exception_case_id']))}",
+                    f"Plan rebuild blocked: {error}",
+                    level="error",
+                )
+                return
             self._flash_redirect(
                 f"/v2/contracts/{contract_id}/plan",
                 f"Plan rebuilt with {result['planned_count']} planned deliveries",
@@ -1169,15 +1384,61 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             planned_date = str(fields.get("planned_date") or "").strip() or None
             qty_raw = str(fields.get("planned_qty_mt") or "").strip()
             qty_mt = float(qty_raw) if qty_raw else None
-            result = service.update_planned_delivery(
-                planned_delivery_id=planned_delivery_id,
-                planned_date=planned_date,
-                planned_qty_mt=qty_mt,
-                notes="web_v2_edit",
-            )
+            try:
+                result = service.update_planned_delivery(
+                    planned_delivery_id=planned_delivery_id,
+                    planned_date=planned_date,
+                    planned_qty_mt=qty_mt,
+                    notes="web_v2_edit",
+                )
+            except Exception as error:
+                case = self._record_exception_case(
+                    contract_id=contract_id,
+                    case_type="planning_override_blocked",
+                    severity="BLOCKER",
+                    reason_code="planned_row_update_invalid",
+                    details={
+                        "as_of_date": utc_today_iso(),
+                        "planned_delivery_id": planned_delivery_id,
+                        "planned_date": planned_date,
+                        "planned_qty_mt": qty_mt,
+                        "error": str(error),
+                    },
+                )
+                self._flash_redirect(
+                    f"/v2/exceptions?contract_id={quote_plus(contract_id)}&case_id={quote_plus(str(case['exception_case_id']))}",
+                    f"Plan update blocked: {error}",
+                    level="error",
+                )
+                return
             self._flash_redirect(
                 f"/v2/contracts/{contract_id}/plan",
                 f"Updated planned delivery {result['planned_delivery_id']}",
+            )
+
+        def _handle_plan_approve(self, contract_id: str) -> None:
+            try:
+                result = service.approve_planned_deliveries(contract_id=contract_id)
+            except Exception as error:
+                case = self._record_exception_case(
+                    contract_id=contract_id,
+                    case_type="planning_approval_blocked",
+                    severity="BLOCKER",
+                    reason_code="plan_approval_invalid",
+                    details={
+                        "as_of_date": utc_today_iso(),
+                        "error": str(error),
+                    },
+                )
+                self._flash_redirect(
+                    f"/v2/exceptions?contract_id={quote_plus(contract_id)}&case_id={quote_plus(str(case['exception_case_id']))}",
+                    f"Plan approval blocked: {error}",
+                    level="error",
+                )
+                return
+            self._flash_redirect(
+                f"/v2/contracts/{contract_id}/execute",
+                f"Plan approved (scheduled rows: {result['scheduled_count']})",
             )
 
         def _handle_execute_materialize_due(self, contract_id: str) -> None:
@@ -1185,7 +1446,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             data = self._form_values(form)
             uploaded = self._collect_temp_uploads(form=form, field_name="original_docs")
             try:
-                as_of_date = str(data.get("as_of_date") or dt.date.today().isoformat()).strip()
+                as_of_date = str(data.get("as_of_date") or utc_today_iso()).strip()
                 service.refresh_contract_state(as_of_date=as_of_date)
                 contract_row = repo.fetch_one("SELECT lpo_state FROM contracts WHERE contract_id = ?", (contract_id,))
                 if not contract_row or str(contract_row.get("lpo_state") or "").upper() != "ACTIVE":
@@ -1270,7 +1531,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             planned_delivery_id = str(fields.get("planned_delivery_id") or "").strip()
             if not planned_delivery_id:
                 raise ValueError("planned_delivery_id is required")
-            as_of_date = dt.date.today().isoformat()
+            as_of_date = utc_today_iso()
             service.refresh_contract_state(as_of_date=as_of_date)
             contract_row = repo.fetch_one("SELECT lpo_state FROM contracts WHERE contract_id = ?", (contract_id,))
             if not contract_row or str(contract_row.get("lpo_state") or "").upper() != "ACTIVE":
@@ -1331,7 +1592,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 raise ValueError("amount_received must be > 0")
             external_reference = str(fields.get("external_reference") or "").strip() or f"WEB-{new_ulid()}"
             payload = {
-                "payment_date": str(fields.get("payment_date") or dt.date.today().isoformat()).strip(),
+                "payment_date": str(fields.get("payment_date") or utc_today_iso()).strip(),
                 "payment_method": str(fields.get("payment_method") or "Bank Transfer").strip(),
                 "external_reference": external_reference,
                 "idempotency_key": external_reference,
@@ -1352,7 +1613,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
 
         def _handle_settle_export(self, contract_id: str) -> None:
             fields = self._urlencoded_fields()
-            as_of = str(fields.get("as_of_date") or dt.date.today().isoformat()).strip()
+            as_of = str(fields.get("as_of_date") or utc_today_iso()).strip()
             out_dir = config.state_dir / "exports" / "web_v2" / as_of / dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
             result = service.export_drep(as_of_date=as_of, out_dir=out_dir)
             self._flash_redirect(
@@ -1514,7 +1775,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             external_reference = str(fields.get("external_reference") or "").strip() or f"WEB-{new_ulid()}"
             result = service.mark_paid(
                 {
-                    "payment_date": str(fields.get("payment_date") or dt.date.today().isoformat()).strip(),
+                    "payment_date": str(fields.get("payment_date") or utc_today_iso()).strip(),
                     "payment_method": str(fields.get("payment_method") or "Bank Transfer").strip(),
                     "external_reference": external_reference,
                     "idempotency_key": external_reference,
@@ -1528,7 +1789,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
 
         def _handle_export_legacy(self) -> None:
             fields = self._urlencoded_fields()
-            as_of = str(fields.get("as_of_date") or dt.date.today().isoformat()).strip()
+            as_of = str(fields.get("as_of_date") or utc_today_iso()).strip()
             out_dir = config.state_dir / "exports" / "web_v2" / as_of / dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
             service.export_drep(as_of_date=as_of, out_dir=out_dir)
             self._flash_redirect("/v2/portfolio", f"Legacy export completed for {as_of}")
@@ -1538,15 +1799,30 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             intake = root.get("intake") if isinstance(root.get("intake"), dict) else {}
             return float(intake.get("field_auto_apply_min", 0.90))
 
+        def _intake_confidence_matrix(self) -> dict[str, dict[str, float]]:
+            return resolve_intake_confidence_matrix(config.automation_thresholds)
+
         def _intake_critical_fields(self) -> set[str]:
             return {
                 "lpo_no",
                 "buyer_id",
                 "vendor_of_record_id",
                 "product_code",
-                "expected_qty_mt",
+                "expected_qty_kg",
                 "unit_price",
+                "unit_price_basis",
             }
+
+        def _is_missing_field_value(self, value: object) -> bool:
+            if value is None:
+                return True
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return True
+                if text.lower() in {"none", "null", "nan"}:
+                    return True
+            return False
 
         def _intake_prefill_from_fields(self, *, fields: list[dict[str, object]], fallback: dict[str, str]) -> dict[str, object]:
             prefill: dict[str, object] = {key: value for key, value in fallback.items()}
@@ -1558,12 +1834,18 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 if value in ("", None):
                     continue
                 prefill[name] = value
+            qty_kg = prefill.get("expected_qty_kg")
+            if qty_kg in (None, "") and prefill.get("expected_qty_mt") not in (None, ""):
+                try:
+                    prefill["expected_qty_kg"] = mt_to_kg_int(float(str(prefill.get("expected_qty_mt"))))
+                except Exception:
+                    pass
             if not prefill.get("expected_qty_mt"):
                 qty_kg = prefill.get("expected_qty_kg")
                 if qty_kg not in (None, ""):
                     prefill["expected_qty_mt"] = kg_to_mt_str(int(float(str(qty_kg))))
             if not prefill.get("issue_date"):
-                prefill["issue_date"] = dt.date.today().isoformat()
+                prefill["issue_date"] = utc_today_iso()
             if not prefill.get("lpo_valid_from"):
                 prefill["lpo_valid_from"] = prefill.get("issue_date")
             if not prefill.get("start_date"):
@@ -1690,7 +1972,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     conn,
                     run_id=run_id,
                     idempotency_key=f"ui-{run_id}",
-                    as_of_date=dt.date.today().isoformat(),
+                    as_of_date=utc_today_iso(),
                     dry_run=False,
                     input_payload={"source": "web_v2", "stage": stage},
                 )
@@ -1714,6 +1996,51 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     started_at=now,
                     failure_reason=reason,
                 )
+
+        def _record_exception_case(
+            self,
+            *,
+            contract_id: str,
+            case_type: str,
+            severity: str,
+            reason_code: str,
+            details: dict[str, object],
+        ) -> dict[str, object]:
+            contract_id_norm = str(contract_id or "").strip() or None
+            details_payload = dict(details)
+            idempotency_key = canonical_json_sha256(
+                {
+                    "contract_id": contract_id_norm,
+                    "case_type": case_type,
+                    "severity": severity,
+                    "reason_code": reason_code,
+                    "details": details_payload,
+                }
+            )
+            with repo.transaction() as conn:
+                case = repo.create_or_get_exception_case(
+                    conn,
+                    autonomy_run_id=new_ulid(),
+                    action_intent_id=None,
+                    contract_id=contract_id_norm,
+                    delivery_id=None,
+                    planned_delivery_id=str(details_payload.get("planned_delivery_id") or "").strip() or None,
+                    case_type=case_type,
+                    severity=severity,
+                    reason_code=reason_code,
+                    details=details_payload,
+                    idempotency_key=idempotency_key,
+                )
+                repo.append_event(
+                    conn,
+                    entity_type="EXCEPTION_CASE",
+                    entity_id=str(case.get("exception_case_id") or ""),
+                    event_type="CASE_CREATED",
+                    as_of_date=str(details_payload.get("as_of_date") or utc_today_iso()),
+                    payload=details_payload,
+                    source="web_v2",
+                )
+                return case
 
         def _capture_uploaded_files(self, *, form: cgi.FieldStorage, field_name: str, contract_id: str) -> int:
             uploaded = self._collect_temp_uploads(form=form, field_name=field_name)

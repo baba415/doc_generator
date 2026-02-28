@@ -124,6 +124,19 @@ class Phase16PlanningTests(unittest.TestCase):
         self.assertEqual("DELIVERED", rows[0]["status"])
         self.assertEqual("DELIVERED", rows[1]["status"])
 
+    def test_approve_planned_deliveries_transitions_rows_to_scheduled(self) -> None:
+        contract_id = self._create_bulk_contract(qty_mt=150.0)
+        self.service.plan_deliveries(contract_id=contract_id, start_date="2026-02-23", cadence="daily", max_lots_per_day=1)
+        result = self.service.approve_planned_deliveries(contract_id=contract_id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(5, int(result["scheduled_count"]))
+        rows = self.repo.fetch_all(
+            "SELECT status FROM planned_deliveries WHERE contract_id = ?",
+            (contract_id,),
+        )
+        self.assertTrue(rows)
+        self.assertTrue(all(str(row["status"]).upper() == "SCHEDULED" for row in rows))
+
     def test_materialize_due_propagates_as_of_to_per_row_materialization(self) -> None:
         contract_id = self._create_bulk_contract(qty_mt=150.0)
         self.service.plan_deliveries(contract_id=contract_id, start_date="2026-02-23", cadence="daily", max_lots_per_day=2)

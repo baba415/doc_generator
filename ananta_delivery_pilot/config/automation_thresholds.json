@@ -5,6 +5,30 @@
     "identity_review_min": 0.70,
     "payment_auto_apply_min": 0.90
   },
+  "intake": {
+    "confidence_matrix": {
+      "identity": {
+        "auto_apply_min": 0.93,
+        "review_min": 0.75
+      },
+      "quantity": {
+        "auto_apply_min": 0.95,
+        "review_min": 0.75
+      },
+      "pricing": {
+        "auto_apply_min": 0.95,
+        "review_min": 0.75
+      },
+      "date": {
+        "auto_apply_min": 0.93,
+        "review_min": 0.75
+      },
+      "document_linkage": {
+        "auto_apply_min": 0.93,
+        "review_min": 0.75
+      }
+    }
+  },
   "over_delivery": {
     "global_default_tolerance_pct": 5.0,
     "buyer_overrides": {
