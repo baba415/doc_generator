@@ -230,6 +230,7 @@ class Phase2Pr8MetricsTests(unittest.TestCase):
         self.assertTrue(generated.endswith("Z"))
         self.assertRegex(generated, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertFalse(metrics["pr8_gate_pass"])
+        self.assertEqual("insufficient_intake_data", metrics["pr8_gate_reason_code"])
 
 
 if __name__ == "__main__":

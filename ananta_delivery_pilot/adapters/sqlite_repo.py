@@ -290,11 +290,20 @@ CREATE TABLE IF NOT EXISTS evidence_originals (
   contract_id TEXT REFERENCES contracts(contract_id) ON DELETE CASCADE,
   delivery_id TEXT REFERENCES deliveries(delivery_id) ON DELETE CASCADE,
   sales_transaction_id TEXT REFERENCES sales_transactions(sales_transaction_id) ON DELETE SET NULL,
+  sales_line_id TEXT REFERENCES sales_lines(sales_line_id) ON DELETE SET NULL,
+  file_name TEXT,
+  doc_type TEXT NOT NULL DEFAULT 'other',
+  link_status TEXT NOT NULL DEFAULT 'UNLINKED',
+  link_confidence REAL,
+  link_reason_code TEXT,
+  link_source TEXT,
+  linked_at TEXT,
   source_path TEXT NOT NULL,
   stored_path TEXT NOT NULL,
   sha256 TEXT NOT NULL,
   captured_at TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS coa_results (
@@ -1062,7 +1071,8 @@ class SQLiteRepo:
             yield conn
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
@@ -1120,6 +1130,15 @@ class SQLiteRepo:
         self._add_column_if_missing(conn, "procurements", "quantity_kg INTEGER NOT NULL DEFAULT 0")
         self._add_column_if_missing(conn, "sales_lines", "quantity_kg INTEGER NOT NULL DEFAULT 0")
         self._add_column_if_missing(conn, "sales_lines", "unit_price_basis TEXT NOT NULL DEFAULT 'KG'")
+        self._add_column_if_missing(conn, "evidence_originals", "sales_line_id TEXT REFERENCES sales_lines(sales_line_id)")
+        self._add_column_if_missing(conn, "evidence_originals", "file_name TEXT")
+        self._add_column_if_missing(conn, "evidence_originals", "doc_type TEXT NOT NULL DEFAULT 'other'")
+        self._add_column_if_missing(conn, "evidence_originals", "link_status TEXT NOT NULL DEFAULT 'UNLINKED'")
+        self._add_column_if_missing(conn, "evidence_originals", "link_confidence REAL")
+        self._add_column_if_missing(conn, "evidence_originals", "link_reason_code TEXT")
+        self._add_column_if_missing(conn, "evidence_originals", "link_source TEXT")
+        self._add_column_if_missing(conn, "evidence_originals", "linked_at TEXT")
+        self._add_column_if_missing(conn, "evidence_originals", "updated_at TEXT")
 
         backfill_policy = str(config.delivery_policies.get("validity_backfill_policy") or "null_if_missing")
         now = utc_now_iso_z()
@@ -1152,6 +1171,27 @@ class SQLiteRepo:
                 """,
                 (now,),
             )
+
+        conn.execute(
+            """
+            UPDATE evidence_originals
+            SET doc_type = COALESCE(NULLIF(TRIM(doc_type), ''), 'other'),
+                link_status = COALESCE(NULLIF(TRIM(link_status), ''), 'UNLINKED'),
+                updated_at = COALESCE(updated_at, created_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_evidence_originals_contract_link
+            ON evidence_originals(contract_id, link_status, doc_type, created_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_evidence_originals_sha
+            ON evidence_originals(sha256)
+            """
+        )
 
         # Keep qty_kg columns coherent for migrated rows.
         conn.execute(

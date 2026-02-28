@@ -510,6 +510,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 (contract_id,),
             )
             today = utc_today_iso()
+            transport_cards = service.execute_transport_cards(contract_id=contract_id, as_of_date=today)
+            doc_completion = service.execute_document_completion_status(contract_id=contract_id, as_of_date=today)
             run_id = str((query.get("run_id") or [""])[0] or "").strip()
             run_timeline = service.command_center_timeline(
                 autonomy_run_id=run_id,
@@ -533,6 +535,51 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 "<button type='submit'>Materialize All Due Eligible Lots</button>"
                 "</div></form>",
             ]
+            parts.extend(
+                [
+                    "<h3>Transport Copilot</h3>",
+                    "<table><thead><tr><th>Delivery</th><th>Copilot Status</th><th>Suggested Truck / Driver</th><th>Confidence</th><th>Snapshot</th><th>Open Cases</th></tr></thead><tbody>",
+                ]
+            )
+            for card in transport_cards:
+                parts.append(
+                    "<tr>"
+                    f"<td>{_escape(card.get('delivery_id'))}</td>"
+                    f"<td><span class='pill'>{_escape(card.get('copilot_status'))}</span></td>"
+                    f"<td>{_escape(card.get('suggested_truck_no') or '-')} / {_escape(card.get('suggested_driver_name') or '-')}</td>"
+                    f"<td>{_escape(card.get('suggested_truck_confidence'))} / {_escape(card.get('suggested_driver_confidence'))}</td>"
+                    f"<td>{_escape(card.get('snapshot_id') or '-')}</td>"
+                    f"<td>{_escape(card.get('open_transport_cases') or 0)}</td>"
+                    "</tr>"
+                )
+            if not transport_cards:
+                parts.append("<tr><td colspan='6' class='muted'>No transport suggestions yet.</td></tr>")
+            parts.append("</tbody></table>")
+
+            doc_summary = doc_completion.get("summary", {}) if isinstance(doc_completion, dict) else {}
+            parts.append(
+                "<h3>Document Completion Copilot</h3>"
+                f"<p class='muted'>Auto-linked={_escape(doc_summary.get('auto_linked', 0))}, "
+                f"manual-linked={_escape(doc_summary.get('manual_linked', 0))}, "
+                f"review={_escape(doc_summary.get('review', 0))}, "
+                f"blocked={_escape(doc_summary.get('blocked', 0))}, "
+                f"unlinked={_escape(doc_summary.get('unlinked', 0))}</p>"
+            )
+            missing_prompts = doc_completion.get("missing_prompts", []) if isinstance(doc_completion, dict) else []
+            parts.append("<table><thead><tr><th>Delivery</th><th>Date</th><th>Status</th><th>Missing Required Originals</th></tr></thead><tbody>")
+            for prompt in missing_prompts:
+                missing = prompt.get("missing_doc_types") if isinstance(prompt.get("missing_doc_types"), list) else []
+                parts.append(
+                    "<tr>"
+                    f"<td>{_escape(prompt.get('delivery_id'))}</td>"
+                    f"<td>{_escape(prompt.get('delivery_date'))}</td>"
+                    f"<td>{_escape(prompt.get('delivery_status'))}</td>"
+                    f"<td>{_escape(', '.join(str(item) for item in missing))}</td>"
+                    "</tr>"
+                )
+            if not missing_prompts:
+                parts.append("<tr><td colspan='4' class='muted'>No unresolved required originals.</td></tr>")
+            parts.append("</tbody></table>")
             if run_id:
                 parts.extend(
                     [
@@ -1515,9 +1562,16 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     )
                     return
                 processed_count = len(result.get("processed") or [])
+                doc_completion = result.get("document_completion") if isinstance(result.get("document_completion"), dict) else {}
+                auto_linked = int(doc_completion.get("auto_linked") or 0)
+                review_cases = int(doc_completion.get("review_cases") or 0)
+                blocker_cases = int(doc_completion.get("blocker_cases") or 0)
                 self._flash_redirect(
                     f"/v2/contracts/{contract_id}/execute",
-                    f"Materialized {processed_count} planned deliveries",
+                    (
+                        f"Materialized {processed_count} planned deliveries "
+                        f"(doc auto-linked={auto_linked}, review={review_cases}, blocked={blocker_cases})"
+                    ),
                 )
             finally:
                 for path in uploaded:
@@ -1561,6 +1615,11 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             service.mark_delivered(delivery_id)
             coa_payload = service.coa_template_for_delivery(delivery_id, default_result="PASS")
             service.record_coa(coa_payload)
+            service.document_completion_copilot(
+                contract_id=contract_id,
+                as_of_date=as_of_date,
+                source="web_v2_execute_one",
+            )
             self._flash_redirect(
                 f"/v2/contracts/{contract_id}/execute",
                 f"Materialized delivery {delivery_id}",

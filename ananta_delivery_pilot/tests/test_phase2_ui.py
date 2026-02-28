@@ -102,6 +102,9 @@ class Phase2UiRouteTests(unittest.TestCase):
                     self.assertIn("Phase 2 (Ledger UI)", body)
                     if route in {"/v2/portfolio", "/v2/workbench"}:
                         self.assertIn("Command Center", body)
+                    if route.endswith("/execute"):
+                        self.assertIn("Transport Copilot", body)
+                        self.assertIn("Document Completion Copilot", body)
         finally:
             _stop_process(proc)
 

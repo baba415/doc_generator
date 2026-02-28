@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -20,6 +21,27 @@ from core.manifest import build_manifest, write_manifest
 from core.time import utc_now_iso_z, utc_today_iso
 from core.units import kg_to_mt_decimal, mt_to_kg_int
 from domain.validators import ensure_vendor_tin
+
+_DOC_TYPE_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("WAYBILL", ("waybill", "wb-", "wb_", " wb ")),
+    ("WEIGHING_TICKET", ("weigh", "wt-", "wt_", "ticket")),
+    ("COA", ("coa", "certificate", "analysis")),
+    ("SUPPLIER_INVOICE", ("supplier invoice", "supplier-invoice", "supplier_invoice", "invoice", "inv-")),
+    ("RECEIPT", ("receipt", "rcpt-")),
+    ("LPO", ("lpo", "purchase order", "po-")),
+)
+
+
+def _doc_type_from_filename(filename: str) -> str:
+    lowered = str(filename or "").strip().lower()
+    for doc_type, hints in _DOC_TYPE_HINTS:
+        if any(hint in lowered for hint in hints):
+            return doc_type
+    return "OTHER"
+
+
+def _norm_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
 class Phase1Service:
@@ -570,23 +592,29 @@ class Phase1Service:
                     order_index=index,
                 )
                 evidence_records.append(stored)
+                file_name = Path(stored["source_path"]).name
+                doc_type = _doc_type_from_filename(file_name).lower()
                 conn.execute(
                     """
                     INSERT INTO evidence_originals(
-                        evidence_id, contract_id, delivery_id, sales_transaction_id, source_path, stored_path,
-                        sha256, captured_at, created_at
+                        evidence_id, contract_id, delivery_id, sales_transaction_id, sales_line_id,
+                        file_name, doc_type, link_status, link_confidence, link_reason_code, link_source, linked_at,
+                        source_path, stored_path, sha256, captured_at, created_at, updated_at
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, NULL, ?, ?, 'UNLINKED', NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         stored["evidence_id"],
                         bundle["contract_id"],
                         delivery_id,
                         sales_transaction_id,
+                        file_name,
+                        doc_type,
                         stored["source_path"],
                         stored["stored_path"],
                         stored["sha256"],
                         stored["captured_at"],
+                        now,
                         now,
                     ),
                 )
@@ -1552,6 +1580,511 @@ class Phase1Service:
             )
         return timeline
 
+    def execute_transport_cards(self, *, contract_id: str, as_of_date: str) -> list[dict[str, Any]]:
+        rows = self.repo.fetch_all(
+            """
+            WITH open_transport_cases AS (
+              SELECT delivery_id, COUNT(*) AS open_count
+              FROM exception_cases
+              WHERE status = 'OPEN'
+                AND case_type = 'transport_assignment'
+                AND contract_id = ?
+              GROUP BY delivery_id
+            ),
+            top_truck AS (
+              SELECT delivery_id, candidate_label, confidence
+              FROM (
+                SELECT
+                  delivery_id,
+                  candidate_label,
+                  confidence,
+                  ROW_NUMBER() OVER (PARTITION BY delivery_id ORDER BY confidence DESC, created_at ASC) AS rn
+                FROM delivery_transport_suggestions
+                WHERE entity_type = 'TRUCK'
+              )
+              WHERE rn = 1
+            ),
+            top_driver AS (
+              SELECT delivery_id, candidate_label, confidence
+              FROM (
+                SELECT
+                  delivery_id,
+                  candidate_label,
+                  confidence,
+                  ROW_NUMBER() OVER (PARTITION BY delivery_id ORDER BY confidence DESC, created_at ASC) AS rn
+                FROM delivery_transport_suggestions
+                WHERE entity_type = 'DRIVER'
+              )
+              WHERE rn = 1
+            )
+            SELECT
+              d.delivery_id,
+              d.delivery_date,
+              d.status AS delivery_status,
+              d.run_id,
+              d.batch_id,
+              d.truck_no,
+              d.driver_name,
+              COALESCE(s.snapshot_id, '') AS snapshot_id,
+              COALESCE(s.reason_code, '') AS snapshot_reason_code,
+              COALESCE(s.confidence, 0) AS snapshot_confidence,
+              COALESCE(tc.open_count, 0) AS open_transport_cases,
+              COALESCE(tt.candidate_label, '') AS suggested_truck_no,
+              COALESCE(td.candidate_label, '') AS suggested_driver_name,
+              COALESCE(tt.confidence, 0) AS suggested_truck_confidence,
+              COALESCE(td.confidence, 0) AS suggested_driver_confidence
+            FROM deliveries d
+            LEFT JOIN delivery_transport_snapshot s ON s.delivery_id = d.delivery_id
+            LEFT JOIN open_transport_cases tc ON tc.delivery_id = d.delivery_id
+            LEFT JOIN top_truck tt ON tt.delivery_id = d.delivery_id
+            LEFT JOIN top_driver td ON td.delivery_id = d.delivery_id
+            WHERE d.contract_id = ?
+            ORDER BY d.delivery_date DESC, d.created_at DESC
+            """,
+            (contract_id, contract_id),
+        )
+        cards: list[dict[str, Any]] = []
+        for row in rows:
+            row_copy = dict(row)
+            row_copy["as_of_date"] = as_of_date
+            if str(row_copy.get("snapshot_id") or "").strip():
+                row_copy["copilot_status"] = "SNAPSHOT_APPLIED"
+            elif int(row_copy.get("open_transport_cases") or 0) > 0:
+                row_copy["copilot_status"] = "EXCEPTION_OPEN"
+            elif str(row_copy.get("suggested_truck_no") or "").strip() or str(row_copy.get("suggested_driver_name") or "").strip():
+                row_copy["copilot_status"] = "SUGGESTED"
+            else:
+                row_copy["copilot_status"] = "NO_SUGGESTION"
+            cards.append(row_copy)
+        return cards
+
+    def execute_document_completion_status(self, *, contract_id: str, as_of_date: str) -> dict[str, Any]:
+        summary = self.repo.fetch_one(
+            """
+            SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN link_status = 'AUTO_LINKED' THEN 1 ELSE 0 END) AS auto_linked,
+              SUM(CASE WHEN link_status = 'MANUAL_LINKED' THEN 1 ELSE 0 END) AS manual_linked,
+              SUM(CASE WHEN link_status = 'REVIEW' THEN 1 ELSE 0 END) AS review,
+              SUM(CASE WHEN link_status = 'BLOCKED' THEN 1 ELSE 0 END) AS blocked,
+              SUM(CASE WHEN link_status = 'UNLINKED' THEN 1 ELSE 0 END) AS unlinked
+            FROM evidence_originals
+            WHERE contract_id = ?
+            """,
+            (contract_id,),
+        ) or {}
+        delivery_rows = self.repo.fetch_all(
+            """
+            SELECT delivery_id, delivery_date, status
+            FROM deliveries
+            WHERE contract_id = ?
+            ORDER BY delivery_date ASC, created_at ASC
+            """,
+            (contract_id,),
+        )
+        evidence_rows = self.repo.fetch_all(
+            """
+            SELECT delivery_id, doc_type, link_status
+            FROM evidence_originals
+            WHERE contract_id = ?
+            """,
+            (contract_id,),
+        )
+        required_doc_types = {"waybill", "weighing_ticket", "coa", "supplier_invoice"}
+        docs_by_delivery: dict[str, set[str]] = {}
+        for row in evidence_rows:
+            delivery_id = str(row.get("delivery_id") or "").strip()
+            if not delivery_id:
+                continue
+            doc_type = str(row.get("doc_type") or "").strip().lower()
+            if not doc_type:
+                continue
+            docs_by_delivery.setdefault(delivery_id, set()).add(doc_type)
+        missing_prompts: list[dict[str, Any]] = []
+        for row in delivery_rows:
+            delivery_id = str(row.get("delivery_id") or "")
+            present = docs_by_delivery.get(delivery_id, set())
+            missing = sorted(required_doc_types - present)
+            if missing:
+                missing_prompts.append(
+                    {
+                        "delivery_id": delivery_id,
+                        "delivery_date": str(row.get("delivery_date") or ""),
+                        "delivery_status": str(row.get("status") or ""),
+                        "missing_doc_types": missing,
+                    }
+                )
+        return {
+            "as_of_date": as_of_date,
+            "summary": {
+                "total": int(summary.get("total") or 0),
+                "auto_linked": int(summary.get("auto_linked") or 0),
+                "manual_linked": int(summary.get("manual_linked") or 0),
+                "review": int(summary.get("review") or 0),
+                "blocked": int(summary.get("blocked") or 0),
+                "unlinked": int(summary.get("unlinked") or 0),
+            },
+            "missing_prompts": missing_prompts,
+        }
+
+    def document_completion_copilot(
+        self,
+        *,
+        contract_id: str,
+        as_of_date: str,
+        autonomy_run_id: str | None = None,
+        action_intent_id: str | None = None,
+        source: str = "document-completion-copilot",
+    ) -> dict[str, Any]:
+        as_of = str(as_of_date or utc_today_iso()).strip()
+        deliveries = self.repo.fetch_all(
+            """
+            SELECT delivery_id, delivery_ref, run_id, batch_id, delivery_date
+            FROM deliveries
+            WHERE contract_id = ?
+            ORDER BY delivery_date ASC, created_at ASC, delivery_id ASC
+            """,
+            (contract_id,),
+        )
+        sales_rows = self.repo.fetch_all(
+            """
+            SELECT st.sales_transaction_id, st.delivery_id, sl.sales_line_id
+            FROM sales_transactions st
+            JOIN sales_lines sl ON sl.sales_transaction_id = st.sales_transaction_id
+            WHERE st.contract_id = ?
+            ORDER BY sl.line_no ASC, sl.sales_line_id ASC
+            """,
+            (contract_id,),
+        )
+        docs_rows = self.repo.fetch_all(
+            """
+            SELECT doc_id, delivery_id, sales_transaction_id, doc_type, doc_number
+            FROM documents
+            WHERE delivery_id IN (
+              SELECT delivery_id FROM deliveries WHERE contract_id = ?
+            )
+            ORDER BY generated_at DESC
+            """,
+            (contract_id,),
+        )
+        evidence_rows = self.repo.fetch_all(
+            """
+            SELECT *
+            FROM evidence_originals
+            WHERE contract_id = ?
+            ORDER BY created_at ASC, evidence_id ASC
+            """,
+            (contract_id,),
+        )
+        sales_by_delivery: dict[str, dict[str, str]] = {}
+        for row in sales_rows:
+            delivery_id = str(row.get("delivery_id") or "").strip()
+            if not delivery_id or delivery_id in sales_by_delivery:
+                continue
+            sales_by_delivery[delivery_id] = {
+                "sales_transaction_id": str(row.get("sales_transaction_id") or ""),
+                "sales_line_id": str(row.get("sales_line_id") or ""),
+            }
+        doc_number_map: dict[str, dict[str, str]] = {}
+        for row in docs_rows:
+            number_norm = _norm_token(str(row.get("doc_number") or ""))
+            if not number_norm:
+                continue
+            doc_number_map[number_norm] = {
+                "delivery_id": str(row.get("delivery_id") or ""),
+                "sales_transaction_id": str(row.get("sales_transaction_id") or ""),
+                "doc_type": str(row.get("doc_type") or "").upper(),
+            }
+        delivery_index = {
+            str(row.get("delivery_id") or ""): dict(row)
+            for row in deliveries
+            if str(row.get("delivery_id") or "").strip()
+        }
+        now = utc_now_iso_z()
+        auto_linked = 0
+        review_cases = 0
+        blocker_cases = 0
+        processed = 0
+        for row in evidence_rows:
+            evidence_id = str(row.get("evidence_id") or "").strip()
+            if not evidence_id:
+                continue
+            filename = str(row.get("file_name") or Path(str(row.get("source_path") or "")).name).strip()
+            if not filename:
+                filename = Path(str(row.get("stored_path") or "")).name
+            filename_norm = _norm_token(filename)
+            doc_type = str(row.get("doc_type") or "").strip().lower() or _doc_type_from_filename(filename).lower()
+            existing_status = str(row.get("link_status") or "UNLINKED").strip().upper()
+            if existing_status in {"AUTO_LINKED", "MANUAL_LINKED"} and str(row.get("delivery_id") or "").strip():
+                continue
+            processed += 1
+
+            candidates: list[dict[str, Any]] = []
+            explicit_delivery_id = str(row.get("delivery_id") or "").strip()
+            if explicit_delivery_id and explicit_delivery_id in delivery_index:
+                delivery_info = delivery_index[explicit_delivery_id]
+                sales_ctx = sales_by_delivery.get(explicit_delivery_id, {})
+                candidates.append(
+                    {
+                        "delivery_id": explicit_delivery_id,
+                        "sales_transaction_id": str(row.get("sales_transaction_id") or sales_ctx.get("sales_transaction_id") or ""),
+                        "sales_line_id": str(row.get("sales_line_id") or sales_ctx.get("sales_line_id") or ""),
+                        "confidence": 1.0,
+                        "reason_bits": ["existing_delivery"],
+                    }
+                )
+            else:
+                for delivery in deliveries:
+                    delivery_id = str(delivery.get("delivery_id") or "")
+                    score = 0.0
+                    reason_bits: list[str] = []
+                    run_norm = _norm_token(str(delivery.get("run_id") or ""))
+                    batch_norm = _norm_token(str(delivery.get("batch_id") or ""))
+                    ref_norm = _norm_token(str(delivery.get("delivery_ref") or ""))
+                    if run_norm and run_norm in filename_norm:
+                        score += 0.55
+                        reason_bits.append("run_id_match")
+                    if batch_norm and batch_norm in filename_norm:
+                        score += 0.55
+                        reason_bits.append("batch_id_match")
+                    if ref_norm and ref_norm in filename_norm:
+                        score += 0.40
+                        reason_bits.append("delivery_ref_match")
+                    if _norm_token(delivery_id) and _norm_token(delivery_id) in filename_norm:
+                        score += 0.45
+                        reason_bits.append("delivery_id_match")
+                    if len(deliveries) == 1:
+                        score += 0.20
+                        reason_bits.append("single_delivery_context")
+                    sales_ctx = sales_by_delivery.get(delivery_id, {})
+                    candidates.append(
+                        {
+                            "delivery_id": delivery_id,
+                            "sales_transaction_id": str(sales_ctx.get("sales_transaction_id") or ""),
+                            "sales_line_id": str(sales_ctx.get("sales_line_id") or ""),
+                            "confidence": min(1.0, round(score, 4)),
+                            "reason_bits": reason_bits,
+                        }
+                    )
+
+            expected_doc_type = {
+                "waybill": "WAYBILL",
+                "weighing_ticket": "WEIGHING_TICKET",
+                "weighing": "WEIGHING_TICKET",
+                "coa": "COA",
+                "supplier_invoice": "INVOICE",
+                "invoice": "INVOICE",
+            }.get(doc_type)
+            for doc_no_norm, doc_info in doc_number_map.items():
+                if not doc_no_norm or doc_no_norm not in filename_norm:
+                    continue
+                if expected_doc_type and str(doc_info.get("doc_type") or "").upper() != expected_doc_type:
+                    continue
+                delivery_id = str(doc_info.get("delivery_id") or "")
+                if not delivery_id:
+                    continue
+                matched = None
+                for candidate in candidates:
+                    if str(candidate.get("delivery_id") or "") == delivery_id:
+                        matched = candidate
+                        break
+                if matched is None:
+                    sales_ctx = sales_by_delivery.get(delivery_id, {})
+                    matched = {
+                        "delivery_id": delivery_id,
+                        "sales_transaction_id": str(doc_info.get("sales_transaction_id") or sales_ctx.get("sales_transaction_id") or ""),
+                        "sales_line_id": str(sales_ctx.get("sales_line_id") or ""),
+                        "confidence": 0.0,
+                        "reason_bits": [],
+                    }
+                    candidates.append(matched)
+                matched["confidence"] = min(1.0, round(float(matched.get("confidence") or 0.0) + 0.80, 4))
+                reason_bits = matched.get("reason_bits") if isinstance(matched.get("reason_bits"), list) else []
+                if "doc_number_match" not in reason_bits:
+                    reason_bits.append("doc_number_match")
+                matched["reason_bits"] = reason_bits
+                if not str(matched.get("sales_transaction_id") or "").strip():
+                    matched["sales_transaction_id"] = str(doc_info.get("sales_transaction_id") or "")
+                if not str(matched.get("sales_line_id") or "").strip():
+                    sales_ctx = sales_by_delivery.get(delivery_id, {})
+                    matched["sales_line_id"] = str(sales_ctx.get("sales_line_id") or "")
+
+            candidates = [candidate for candidate in candidates if str(candidate.get("delivery_id") or "").strip()]
+            candidates.sort(
+                key=lambda item: (
+                    -float(item.get("confidence") or 0.0),
+                    str(item.get("delivery_id") or ""),
+                )
+            )
+            top = candidates[0] if candidates else None
+            second = candidates[1] if len(candidates) > 1 else None
+            top_confidence = float(top.get("confidence") or 0.0) if isinstance(top, dict) else 0.0
+            ambiguous = bool(
+                top
+                and second
+                and abs(top_confidence - float(second.get("confidence") or 0.0)) < 0.05
+                and top_confidence >= 0.70
+            )
+            top_reasons = top.get("reason_bits") if isinstance(top, dict) and isinstance(top.get("reason_bits"), list) else []
+            strong_signal = any(reason in {"existing_delivery", "run_id_match", "batch_id_match", "doc_number_match"} for reason in top_reasons)
+
+            if top and top_confidence >= 0.93 and strong_signal and not ambiguous:
+                with self.repo.transaction() as conn:
+                    conn.execute(
+                        """
+                        UPDATE evidence_originals
+                        SET delivery_id = ?,
+                            sales_transaction_id = ?,
+                            sales_line_id = ?,
+                            file_name = COALESCE(NULLIF(file_name, ''), ?),
+                            doc_type = ?,
+                            link_status = 'AUTO_LINKED',
+                            link_confidence = ?,
+                            link_reason_code = ?,
+                            link_source = ?,
+                            linked_at = ?,
+                            updated_at = ?
+                        WHERE evidence_id = ?
+                        """,
+                        (
+                            str(top.get("delivery_id") or ""),
+                            str(top.get("sales_transaction_id") or "") or None,
+                            str(top.get("sales_line_id") or "") or None,
+                            filename,
+                            doc_type,
+                            top_confidence,
+                            "strong_match",
+                            source,
+                            now,
+                            now,
+                            evidence_id,
+                        ),
+                    )
+                    self.repo.append_event(
+                        conn,
+                        entity_type="EVIDENCE",
+                        entity_id=evidence_id,
+                        event_type="EVIDENCE_AUTO_LINKED",
+                        as_of_date=as_of,
+                        payload={
+                            "delivery_id": str(top.get("delivery_id") or ""),
+                            "sales_transaction_id": str(top.get("sales_transaction_id") or ""),
+                            "sales_line_id": str(top.get("sales_line_id") or ""),
+                            "doc_type": doc_type,
+                            "confidence": top_confidence,
+                            "reason_bits": top_reasons,
+                        },
+                        source=source,
+                    )
+                auto_linked += 1
+                continue
+
+            if not top:
+                reason_code = "doc_link_no_match"
+                severity = "BLOCKER"
+                target_status = "BLOCKED"
+            elif len(candidates) > 1 and top_confidence <= 0.0:
+                reason_code = "doc_link_ambiguous"
+                severity = "BLOCKER"
+                target_status = "BLOCKED"
+            elif ambiguous:
+                reason_code = "doc_link_ambiguous"
+                severity = "BLOCKER"
+                target_status = "BLOCKED"
+            elif top_confidence >= 0.75:
+                reason_code = "doc_link_partial"
+                severity = "REVIEW"
+                target_status = "REVIEW"
+            else:
+                reason_code = "doc_link_low_confidence"
+                severity = "REVIEW"
+                target_status = "REVIEW"
+            if severity == "BLOCKER":
+                blocker_cases += 1
+            else:
+                review_cases += 1
+
+            case_payload = {
+                "evidence_id": evidence_id,
+                "contract_id": contract_id,
+                "as_of_date": as_of,
+                "doc_type": doc_type,
+                "file_name": filename,
+                "top_confidence": top_confidence,
+                "reason_code": reason_code,
+                "candidates": candidates[:3],
+                "selected_candidate": top or {},
+            }
+            case_key = f"doc-link|{evidence_id}|{reason_code}|{as_of}"
+            target_delivery_id = str(top.get("delivery_id") or "").strip() if isinstance(top, dict) else ""
+            with self.repo.transaction() as conn:
+                conn.execute(
+                    """
+                    UPDATE evidence_originals
+                    SET file_name = COALESCE(NULLIF(file_name, ''), ?),
+                        doc_type = ?,
+                        link_status = ?,
+                        link_confidence = ?,
+                        link_reason_code = ?,
+                        link_source = ?,
+                        updated_at = ?
+                    WHERE evidence_id = ?
+                    """,
+                    (
+                        filename,
+                        doc_type,
+                        target_status,
+                        top_confidence if top else 0.0,
+                        reason_code,
+                        source,
+                        now,
+                        evidence_id,
+                    ),
+                )
+                case_row = self.repo.create_or_get_exception_case(
+                    conn,
+                    autonomy_run_id=autonomy_run_id,
+                    action_intent_id=action_intent_id,
+                    contract_id=contract_id,
+                    delivery_id=target_delivery_id or None,
+                    planned_delivery_id=None,
+                    case_type="document_linkage",
+                    severity=severity,
+                    reason_code=reason_code,
+                    details=case_payload,
+                    idempotency_key=case_key,
+                )
+                self.repo.add_decision_feature(
+                    conn,
+                    exception_case_id=str(case_row["exception_case_id"]),
+                    feature_key="document_link_candidates",
+                    feature_payload=case_payload,
+                )
+                self.repo.append_event(
+                    conn,
+                    entity_type="EXCEPTION_CASE",
+                    entity_id=str(case_row["exception_case_id"]),
+                    event_type="CASE_OPENED",
+                    as_of_date=as_of,
+                    payload={
+                        "reason_code": reason_code,
+                        "evidence_id": evidence_id,
+                    },
+                    source=source,
+                )
+
+        status = self.execute_document_completion_status(contract_id=contract_id, as_of_date=as_of)
+        return {
+            "ok": True,
+            "contract_id": contract_id,
+            "as_of_date": as_of,
+            "processed": processed,
+            "auto_linked": auto_linked,
+            "review_cases": review_cases,
+            "blocker_cases": blocker_cases,
+            "status": status,
+        }
+
     def exception_case_cards(
         self,
         *,
@@ -2011,7 +2544,17 @@ class Phase1Service:
             (contract_id, refresh_date),
         )
         if not due_rows:
-            return {"ok": True, "contract_id": contract_id, "processed": [], "message": "No due planned deliveries"}
+            doc_completion = self.document_completion_copilot(
+                contract_id=contract_id,
+                as_of_date=refresh_date,
+            )
+            return {
+                "ok": True,
+                "contract_id": contract_id,
+                "processed": [],
+                "message": "No due planned deliveries",
+                "document_completion": doc_completion,
+            }
 
         processed: list[dict[str, Any]] = []
         for row in due_rows:
@@ -2048,8 +2591,16 @@ class Phase1Service:
                     "blocked_planned_delivery_id": planned_delivery_id,
                     "error": str(error),
                 }
-
-        return {"ok": True, "contract_id": contract_id, "processed": processed}
+        doc_completion = self.document_completion_copilot(
+            contract_id=contract_id,
+            as_of_date=refresh_date,
+        )
+        return {
+            "ok": True,
+            "contract_id": contract_id,
+            "processed": processed,
+            "document_completion": doc_completion,
+        }
 
     def coa_template_for_delivery(self, delivery_id: str, *, default_result: str = "PASS") -> dict[str, Any]:
         bundle = self.repo.get_delivery_bundle(delivery_id)
@@ -2098,6 +2649,50 @@ class Phase1Service:
         source_path = source_path.expanduser().resolve()
         if not source_path.exists():
             raise FileNotFoundError(f"Evidence file not found: {source_path}")
+        file_hash = sha256_file(source_path)
+        file_name = source_path.name
+        doc_type = _doc_type_from_filename(file_name)
+        now = utc_now_iso_z()
+        existing = self.repo.fetch_one(
+            """
+            SELECT * FROM evidence_originals
+            WHERE contract_id = ? AND sha256 = ?
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (contract_id, file_hash),
+        )
+        if existing:
+            with self.repo.transaction() as conn:
+                conn.execute(
+                    """
+                    UPDATE evidence_originals
+                    SET delivery_id = COALESCE(delivery_id, ?),
+                        sales_transaction_id = COALESCE(sales_transaction_id, ?),
+                        doc_type = COALESCE(NULLIF(TRIM(doc_type), ''), ?),
+                        file_name = COALESCE(file_name, ?),
+                        updated_at = ?
+                    WHERE evidence_id = ?
+                    """,
+                    (
+                        delivery_id,
+                        sales_transaction_id,
+                        doc_type.lower(),
+                        file_name,
+                        now,
+                        str(existing["evidence_id"]),
+                    ),
+                )
+            row = self.repo.fetch_one("SELECT * FROM evidence_originals WHERE evidence_id = ?", (str(existing["evidence_id"]),))
+            return {
+                "evidence_id": str(row["evidence_id"]),
+                "source_path": str(row["source_path"]),
+                "stored_path": str(row["stored_path"]),
+                "sha256": str(row["sha256"]),
+                "captured_at": str(row["captured_at"]),
+                "deduped": True,
+                "doc_type": str(row.get("doc_type") or "").upper(),
+            }
         dest_dir = self.config.state_dir / "evidence" / "originals" / contract_id
         next_index = len(list(dest_dir.glob("*"))) + 1 if dest_dir.exists() else 1
         stored = persist_evidence_original(
@@ -2105,29 +2700,36 @@ class Phase1Service:
             dest_dir=dest_dir,
             order_index=next_index,
         )
-        now = utc_now_iso_z()
         with self.repo.transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO evidence_originals(
-                    evidence_id, contract_id, delivery_id, sales_transaction_id, source_path, stored_path,
-                    sha256, captured_at, created_at
+                    evidence_id, contract_id, delivery_id, sales_transaction_id, sales_line_id,
+                    file_name, doc_type, link_status, link_confidence, link_reason_code, link_source, linked_at,
+                    source_path, stored_path, sha256, captured_at, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, NULL, ?, ?, 'UNLINKED', NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     stored["evidence_id"],
                     contract_id,
                     delivery_id,
                     sales_transaction_id,
+                    file_name,
+                    doc_type.lower(),
                     stored["source_path"],
                     stored["stored_path"],
                     stored["sha256"],
                     stored["captured_at"],
                     now,
+                    now,
                 ),
             )
-        return stored
+        return {
+            **stored,
+            "deduped": False,
+            "doc_type": doc_type,
+        }
 
 
 def _resolve_coa_profile_for_ui(coa_profiles: dict[str, Any], *, buyer_group: str, product_code: str) -> dict[str, Any]:

@@ -251,6 +251,7 @@ class AutomationOrchestrator:
         idempotency_key = f"{case_id}|{normalized_decision}|{normalized_reason}"
         case_details = json.loads(case.get("details_json") or "{}")
         suggestion_ids = case_details.get("suggestion_ids") if isinstance(case_details.get("suggestion_ids"), list) else []
+        case_type = str(case.get("case_type") or "")
         case_as_of = str(case_details.get("as_of_date") or utc_now_iso_z()[:10])
         with self.repo.transaction() as conn:
             decision_row = self.repo.add_human_decision(
@@ -290,6 +291,92 @@ class AutomationOrchestrator:
                     feature_key="transport_suggestion_ids",
                     feature_payload={"suggestion_ids": suggestion_ids},
                 )
+                self.repo.add_decision_outcome(
+                    conn,
+                    exception_case_id=case_id,
+                    human_decision_id=str(decision_row["human_decision_id"]),
+                    outcome_label="transport_suggestion_feedback",
+                    outcome_payload={
+                        "accepted": bool(normalized_decision in {"APPROVE", "OVERRIDE"}),
+                        "suggestion_ids": [str(item) for item in suggestion_ids if str(item).strip()],
+                    },
+                )
+            if case_type == "document_linkage":
+                evidence_id = str(case_details.get("evidence_id") or "").strip()
+                selected_candidate = (
+                    case_details.get("selected_candidate")
+                    if isinstance(case_details.get("selected_candidate"), dict)
+                    else {}
+                )
+                target_delivery_id = str(selected_candidate.get("delivery_id") or "").strip() or None
+                target_sales_transaction_id = str(selected_candidate.get("sales_transaction_id") or "").strip() or None
+                target_sales_line_id = str(selected_candidate.get("sales_line_id") or "").strip() or None
+                if evidence_id:
+                    if normalized_decision in {"APPROVE", "OVERRIDE"}:
+                        conn.execute(
+                            """
+                            UPDATE evidence_originals
+                            SET delivery_id = COALESCE(?, delivery_id),
+                                sales_transaction_id = COALESCE(?, sales_transaction_id),
+                                sales_line_id = COALESCE(?, sales_line_id),
+                                link_status = 'MANUAL_LINKED',
+                                link_reason_code = 'manual_link_approved',
+                                link_source = 'exception_decision',
+                                linked_at = ?,
+                                updated_at = ?
+                            WHERE evidence_id = ?
+                            """,
+                            (
+                                target_delivery_id,
+                                target_sales_transaction_id,
+                                target_sales_line_id,
+                                utc_now_iso_z(),
+                                utc_now_iso_z(),
+                                evidence_id,
+                            ),
+                        )
+                        doc_outcome_label = "DOC_LINK_APPROVED"
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE evidence_originals
+                            SET link_status = 'AUTO_LINK_REJECTED',
+                                link_reason_code = 'manual_link_rejected',
+                                link_source = 'exception_decision',
+                                updated_at = ?
+                            WHERE evidence_id = ?
+                            """,
+                            (utc_now_iso_z(), evidence_id),
+                        )
+                        doc_outcome_label = "DOC_LINK_REJECTED"
+                    self.repo.append_event(
+                        conn,
+                        entity_type="EVIDENCE",
+                        entity_id=evidence_id,
+                        event_type="EVIDENCE_LINK_DECIDED",
+                        as_of_date=case_as_of,
+                        payload={
+                            "case_id": case_id,
+                            "decision": normalized_decision,
+                            "delivery_id": target_delivery_id,
+                            "sales_transaction_id": target_sales_transaction_id,
+                            "sales_line_id": target_sales_line_id,
+                        },
+                        source="decide-case",
+                    )
+                    self.repo.add_decision_outcome(
+                        conn,
+                        exception_case_id=case_id,
+                        human_decision_id=str(decision_row["human_decision_id"]),
+                        outcome_label=doc_outcome_label,
+                        outcome_payload={
+                            "evidence_id": evidence_id,
+                            "decision": normalized_decision,
+                            "delivery_id": target_delivery_id,
+                            "sales_transaction_id": target_sales_transaction_id,
+                            "sales_line_id": target_sales_line_id,
+                        },
+                    )
             self.repo.add_decision_outcome(
                 conn,
                 exception_case_id=case_id,
@@ -298,7 +385,7 @@ class AutomationOrchestrator:
                 outcome_payload={
                     "decision": normalized_decision,
                     "reason": normalized_reason,
-                    "case_type": case.get("case_type"),
+                    "case_type": case_type,
                     "reason_code": case.get("reason_code"),
                 },
             )
@@ -372,6 +459,7 @@ class AutomationOrchestrator:
         lookback_window_days: int = 30,
         benchmark_version: str = "phase2.pr8.v1",
     ) -> dict[str, Any]:
+        self.phase1.init_db()
         if lookback_window_days <= 0:
             raise ValueError("lookback_window_days must be > 0")
         try:
@@ -442,6 +530,11 @@ class AutomationOrchestrator:
             as_of_date=as_of_date,
             benchmark_version=benchmark_version,
         )
+        pr9_metrics = self._pr9_transport_doc_metrics(
+            lookback_start_iso=lookback_start_iso,
+            as_of_date=as_of_date,
+            benchmark_version=benchmark_version,
+        )
         generated_at_utc = utc_now_iso_z()
         metrics = {
             "as_of_date": as_of_date,
@@ -475,6 +568,20 @@ class AutomationOrchestrator:
             "benchmark_version_match_pr8": intake_metrics["benchmark_version_match_pr8"],
             "pr8_gate_pass": intake_metrics["pr8_gate_pass"],
             "pr8_gate_reason_code": intake_metrics["pr8_gate_reason_code"],
+            "manual_transport_field_updates": pr9_metrics["manual_transport_field_updates"],
+            "deliveries_with_transport_assignment": pr9_metrics["deliveries_with_transport_assignment"],
+            "manual_transport_fields_per_delivery": pr9_metrics["manual_transport_fields_per_delivery"],
+            "manual_transport_fields_per_delivery_gate_threshold": 3.0,
+            "manual_transport_fields_per_delivery_gate_pass": pr9_metrics["manual_transport_fields_per_delivery_gate_pass"],
+            "true_positive_autolinks": pr9_metrics["true_positive_autolinks"],
+            "false_positive_autolinks": pr9_metrics["false_positive_autolinks"],
+            "doc_autolink_precision": pr9_metrics["doc_autolink_precision"],
+            "doc_autolink_precision_gate_threshold": 0.90,
+            "doc_autolink_precision_gate_pass": pr9_metrics["doc_autolink_precision_gate_pass"],
+            "benchmark_version_expected_pr9": pr9_metrics["benchmark_version_expected_pr9"],
+            "benchmark_version_match_pr9": pr9_metrics["benchmark_version_match_pr9"],
+            "pr9_gate_pass": pr9_metrics["pr9_gate_pass"],
+            "pr9_gate_reason_code": pr9_metrics["pr9_gate_reason_code"],
         }
         out_dir.mkdir(parents=True, exist_ok=True)
         metrics_path = out_dir / f"autonomy_metrics_{as_of_date}.json"
@@ -493,6 +600,8 @@ class AutomationOrchestrator:
                     "generated_at_utc": generated_at_utc,
                     "pr8_gate_pass": bool(intake_metrics["pr8_gate_pass"]),
                     "pr8_gate_reason_code": str(intake_metrics["pr8_gate_reason_code"]),
+                    "pr9_gate_pass": bool(pr9_metrics["pr9_gate_pass"]),
+                    "pr9_gate_reason_code": str(pr9_metrics["pr9_gate_reason_code"]),
                 },
                 source="autonomy-metrics",
             )
@@ -612,9 +721,13 @@ class AutomationOrchestrator:
             zero_edit_rate = None
             zero_edit_gate_pass = False
 
+        has_intake_confirm_data = len(confirm_run_ids) > 0
         if not benchmark_match:
             pr8_gate_pass = False
             pr8_reason = "benchmark_version_mismatch"
+        elif not has_intake_confirm_data:
+            pr8_gate_pass = False
+            pr8_reason = "insufficient_intake_data"
         elif not median_manual_gate_pass:
             pr8_gate_pass = False
             pr8_reason = "median_manual_fields_threshold_failed"
@@ -638,6 +751,107 @@ class AutomationOrchestrator:
             "benchmark_version_match_pr8": bool(benchmark_match),
             "pr8_gate_pass": bool(pr8_gate_pass),
             "pr8_gate_reason_code": pr8_reason,
+        }
+
+    def _pr9_transport_doc_metrics(
+        self,
+        *,
+        lookback_start_iso: str,
+        as_of_date: str,
+        benchmark_version: str,
+    ) -> dict[str, Any]:
+        expected_benchmark_version = "phase2.pr9.v1"
+        benchmark_match = benchmark_version == expected_benchmark_version
+
+        transport_rows = self.repo.fetch_one(
+            """
+            SELECT
+              COUNT(DISTINCT d.delivery_id) AS deliveries_with_transport_assignment
+            FROM deliveries d
+            LEFT JOIN delivery_transport_snapshot s ON s.delivery_id = d.delivery_id
+            WHERE substr(COALESCE(s.created_at, d.updated_at, d.created_at), 1, 10) BETWEEN ? AND ?
+              AND (
+                s.snapshot_id IS NOT NULL
+                OR TRIM(COALESCE(d.truck_no, '')) <> ''
+                OR TRIM(COALESCE(d.driver_name, '')) <> ''
+              )
+            """,
+            (lookback_start_iso, as_of_date),
+        ) or {"deliveries_with_transport_assignment": 0}
+        deliveries_with_transport_assignment = int(transport_rows.get("deliveries_with_transport_assignment") or 0)
+
+        manual_transport_row = self.repo.fetch_one(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM decision_outcomes
+            WHERE outcome_label = 'transport_suggestion_feedback'
+              AND substr(created_at, 1, 10) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        ) or {"cnt": 0}
+        manual_transport_field_updates = int(manual_transport_row.get("cnt") or 0)
+        if deliveries_with_transport_assignment > 0:
+            manual_transport_fields_per_delivery = round(
+                manual_transport_field_updates / deliveries_with_transport_assignment,
+                4,
+            )
+            manual_transport_gate_pass = manual_transport_fields_per_delivery < 3.0
+        else:
+            manual_transport_fields_per_delivery = None
+            manual_transport_gate_pass = False
+
+        doc_rows = self.repo.fetch_one(
+            """
+            SELECT
+              SUM(CASE WHEN link_status = 'AUTO_LINKED' THEN 1 ELSE 0 END) AS true_positive_autolinks,
+              SUM(CASE WHEN link_status = 'AUTO_LINK_REJECTED' THEN 1 ELSE 0 END) AS false_positive_autolinks
+            FROM evidence_originals
+            WHERE substr(COALESCE(linked_at, updated_at, created_at), 1, 10) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        ) or {"true_positive_autolinks": 0, "false_positive_autolinks": 0}
+        true_positive_autolinks = int(doc_rows.get("true_positive_autolinks") or 0)
+        false_positive_autolinks = int(doc_rows.get("false_positive_autolinks") or 0)
+        doc_denom = true_positive_autolinks + false_positive_autolinks
+        if doc_denom > 0:
+            doc_autolink_precision = round(true_positive_autolinks / doc_denom, 4)
+            doc_autolink_precision_gate_pass = doc_autolink_precision >= 0.90
+        else:
+            doc_autolink_precision = None
+            doc_autolink_precision_gate_pass = False
+
+        if not benchmark_match:
+            pr9_gate_pass = False
+            pr9_reason = "benchmark_version_mismatch"
+        elif deliveries_with_transport_assignment == 0:
+            pr9_gate_pass = False
+            pr9_reason = "insufficient_transport_data"
+        elif not manual_transport_gate_pass:
+            pr9_gate_pass = False
+            pr9_reason = "manual_transport_fields_threshold_failed"
+        elif doc_denom == 0:
+            pr9_gate_pass = False
+            pr9_reason = "insufficient_doc_autolink_data"
+        elif not doc_autolink_precision_gate_pass:
+            pr9_gate_pass = False
+            pr9_reason = "doc_autolink_precision_failed"
+        else:
+            pr9_gate_pass = True
+            pr9_reason = "pass"
+
+        return {
+            "manual_transport_field_updates": manual_transport_field_updates,
+            "deliveries_with_transport_assignment": deliveries_with_transport_assignment,
+            "manual_transport_fields_per_delivery": manual_transport_fields_per_delivery,
+            "manual_transport_fields_per_delivery_gate_pass": bool(manual_transport_gate_pass),
+            "true_positive_autolinks": true_positive_autolinks,
+            "false_positive_autolinks": false_positive_autolinks,
+            "doc_autolink_precision": doc_autolink_precision,
+            "doc_autolink_precision_gate_pass": bool(doc_autolink_precision_gate_pass),
+            "benchmark_version_expected_pr9": expected_benchmark_version,
+            "benchmark_version_match_pr9": bool(benchmark_match),
+            "pr9_gate_pass": bool(pr9_gate_pass),
+            "pr9_gate_reason_code": pr9_reason,
         }
 
     def _contracts_for_autonomy(self, *, contract_id: str | None) -> list[dict[str, Any]]:
@@ -1672,11 +1886,28 @@ class AutomationOrchestrator:
                     "error": transport.get("error"),
                     "transport": transport,
                 }
+            doc_completion = self.phase1.document_completion_copilot(
+                contract_id=contract_id,
+                as_of_date=as_of_date,
+                autonomy_run_id=autonomy_run_id,
+                action_intent_id=action_intent_id,
+                source="run-autonomy",
+            )
+            if int(doc_completion.get("blocker_cases") or 0) > 0:
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "status": "FAILED",
+                    "error": "Document completion blocked by ambiguous/conflicting links",
+                    "transport": transport,
+                    "document_completion": doc_completion,
+                }
             return {
                 "ok": True,
                 "status": "SUCCESS",
                 "processed_count": len(processed_rows) if isinstance(processed_rows, list) else 0,
                 "transport": transport,
+                "document_completion": doc_completion,
                 "policy": {
                     "policy_version": runtime_policy.get("policy_version"),
                     "policy_source_key": runtime_policy.get("policy_source_key"),

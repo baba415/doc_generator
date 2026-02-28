@@ -80,7 +80,8 @@ Release-candidate CI now runs the same script in `.github/workflows/release-cand
 2. **Plan** (`/v2/contracts/<contract_id>/plan`)  
    Review lot split, edit planned date/qty for exceptions, rebuild schedule if needed.
 3. **Execute** (`/v2/contracts/<contract_id>/execute`)  
-   Materialize due deliveries (single or bulk), auto-progress to delivered, auto-record COA, auto-generate 4-pack.
+   Materialize due deliveries (single or bulk), auto-progress to delivered, auto-record COA, auto-generate 4-pack.  
+   PR9 adds transport suggestion/status cards and document-completion status with missing-original prompts.
 4. **Settle** (`/v2/contracts/<contract_id>/settle`)  
    Mark payment, generate receipt, run DREP export with deterministic `as_of_date`.
 5. **Exceptions** (`/v2/exceptions`)  
@@ -129,7 +130,7 @@ python3 run.py auto-resume --run-id <run_id>
 python3 run.py run-autonomy --as-of 2026-03-31 --dry-run
 python3 run.py list-cases --status OPEN
 python3 run.py decide-case --case-id <case_id> --decision APPROVE --reason "override"
-python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --benchmark-version phase2.pr8.v1 --out-dir .state/automation_metrics
+python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --benchmark-version phase2.pr9.v1 --out-dir .state/automation_metrics
 ```
 
 Phase 1 state writes to:
