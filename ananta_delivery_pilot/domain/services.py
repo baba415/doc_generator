@@ -14,7 +14,7 @@ from adapters.sqlite_repo import SQLiteRepo
 from adapters.storage import output_delivery_dir, persist_evidence_original
 from core.config import RuntimeConfig, infer_buyer_group
 from core.enums import DeliveryStatus, DocumentType, PaymentStatus
-from core.hashing import sha256_file
+from core.hashing import canonical_json_sha256, sha256_file
 from core.ids import new_ulid
 from core.manifest import build_manifest, write_manifest
 from core.time import utc_now_iso_z, utc_today_iso
@@ -1043,6 +1043,28 @@ class Phase1Service:
             "exports": exports,
         }
 
+    def _command_center_section(self, row: dict[str, Any]) -> str:
+        if int(row.get("needs_decision_count") or 0) > 0:
+            return "NEEDS_DECISION"
+        if str(row.get("lpo_state") or "").upper() != "ACTIVE":
+            return "AT_RISK"
+        if int(row.get("due_planned_lots") or 0) > 0 or int(row.get("delivered_not_invoiced") or 0) > 0:
+            return "DUE_ACTION"
+        if float(row.get("outstanding_total") or 0.0) > 0:
+            return "AT_RISK"
+        if int(row.get("open_planned_lots") or 0) > 0:
+            return "AT_RISK"
+        return "AT_RISK"
+
+    def _run_all_skip_reason(self, row: dict[str, Any]) -> str | None:
+        if int(row.get("needs_decision_count") or 0) > 0:
+            return "OPEN_EXCEPTION_CASES"
+        if str(row.get("lpo_state") or "").upper() != "ACTIVE":
+            return "LPO_NOT_ACTIVE"
+        if int(row.get("due_planned_lots") or 0) <= 0 and int(row.get("delivered_not_invoiced") or 0) <= 0:
+            return "NOT_DUE"
+        return None
+
     def command_center_rows(self, *, as_of_date: str, limit: int = 200) -> list[dict[str, Any]]:
         self.repo.set_as_of_date(as_of_date)
         rows = self.repo.fetch_all(
@@ -1122,7 +1144,261 @@ class Phase1Service:
             elif float(row.get("outstanding_total") or 0.0) > 0:
                 next_action = "Settle"
             row["next_action"] = next_action
+            row["section"] = self._command_center_section(row)
         return rows
+
+    def command_center_sections(self, *, as_of_date: str, limit: int = 200) -> dict[str, Any]:
+        rows = self.command_center_rows(as_of_date=as_of_date, limit=limit)
+        sections: dict[str, list[dict[str, Any]]] = {
+            "NEEDS_DECISION": [],
+            "DUE_ACTION": [],
+            "AT_RISK": [],
+        }
+        for row in rows:
+            section = str(row.get("section") or "DUE_ACTION").upper()
+            sections.setdefault(section, []).append(row)
+        return {
+            "as_of_date_utc": as_of_date,
+            "rows": rows,
+            "sections": sections,
+        }
+
+    def run_all_eligible(
+        self,
+        *,
+        as_of_date_utc: str | None = None,
+        mode: str,
+        benchmark_version: str = "phase2.pr6.v1",
+        max_contracts_per_run: int = 20,
+        max_actions_per_run: int = 200,
+        preview_token: str | None = None,
+    ) -> dict[str, Any]:
+        if mode not in {"preview", "execute"}:
+            raise ValueError("mode must be preview or execute")
+        if max_contracts_per_run <= 0:
+            raise ValueError("max_contracts_per_run must be > 0")
+        if max_actions_per_run <= 0:
+            raise ValueError("max_actions_per_run must be > 0")
+
+        as_of_date = str(as_of_date_utc or utc_today_iso()).strip()
+        rows = self.command_center_rows(as_of_date=as_of_date, limit=1000)
+        eligible_all: list[dict[str, Any]] = []
+        skipped_contracts: list[dict[str, Any]] = []
+        for row in rows:
+            contract_id = str(row.get("contract_id") or "")
+            reason = self._run_all_skip_reason(row)
+            if reason:
+                skipped_contracts.append(
+                    {
+                        "contract_id": contract_id,
+                        "reason_code": reason,
+                    }
+                )
+                continue
+            eligible_all.append(row)
+
+        capped_eligible = eligible_all[:max_contracts_per_run]
+        for row in eligible_all[max_contracts_per_run:]:
+            skipped_contracts.append(
+                {
+                    "contract_id": str(row.get("contract_id") or ""),
+                    "reason_code": "CONTRACT_CAP_REACHED",
+                }
+            )
+
+        contract_scope_hash = canonical_json_sha256(
+            {
+                "as_of_date_utc": as_of_date,
+                "benchmark_version": benchmark_version,
+                "eligible_contracts": [str(row.get("contract_id") or "") for row in eligible_all],
+                "max_contracts_per_run": max_contracts_per_run,
+                "max_actions_per_run": max_actions_per_run,
+            }
+        )
+        preview_seed = {
+            "as_of_date_utc": as_of_date,
+            "benchmark_version": benchmark_version,
+            "max_contracts_per_run": max_contracts_per_run,
+            "max_actions_per_run": max_actions_per_run,
+            "contract_scope_hash": contract_scope_hash,
+            "eligible_contract_ids": [str(row.get("contract_id") or "") for row in capped_eligible],
+            "skipped_contracts": sorted(
+                skipped_contracts,
+                key=lambda item: (str(item.get("contract_id") or ""), str(item.get("reason_code") or "")),
+            ),
+        }
+        preview_token_value = canonical_json_sha256(preview_seed)
+        preview_idempotency_key = (
+            "run_all_preview::"
+            f"{as_of_date}::{benchmark_version}::{max_contracts_per_run}::{max_actions_per_run}::{contract_scope_hash}"
+        )
+
+        if mode == "preview":
+            with self.repo.transaction() as conn:
+                existing = self.repo.find_idempotent_response(
+                    conn,
+                    command_name="run-all-eligible-preview",
+                    idempotency_key=preview_idempotency_key,
+                )
+                if existing:
+                    return existing
+                response = {
+                    "ok": True,
+                    "mode": "preview",
+                    "as_of_date_utc": as_of_date,
+                    "benchmark_version": benchmark_version,
+                    "max_contracts_per_run": max_contracts_per_run,
+                    "max_actions_per_run": max_actions_per_run,
+                    "contract_scope_hash": contract_scope_hash,
+                    "eligible_contract_ids": [str(row.get("contract_id") or "") for row in capped_eligible],
+                    "eligible_count": len(capped_eligible),
+                    "skipped_contracts": sorted(
+                        skipped_contracts,
+                        key=lambda item: (str(item.get("contract_id") or ""), str(item.get("reason_code") or "")),
+                    ),
+                    "preview_token": preview_token_value,
+                    "dry_run_required": True,
+                    "execute_idempotency_key": (
+                        "run_all_execute::"
+                        f"{as_of_date}::{benchmark_version}::{preview_token_value}::"
+                        f"{canonical_json_sha256({'eligible_contract_ids': [str(row.get('contract_id') or '') for row in capped_eligible]})}"
+                    ),
+                }
+                self.repo.save_idempotent_response(
+                    conn,
+                    command_name="run-all-eligible-preview",
+                    idempotency_key=preview_idempotency_key,
+                    response=response,
+                )
+                return response
+
+        expected_preview_token = preview_token_value
+        provided_preview_token = str(preview_token or "").strip()
+        if not provided_preview_token:
+            raise ValueError("preview_token is required for run-all execute")
+        if provided_preview_token != expected_preview_token:
+            raise ValueError("preview_token mismatch for current run-all scope")
+
+        eligible_contract_ids = [str(row.get("contract_id") or "") for row in capped_eligible]
+        eligible_contracts_hash = canonical_json_sha256({"eligible_contract_ids": eligible_contract_ids})
+        execute_idempotency_key = (
+            "run_all_execute::"
+            f"{as_of_date}::{benchmark_version}::{provided_preview_token}::{eligible_contracts_hash}"
+        )
+        expected_actions_per_contract = 5
+        executed_contracts: list[dict[str, Any]] = []
+        capped_skips: list[dict[str, Any]] = []
+        attempted_actions = 0
+
+        with self.repo.transaction() as conn:
+            existing = self.repo.find_idempotent_response(
+                conn,
+                command_name="run-all-eligible-execute",
+                idempotency_key=execute_idempotency_key,
+            )
+            if existing:
+                existing["idempotent_replay"] = True
+                return existing
+
+        for contract_id in eligible_contract_ids:
+            if attempted_actions + expected_actions_per_contract > max_actions_per_run:
+                capped_skips.append(
+                    {
+                        "contract_id": contract_id,
+                        "reason_code": "ACTION_CAP_REACHED",
+                    }
+                )
+                continue
+            existing_actions = self.repo.fetch_one(
+                """
+                WITH latest_executions AS (
+                  SELECT
+                    ae.action_intent_id,
+                    ae.status,
+                    ROW_NUMBER() OVER (PARTITION BY ae.action_intent_id ORDER BY ae.execution_no DESC) AS rn
+                  FROM action_executions ae
+                )
+                SELECT
+                  COUNT(DISTINCT CASE
+                    WHEN ai.status = 'EXECUTED' AND le.status = 'SUCCESS' THEN ai.intent_type
+                    ELSE NULL
+                  END) AS successful_intents,
+                  COUNT(DISTINCT CASE
+                    WHEN ai.status IN ('FAILED', 'BLOCKED') THEN ai.intent_type
+                    ELSE NULL
+                  END) AS failed_or_blocked_intents
+                FROM action_intents ai
+                LEFT JOIN latest_executions le
+                  ON le.action_intent_id = ai.action_intent_id
+                 AND le.rn = 1
+                WHERE ai.contract_id = ? AND ai.as_of_date = ?
+                """,
+                (contract_id, as_of_date),
+            )
+            successful_intents = int((existing_actions or {"successful_intents": 0})["successful_intents"] or 0)
+            failed_or_blocked = int((existing_actions or {"failed_or_blocked_intents": 0})["failed_or_blocked_intents"] or 0)
+            already_applied_actions = successful_intents
+            if successful_intents >= expected_actions_per_contract and failed_or_blocked == 0:
+                executed_contracts.append(
+                    {
+                        "contract_id": contract_id,
+                        "status": "ALREADY_APPLIED",
+                        "already_applied_actions": already_applied_actions,
+                        "autonomy_run_id": None,
+                        "case_ids": [],
+                    }
+                )
+                continue
+            cycle = self.run_recommended_cycle(contract_id=contract_id, as_of_date=as_of_date, dry_run=False)
+            status = "SUCCESS" if cycle.get("ok") else "BLOCKED"
+            executed_contracts.append(
+                {
+                    "contract_id": contract_id,
+                    "status": status,
+                    "already_applied_actions": already_applied_actions,
+                    "autonomy_run_id": cycle.get("autonomy_run_id"),
+                    "case_ids": cycle.get("case_ids", []),
+                }
+            )
+            attempted_actions += expected_actions_per_contract
+
+        response = {
+            "ok": True,
+            "mode": "execute",
+            "as_of_date_utc": as_of_date,
+            "benchmark_version": benchmark_version,
+            "max_contracts_per_run": max_contracts_per_run,
+            "max_actions_per_run": max_actions_per_run,
+            "contract_scope_hash": contract_scope_hash,
+            "preview_token": provided_preview_token,
+            "execute_idempotency_key": execute_idempotency_key,
+            "executed_contracts": executed_contracts,
+            "skipped_contracts": sorted(
+                [*skipped_contracts, *capped_skips],
+                key=lambda item: (str(item.get("contract_id") or ""), str(item.get("reason_code") or "")),
+            ),
+            "summary": {
+                "eligible_count": len(eligible_contract_ids),
+                "executed_count": len(executed_contracts),
+                "already_applied_count": sum(
+                    1 for item in executed_contracts if str(item.get("status") or "").upper() == "ALREADY_APPLIED"
+                ),
+                "blocked_count": sum(
+                    1 for item in executed_contracts if str(item.get("status") or "").upper() == "BLOCKED"
+                ),
+                "skipped_count": len(skipped_contracts) + len(capped_skips),
+                "attempted_actions": attempted_actions,
+            },
+            "idempotent_replay": False,
+        }
+        with self.repo.transaction() as conn:
+            self.repo.save_idempotent_response(
+                conn,
+                command_name="run-all-eligible-execute",
+                idempotency_key=execute_idempotency_key,
+                response=response,
+            )
+        return response
 
     def run_recommended_cycle(
         self,

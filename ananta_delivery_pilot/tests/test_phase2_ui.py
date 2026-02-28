@@ -88,6 +88,7 @@ class Phase2UiRouteTests(unittest.TestCase):
                 self.assertIn("Phase 2 (Ledger UI)", root_body)
             routes = [
                 "/v2/portfolio",
+                "/v2/workbench",
                 "/v2/intake",
                 f"/v2/contracts/{self.contract_id}/plan",
                 f"/v2/contracts/{self.contract_id}/execute",
@@ -99,7 +100,7 @@ class Phase2UiRouteTests(unittest.TestCase):
                     self.assertEqual(200, response.status)
                     body = response.read().decode("utf-8")
                     self.assertIn("Phase 2 (Ledger UI)", body)
-                    if route == "/v2/portfolio":
+                    if route in {"/v2/portfolio", "/v2/workbench"}:
                         self.assertIn("Command Center", body)
         finally:
             _stop_process(proc)
@@ -292,6 +293,54 @@ class Phase2UiRouteTests(unittest.TestCase):
             )
             self.assertIn("Exceptions Queue", html_body)
             self.assertIn(self.contract_id, html_body)
+        finally:
+            _stop_process(proc)
+
+    def test_run_all_preview_and_execute_from_portfolio(self) -> None:
+        evidence = self.temp_dir / "evidence_run_all.txt"
+        evidence.write_text("evidence", encoding="utf-8")
+        self.service.capture_evidence_original(contract_id=self.contract_id, source_path=evidence)
+        try:
+            port = _pick_free_port()
+        except PermissionError:
+            self.skipTest("socket bind not permitted in current sandbox")
+        proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
+        try:
+            _wait_for_route(port, "/v2/portfolio")
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/v2/portfolio", timeout=3) as response:
+                initial_html = response.read().decode("utf-8")
+            self.assertNotIn("Run All Eligible (Execute)", initial_html)
+            preview_html = _post_form(
+                port=port,
+                path="/v2/run-all-eligible",
+                fields={
+                    "as_of_date": "2026-02-23",
+                    "benchmark_version": "phase2.pr6.v1",
+                    "max_contracts_per_run": "20",
+                    "max_actions_per_run": "200",
+                },
+            )
+            self.assertIn("Run All Preview", preview_html)
+            preview_token = _hidden_value(preview_html, "preview_token")
+            self.assertTrue(preview_token)
+            execute_html = _post_form(
+                port=port,
+                path="/v2/run-all-eligible/execute",
+                fields={
+                    "as_of_date": "2026-02-23",
+                    "benchmark_version": "phase2.pr6.v1",
+                    "max_contracts_per_run": "20",
+                    "max_actions_per_run": "200",
+                    "preview_token": preview_token,
+                },
+            )
+            self.assertIn("Command Center", execute_html)
+            self.assertIn("Run-all execute complete", execute_html)
+            intents = self.repo.fetch_all(
+                "SELECT * FROM action_intents WHERE contract_id = ? AND as_of_date = ?",
+                (self.contract_id, "2026-02-23"),
+            )
+            self.assertGreaterEqual(len(intents), 1)
         finally:
             _stop_process(proc)
 

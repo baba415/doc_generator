@@ -23,7 +23,7 @@ from adapters.lpo_parser import PARSER_VERSION, parse_lpo
 from adapters.sqlite_repo import SQLiteRepo
 from core.config import RuntimeConfig
 from core.ids import new_ulid
-from core.time import utc_now_iso_z
+from core.time import utc_now_iso_z, utc_today_iso
 from core.units import kg_to_mt_str, mt_to_kg_int
 from domain.services import Phase1Service
 
@@ -65,6 +65,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
     route_settle_paid = re.compile(r"^/v2/contracts/([^/]+)/settle/mark-paid$")
     route_settle_export = re.compile(r"^/v2/contracts/([^/]+)/settle/export-drep$")
     route_run_recommended = re.compile(r"^/v2/contracts/([^/]+)/run-recommended$")
+    route_run_all_preview = re.compile(r"^/v2/run-all-eligible$")
+    route_run_all_execute = re.compile(r"^/v2/run-all-eligible/execute$")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A003
@@ -76,6 +78,9 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             query = parse_qs(parsed.query)
             try:
                 if route in {"/", "/v2"}:
+                    self._redirect("/v2/portfolio")
+                    return
+                if route == "/v2/workbench":
                     self._redirect("/v2/portfolio")
                     return
                 if route == "/v2/portfolio":
@@ -172,6 +177,12 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 if match:
                     self._handle_run_recommended(match.group(1))
                     return
+                if route_run_all_preview.match(route):
+                    self._handle_run_all_preview()
+                    return
+                if route_run_all_execute.match(route):
+                    self._handle_run_all_execute()
+                    return
                 if route == "/v2/exceptions/decide":
                     self._handle_exception_decide()
                     return
@@ -235,43 +246,93 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
 
         def _render_portfolio(self, query: dict[str, list[str]]) -> None:
             msg, level = self._msg(query)
-            today = dt.date.today().isoformat()
-            rows = service.command_center_rows(as_of_date=today, limit=300)
+            as_of_date_utc = str((query.get("as_of_date") or [utc_today_iso()])[0] or utc_today_iso()).strip()
+            max_contracts_per_run = int(str((query.get("max_contracts_per_run") or ["20"])[0] or "20"))
+            max_actions_per_run = int(str((query.get("max_actions_per_run") or ["200"])[0] or "200"))
+            benchmark_version = str((query.get("benchmark_version") or ["phase2.pr6.v1"])[0] or "phase2.pr6.v1").strip()
+            queue_data = service.command_center_sections(as_of_date=as_of_date_utc, limit=300)
+            sections = queue_data["sections"]
+            rows = queue_data["rows"]
+            preview_token = str((query.get("preview_token") or [""])[0] or "").strip()
+            preview_result: dict[str, object] | None = None
+            preview_stale = False
+            if preview_token:
+                preview_result = service.run_all_eligible(
+                    as_of_date_utc=as_of_date_utc,
+                    mode="preview",
+                    benchmark_version=benchmark_version,
+                    max_contracts_per_run=max_contracts_per_run,
+                    max_actions_per_run=max_actions_per_run,
+                )
+                if str(preview_result.get("preview_token") or "") != preview_token:
+                    preview_stale = True
+
             table = [
                 "<h2>Command Center</h2>",
-                "<p class='muted'>Primary path: Run Recommended. Only unresolved exception cases require manual action.</p>",
-                "<table><thead><tr><th>Contract</th><th>Buyer</th><th>LPO State</th><th>Expected/Delivered (MT)</th><th>Open Lots</th><th>Due Lots</th><th>Delivered Not Invoiced</th><th>Outstanding</th><th>Needs Decision</th><th>Actions</th></tr></thead><tbody>",
+                "<p class='muted'>Primary path: run from here. Daily queueing and action windows use UTC date.</p>",
+                "<form method='POST' action='/v2/run-all-eligible' class='inline-grid'>"
+                f"<label>As-of (UTC) <input type='date' name='as_of_date' value='{_escape(as_of_date_utc)}' /></label>"
+                f"<label>Benchmark Version <input type='text' name='benchmark_version' value='{_escape(benchmark_version)}' /></label>"
+                f"<label>Max Contracts/Run <input type='number' min='1' name='max_contracts_per_run' value='{_escape(max_contracts_per_run)}' /></label>"
+                f"<label>Max Actions/Run <input type='number' min='1' name='max_actions_per_run' value='{_escape(max_actions_per_run)}' /></label>"
+                "<button type='submit'>Run All Eligible (Preview)</button>"
+                "</form>",
             ]
-            for row in rows:
-                contract_id = str(row["contract_id"])
-                needs_decision = int(row.get("needs_decision_count") or 0)
-                outstanding = float(row.get("outstanding_total") or 0.0)
-                action_links = (
-                    f"<form method='POST' action='/v2/contracts/{_escape(contract_id)}/run-recommended' class='inline-form'>"
-                    f"<input type='hidden' name='as_of_date' value='{_escape(today)}' />"
-                    "<button type='submit'>Run Recommended</button>"
-                    "</form>"
-                    f"<a href='/v2/contracts/{_escape(contract_id)}/plan'>Plan</a> "
-                    f"<a href='/v2/contracts/{_escape(contract_id)}/execute'>Execute</a> "
-                    f"<a href='/v2/contracts/{_escape(contract_id)}/settle'>Settle</a>"
-                )
+            if preview_result:
+                preview_rows = preview_result.get("skipped_contracts", [])
+                preview_rows = preview_rows if isinstance(preview_rows, list) else []
                 table.append(
-                    "<tr>"
-                    f"<td>{_escape(row.get('lpo_no') or row.get('contract_ref'))}</td>"
-                    f"<td>{_escape(row.get('buyer_id'))}</td>"
-                    f"<td><span class='pill'>{_escape(row.get('lpo_state'))}</span></td>"
-                    f"<td>{_escape(_fmt_qty_mt_from_kg(row.get('expected_total_qty_kg')))} / {_escape(_fmt_qty_mt_from_kg(row.get('delivered_qty_kg')))}</td>"
-                    f"<td>{_escape(row.get('open_planned_lots'))}</td>"
-                    f"<td>{_escape(row.get('due_planned_lots'))}</td>"
-                    f"<td>{_escape(row.get('delivered_not_invoiced'))}</td>"
-                    f"<td>{_escape(f'{outstanding:,.2f}')}</td>"
-                    f"<td><a href='/v2/exceptions?contract_id={quote_plus(contract_id)}'><span class='pill'>{_escape(needs_decision)}</span></a></td>"
-                    f"<td>{action_links}</td>"
-                    "</tr>"
+                    "<details open><summary><strong>Run All Preview</strong></summary>"
+                    f"<p class='muted'>Eligible: {_escape(preview_result.get('eligible_count'))}; "
+                    f"Skipped: {_escape(len(preview_rows))}; "
+                    f"preview_token={_escape(preview_result.get('preview_token'))}</p>"
                 )
+                if preview_stale:
+                    table.append("<p class='muted' style='color:#b45309'>Preview token is stale for current queue snapshot. Generate preview again.</p>")
+                else:
+                    table.append(
+                        "<form method='POST' action='/v2/run-all-eligible/execute' class='inline-grid'>"
+                        f"<input type='hidden' name='as_of_date' value='{_escape(as_of_date_utc)}' />"
+                        f"<input type='hidden' name='benchmark_version' value='{_escape(benchmark_version)}' />"
+                        f"<input type='hidden' name='max_contracts_per_run' value='{_escape(max_contracts_per_run)}' />"
+                        f"<input type='hidden' name='max_actions_per_run' value='{_escape(max_actions_per_run)}' />"
+                        f"<input type='hidden' name='preview_token' value='{_escape(preview_result.get('preview_token'))}' />"
+                        "<button type='submit'>Run All Eligible (Execute)</button>"
+                        "</form>"
+                    )
+                if preview_rows:
+                    table.append("<table><thead><tr><th>Skipped Contract</th><th>Reason</th></tr></thead><tbody>")
+                    for skip in preview_rows:
+                        table.append(
+                            "<tr>"
+                            f"<td>{_escape(skip.get('contract_id'))}</td>"
+                            f"<td>{_escape(skip.get('reason_code'))}</td>"
+                            "</tr>"
+                        )
+                    table.append("</tbody></table>")
+                table.append("</details>")
+
+            def _section_table(title: str, section_rows: list[dict[str, object]]) -> str:
+                chunks = [
+                    f"<h3>{_escape(title)} ({len(section_rows)})</h3>",
+                    "<table><thead><tr><th>Contract</th><th>Buyer</th><th>LPO State</th><th>Expected/Delivered (MT)</th><th>Open Lots</th><th>Due Lots</th><th>Delivered Not Invoiced</th><th>Outstanding</th><th>Needs Decision</th><th>Action</th></tr></thead><tbody>",
+                ]
+                if not section_rows:
+                    chunks.append("<tr><td colspan='10' class='muted'>No items.</td></tr>")
+                    chunks.append("</tbody></table>")
+                    return "".join(chunks)
+                for row in section_rows:
+                    chunks.append(self._portfolio_row_html(row, as_of_date_utc))
+                chunks.append("</tbody></table>")
+                return "".join(chunks)
+
+            table.append(_section_table("Needs Decision", sections.get("NEEDS_DECISION", [])))
+            table.append(_section_table("Due Actions", sections.get("DUE_ACTION", [])))
+            table.append(_section_table("At Risk", sections.get("AT_RISK", [])))
+
             if not rows:
-                table.append("<tr><td colspan='10' class='muted'>No contracts yet.</td></tr>")
-            table.append("</tbody></table>")
+                table.append("<p class='muted'>No contracts yet.</p>")
+
             table.append(
                 "<details class='advanced'><summary>Advanced</summary>"
                 "<ul>"
@@ -1212,7 +1273,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
 
         def _handle_run_recommended(self, contract_id: str) -> None:
             fields = self._urlencoded_fields()
-            as_of = str(fields.get("as_of_date") or dt.date.today().isoformat()).strip()
+            as_of = str(fields.get("as_of_date") or utc_today_iso()).strip()
             cycle = service.run_recommended_cycle(
                 contract_id=contract_id,
                 as_of_date=as_of,
@@ -1242,6 +1303,54 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 target,
                 f"Run Recommended blocked. Open cases: {blocked or 'none'}",
                 level="error",
+            )
+
+        def _handle_run_all_preview(self) -> None:
+            fields = self._urlencoded_fields()
+            as_of = str(fields.get("as_of_date") or utc_today_iso()).strip()
+            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr6.v1").strip()
+            max_contracts = int(str(fields.get("max_contracts_per_run") or "20"))
+            max_actions = int(str(fields.get("max_actions_per_run") or "200"))
+            preview = service.run_all_eligible(
+                as_of_date_utc=as_of,
+                mode="preview",
+                benchmark_version=benchmark_version,
+                max_contracts_per_run=max_contracts,
+                max_actions_per_run=max_actions,
+            )
+            self._flash_redirect(
+                "/v2/portfolio"
+                f"?as_of_date={quote_plus(as_of)}"
+                f"&benchmark_version={quote_plus(benchmark_version)}"
+                f"&max_contracts_per_run={quote_plus(str(max_contracts))}"
+                f"&max_actions_per_run={quote_plus(str(max_actions))}"
+                f"&preview_token={quote_plus(str(preview.get('preview_token') or ''))}",
+                f"Run-all preview ready (eligible={preview.get('eligible_count')}, skipped={len(preview.get('skipped_contracts', []))})",
+            )
+
+        def _handle_run_all_execute(self) -> None:
+            fields = self._urlencoded_fields()
+            as_of = str(fields.get("as_of_date") or utc_today_iso()).strip()
+            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr6.v1").strip()
+            max_contracts = int(str(fields.get("max_contracts_per_run") or "20"))
+            max_actions = int(str(fields.get("max_actions_per_run") or "200"))
+            preview_token = str(fields.get("preview_token") or "").strip()
+            result = service.run_all_eligible(
+                as_of_date_utc=as_of,
+                mode="execute",
+                benchmark_version=benchmark_version,
+                max_contracts_per_run=max_contracts,
+                max_actions_per_run=max_actions,
+                preview_token=preview_token,
+            )
+            summary = result.get("summary", {})
+            self._flash_redirect(
+                f"/v2/portfolio?as_of_date={quote_plus(as_of)}",
+                "Run-all execute complete "
+                f"(executed={summary.get('executed_count', 0)}, "
+                f"already_applied={summary.get('already_applied_count', 0)}, "
+                f"blocked={summary.get('blocked_count', 0)}, "
+                f"skipped={summary.get('skipped_count', 0)})",
             )
 
         def _handle_exception_decide(self) -> None:
@@ -1573,6 +1682,44 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 "</div>"
             )
 
+        def _portfolio_row_html(self, row: dict[str, object], as_of_date_utc: str) -> str:
+            contract_id = str(row.get("contract_id") or "")
+            needs_decision = int(row.get("needs_decision_count") or 0)
+            outstanding = float(row.get("outstanding_total") or 0.0)
+            if needs_decision > 0:
+                primary_action = (
+                    f"<a class='btn' href='/v2/exceptions?contract_id={quote_plus(contract_id)}'>Resolve Exceptions</a>"
+                )
+            else:
+                primary_action = (
+                    f"<form method='POST' action='/v2/contracts/{_escape(contract_id)}/run-recommended' class='inline-form'>"
+                    f"<input type='hidden' name='as_of_date' value='{_escape(as_of_date_utc)}' />"
+                    "<button type='submit'>Run Recommended</button>"
+                    "</form>"
+                )
+            advanced_links = (
+                "<details class='advanced'>"
+                "<summary>Advanced</summary>"
+                f"<a href='/v2/contracts/{_escape(contract_id)}/plan'>Plan</a> · "
+                f"<a href='/v2/contracts/{_escape(contract_id)}/execute'>Execute</a> · "
+                f"<a href='/v2/contracts/{_escape(contract_id)}/settle'>Settle</a>"
+                "</details>"
+            )
+            return (
+                "<tr>"
+                f"<td>{_escape(row.get('lpo_no') or row.get('contract_ref'))}<br/><span class='muted'>{_escape(contract_id)}</span></td>"
+                f"<td>{_escape(row.get('buyer_id'))}<br/><span class='muted'>{_escape(row.get('vendor_of_record_id'))}</span></td>"
+                f"<td><span class='pill'>{_escape(row.get('lpo_state'))}</span></td>"
+                f"<td>{_escape(_fmt_qty_mt_from_kg(row.get('expected_total_qty_kg')))} / {_escape(_fmt_qty_mt_from_kg(row.get('delivered_qty_kg')))}</td>"
+                f"<td>{_escape(row.get('open_planned_lots'))}</td>"
+                f"<td>{_escape(row.get('due_planned_lots'))}</td>"
+                f"<td>{_escape(row.get('delivered_not_invoiced'))}</td>"
+                f"<td>{_escape(f'{outstanding:,.2f}')}</td>"
+                f"<td><a href='/v2/exceptions?contract_id={quote_plus(contract_id)}'><span class='pill'>{_escape(needs_decision)}</span></a></td>"
+                f"<td>{primary_action}{advanced_links}</td>"
+                "</tr>"
+            )
+
         def _entity_options(self, *, prefix: str, exclude_prefixes: tuple[str, ...] = ()) -> list[tuple[str, str]]:
             options: list[tuple[str, str]] = []
             for entity_id, entity in config.registry.entities.items():
@@ -1603,7 +1750,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             self.end_headers()
 
         def _flash_redirect(self, path: str, message: str, *, level: str = "ok") -> None:
-            self._redirect(f"{path}?msg={quote_plus(message)}&level={quote_plus(level)}")
+            separator = "&" if "?" in path else "?"
+            self._redirect(f"{path}{separator}msg={quote_plus(message)}&level={quote_plus(level)}")
 
         def _render_page(self, title: str, body_html: str, *, active: str, msg: str = "", level: str = "ok") -> None:
             alert = ""
