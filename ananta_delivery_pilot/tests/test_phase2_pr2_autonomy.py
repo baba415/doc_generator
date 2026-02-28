@@ -182,7 +182,7 @@ class Phase2PR2AutonomyTests(unittest.TestCase):
         parsed = parser.parse_args(["autonomy-metrics", "--as-of", "2026-03-31"])
         self.assertEqual("autonomy-metrics", parsed.command)
         self.assertEqual(30, parsed.lookback_window_days)
-        self.assertEqual("phase2.pr8.v1", parsed.benchmark_version)
+        self.assertEqual("phase2.pr10.v1", parsed.benchmark_version)
 
     def test_non_dry_run_autonomy_executes_intents_with_evidence_present(self) -> None:
         contract_id = self._create_contract("PR2-LPO-NONDRY")

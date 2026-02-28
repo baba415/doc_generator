@@ -44,6 +44,13 @@ def _norm_token(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
 class Phase1Service:
     def __init__(self, config: RuntimeConfig, repo: SQLiteRepo) -> None:
         self.config = config
@@ -1062,6 +1069,475 @@ class Phase1Service:
                 response=response,
             )
             return response
+
+    def _load_idempotent_response(
+        self,
+        *,
+        command_name: str,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        key = str(idempotency_key or "").strip()
+        if not key:
+            return None
+        with self.repo.transaction() as conn:
+            return self.repo.find_idempotent_response(
+                conn,
+                command_name=command_name,
+                idempotency_key=key,
+            )
+
+    def settlement_suggest_allocations(
+        self,
+        *,
+        contract_id: str,
+        as_of_date: str,
+        payment_reference: str = "",
+        amount_received: float | None = None,
+        payment_date: str | None = None,
+        payment_method: str = "Bank Transfer",
+        dry_run: bool = True,
+        idempotency_key: str | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        amount_value = _safe_float(amount_received, 0.0)
+        payment_ref = str(payment_reference or "").strip()
+        payment_date_value = str(payment_date or as_of_date or utc_today_iso()).strip()
+        benchmark_payload = {
+            "contract_id": contract_id,
+            "as_of_date": as_of_date,
+            "payment_reference": payment_ref,
+            "amount_received": round(amount_value, 2),
+            "payment_date": payment_date_value,
+            "payment_method": str(payment_method or "Bank Transfer").strip(),
+            "dry_run": bool(dry_run),
+        }
+        suggest_key = str(idempotency_key or "").strip() or f"settlement-suggest::{canonical_json_sha256(benchmark_payload)}"
+        if persist:
+            existing = self._load_idempotent_response(command_name="settlement-suggest", idempotency_key=suggest_key)
+            if existing:
+                return existing
+
+        sales_rows = self.repo.fetch_all(
+            """
+            SELECT
+              ds.sales_transaction_id,
+              ds.invoice_no,
+              ds.invoice_date,
+              ds.due_date,
+              ds.amount_due,
+              ds.outstanding_balance,
+              ds.expected_wht_amount,
+              ds.certified_withheld_amount,
+              ds.buyer_id,
+              ds.vendor_of_record_id
+            FROM drep_sales ds
+            WHERE ds.contract_id = ?
+              AND ds.outstanding_balance > 0
+            ORDER BY ds.due_date ASC, ds.invoice_no ASC
+            """,
+            (contract_id,),
+        )
+        ref_norm = _norm_token(payment_ref)
+        has_single_candidate = len(sales_rows) == 1
+        suggestions: list[dict[str, Any]] = []
+        for row in sales_rows:
+            invoice_no = str(row.get("invoice_no") or "")
+            invoice_norm = _norm_token(invoice_no)
+            outstanding = float(row.get("outstanding_balance") or 0.0)
+            expected_wht_amount = float(row.get("expected_wht_amount") or 0.0)
+            certified_withheld_amount = float(row.get("certified_withheld_amount") or 0.0)
+            score = 0.0
+            reason_bits: list[str] = []
+
+            if ref_norm and invoice_norm and (invoice_norm in ref_norm or ref_norm in invoice_norm):
+                score += 0.70
+                reason_bits.append("invoice_reference_match")
+            elif ref_norm and invoice_norm:
+                invoice_suffix = invoice_norm[-6:] if len(invoice_norm) >= 6 else invoice_norm
+                if invoice_suffix and invoice_suffix in ref_norm:
+                    score += 0.30
+                    reason_bits.append("invoice_reference_partial")
+            else:
+                reason_bits.append("invoice_reference_missing")
+
+            if amount_value > 0 and outstanding > 0:
+                delta = abs(amount_value - outstanding)
+                near_threshold = max(1.0, outstanding * 0.01)
+                mismatch_threshold = max(10.0, outstanding * 0.05)
+                if delta <= 0.01:
+                    score += 0.20
+                    reason_bits.append("amount_exact")
+                elif delta <= near_threshold:
+                    score += 0.10
+                    reason_bits.append("amount_near")
+                elif delta > mismatch_threshold:
+                    reason_bits.append("amount_mismatch_outside_policy")
+            withholding_gap = max(expected_wht_amount - certified_withheld_amount, 0.0)
+            if amount_value > 0 and outstanding > 0 and withholding_gap > 0:
+                shortfall = max(outstanding - amount_value, 0.0)
+                if shortfall > 0 and shortfall <= (withholding_gap + 1.0):
+                    reason_bits.append("withholding_evidence_missing")
+            if has_single_candidate:
+                score += 0.10
+                reason_bits.append("single_candidate")
+
+            confidence = round(min(0.99, score), 4)
+            suggested_amount = round(outstanding if amount_value <= 0 else min(outstanding, amount_value), 2)
+            suggestion_id = f"SUG-{canonical_json_sha256({'contract_id': contract_id, 'sales_transaction_id': row['sales_transaction_id'], 'as_of_date': as_of_date, 'payment_reference': payment_ref, 'amount_received': round(amount_value, 2)})[:20]}"
+            suggestions.append(
+                {
+                    "suggestion_id": suggestion_id,
+                    "sales_transaction_id": str(row.get("sales_transaction_id") or ""),
+                    "invoice_no": invoice_no,
+                    "invoice_date": str(row.get("invoice_date") or ""),
+                    "due_date": str(row.get("due_date") or ""),
+                    "outstanding_balance": outstanding,
+                    "suggested_amount": suggested_amount,
+                    "expected_wht_amount": expected_wht_amount,
+                    "certified_withheld_amount": certified_withheld_amount,
+                    "confidence": confidence,
+                    "reason_bits": reason_bits,
+                }
+            )
+
+        suggestions.sort(
+            key=lambda item: (
+                -float(item.get("confidence") or 0.0),
+                str(item.get("due_date") or ""),
+                str(item.get("invoice_no") or ""),
+            )
+        )
+        top = suggestions[0] if suggestions else None
+        second = suggestions[1] if len(suggestions) > 1 else None
+        top_confidence = float(top.get("confidence") or 0.0) if isinstance(top, dict) else 0.0
+        ambiguous = bool(
+            top
+            and second
+            and top_confidence >= 0.75
+            and abs(top_confidence - float(second.get("confidence") or 0.0)) < 0.05
+        )
+        reason_code = "pass"
+        decision_class = "BLOCKER"
+        if not top:
+            reason_code = "invoice_not_settlement_eligible"
+            decision_class = "BLOCKER"
+        elif amount_value <= 0 and not payment_ref:
+            reason_code = "insufficient_payment_data"
+            decision_class = "BLOCKER"
+        elif ambiguous:
+            reason_code = "multiple_candidate_conflict"
+            decision_class = "BLOCKER"
+        elif "withholding_evidence_missing" in list(top.get("reason_bits") or []):
+            reason_code = "withholding_evidence_missing"
+            decision_class = "BLOCKER"
+        elif "amount_mismatch_outside_policy" in list(top.get("reason_bits") or []):
+            reason_code = "amount_mismatch_outside_policy"
+            decision_class = "BLOCKER"
+        elif top_confidence >= 0.95 and "invoice_reference_match" in list(top.get("reason_bits") or []):
+            reason_code = "auto_threshold_met"
+            decision_class = "AUTO_APPLY"
+        elif top_confidence >= 0.75:
+            reason_code = "review_threshold"
+            decision_class = "REVIEW"
+        elif not payment_ref:
+            reason_code = "payment_reference_missing"
+            decision_class = "BLOCKER"
+        else:
+            reason_code = "payment_reference_ambiguous"
+            decision_class = "BLOCKER"
+
+        response = {
+            "ok": True,
+            "contract_id": contract_id,
+            "as_of_date": as_of_date,
+            "payment_date": payment_date_value,
+            "payment_method": str(payment_method or "Bank Transfer").strip(),
+            "payment_reference": payment_ref,
+            "amount_received": round(amount_value, 2),
+            "dry_run": bool(dry_run),
+            "suggestion_set_id": suggest_key,
+            "suggestions": suggestions,
+            "top_suggestion": top,
+            "decision_class": decision_class,
+            "reason_code": reason_code,
+            "ambiguous": ambiguous,
+        }
+        if persist:
+            with self.repo.transaction() as conn:
+                self.repo.save_idempotent_response(
+                    conn,
+                    command_name="settlement-suggest",
+                    idempotency_key=suggest_key,
+                    response=response,
+                )
+                self.repo.append_event(
+                    conn,
+                    entity_type="CONTRACT",
+                    entity_id=contract_id,
+                    event_type="SETTLEMENT_SUGGESTED",
+                    as_of_date=as_of_date,
+                    payload={
+                        "suggestion_set_id": suggest_key,
+                        "decision_class": decision_class,
+                        "reason_code": reason_code,
+                        "suggestion_count": len(suggestions),
+                    },
+                    source="settlement-copilot",
+                )
+        return response
+
+    def settlement_apply_suggestion(
+        self,
+        *,
+        contract_id: str,
+        suggestion_set_id: str,
+        suggestion_id: str,
+        as_of_date: str,
+        decision: str = "APPLY",
+        reason: str = "",
+        allow_placeholder_tin: bool = True,
+        skip_pdf: bool = False,
+        payment_reference: str = "",
+        payment_date: str | None = None,
+        payment_method: str = "Bank Transfer",
+        amount_received: float | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        decision_norm = str(decision or "APPLY").strip().upper()
+        if decision_norm not in {"APPLY", "APPROVE", "AUTO_APPLY", "REJECT"}:
+            raise ValueError("decision must be APPLY, APPROVE, AUTO_APPLY or REJECT")
+        apply_key = str(idempotency_key or "").strip() or (
+            f"settlement-apply::{canonical_json_sha256({'contract_id': contract_id, 'suggestion_set_id': suggestion_set_id, 'suggestion_id': suggestion_id, 'as_of_date': as_of_date, 'decision': decision_norm})}"
+        )
+        existing = self._load_idempotent_response(command_name="settlement-apply", idempotency_key=apply_key)
+        if existing:
+            return existing
+
+        suggestion_set = self._load_idempotent_response(command_name="settlement-suggest", idempotency_key=suggestion_set_id)
+        if not suggestion_set:
+            raise ValueError("Unknown suggestion_set_id")
+        if str(suggestion_set.get("contract_id") or "") != contract_id:
+            raise ValueError("suggestion_set_id does not match contract")
+        suggestions = suggestion_set.get("suggestions")
+        if not isinstance(suggestions, list):
+            suggestions = []
+        selected = None
+        for row in suggestions:
+            if str(row.get("suggestion_id") or "") == suggestion_id:
+                selected = row
+                break
+        if not isinstance(selected, dict):
+            raise ValueError("Unknown suggestion_id")
+
+        confidence = float(selected.get("confidence") or 0.0)
+        decision_class = str(suggestion_set.get("decision_class") or "BLOCKER").upper()
+        ambiguous = bool(suggestion_set.get("ambiguous"))
+        should_apply = decision_norm in {"APPLY", "APPROVE", "AUTO_APPLY"} and decision_class == "AUTO_APPLY" and not ambiguous
+
+        if should_apply:
+            external_reference = str(payment_reference or suggestion_set.get("payment_reference") or "").strip() or f"SETTLE-{new_ulid()}"
+            payment_payload = {
+                "payment_date": str(payment_date or suggestion_set.get("payment_date") or as_of_date).strip(),
+                "payment_method": str(payment_method or suggestion_set.get("payment_method") or "Bank Transfer").strip(),
+                "external_reference": external_reference,
+                "idempotency_key": f"{apply_key}::mark-paid",
+                "amount_received": _safe_float(
+                    amount_received,
+                    _safe_float(suggestion_set.get("amount_received"), _safe_float(selected.get("suggested_amount"), 0.0)),
+                ),
+                "allocations": [
+                    {
+                        "sales_transaction_id": str(selected.get("sales_transaction_id") or ""),
+                        "allocated_amount": _safe_float(selected.get("suggested_amount"), 0.0),
+                        "notes": "settlement_copilot_auto_apply",
+                    }
+                ],
+            }
+            paid = self.mark_paid(
+                payment_payload,
+                allow_placeholder_tin=allow_placeholder_tin,
+                skip_pdf=skip_pdf,
+            )
+            response = {
+                "ok": True,
+                "status": "APPLIED",
+                "contract_id": contract_id,
+                "suggestion_set_id": suggestion_set_id,
+                "suggestion_id": suggestion_id,
+                "decision_class": decision_class,
+                "confidence": confidence,
+                "reason_code": "applied",
+                "mark_paid_result": paid,
+            }
+            with self.repo.transaction() as conn:
+                self.repo.append_event(
+                    conn,
+                    entity_type="CONTRACT",
+                    entity_id=contract_id,
+                    event_type="SETTLEMENT_SUGGESTION_ACCEPTED",
+                    as_of_date=as_of_date,
+                    payload={
+                        "suggestion_set_id": suggestion_set_id,
+                        "suggestion_id": suggestion_id,
+                        "sales_transaction_id": str(selected.get("sales_transaction_id") or ""),
+                        "confidence": confidence,
+                        "decision": decision_norm,
+                    },
+                    source="settlement-copilot",
+                )
+                self.repo.save_idempotent_response(
+                    conn,
+                    command_name="settlement-apply",
+                    idempotency_key=apply_key,
+                    response=response,
+                )
+            return response
+
+        reason_code = (
+            "multiple_candidate_conflict"
+            if ambiguous
+            else str(suggestion_set.get("reason_code") or "payment_reference_ambiguous")
+        )
+        severity = "BLOCKER" if decision_class == "BLOCKER" or decision_norm == "REJECT" else "REVIEW"
+        details = {
+            "as_of_date": as_of_date,
+            "suggestion_set_id": suggestion_set_id,
+            "suggestion_id": suggestion_id,
+            "decision": decision_norm,
+            "decision_class": decision_class,
+            "confidence": confidence,
+            "reason": str(reason or "").strip(),
+            "selected_candidate": selected,
+            "all_candidates": suggestions[:3],
+        }
+        case_key = f"settlement|{contract_id}|{suggestion_set_id}|{suggestion_id}|{reason_code}"
+        with self.repo.transaction() as conn:
+            case_row = self.repo.create_or_get_exception_case(
+                conn,
+                autonomy_run_id=new_ulid(),
+                action_intent_id=None,
+                contract_id=contract_id,
+                delivery_id=None,
+                planned_delivery_id=None,
+                case_type="settlement_allocation",
+                severity=severity,
+                reason_code=reason_code,
+                details=details,
+                idempotency_key=case_key,
+            )
+            self.repo.add_decision_feature(
+                conn,
+                exception_case_id=str(case_row["exception_case_id"]),
+                feature_key="settlement_suggestion_candidates",
+                feature_payload=details,
+            )
+            self.repo.append_event(
+                conn,
+                entity_type="EXCEPTION_CASE",
+                entity_id=str(case_row["exception_case_id"]),
+                event_type="CASE_OPENED",
+                as_of_date=as_of_date,
+                payload={"reason_code": reason_code, "suggestion_set_id": suggestion_set_id},
+                source="settlement-copilot",
+            )
+            self.repo.append_event(
+                conn,
+                entity_type="CONTRACT",
+                entity_id=contract_id,
+                event_type="SETTLEMENT_SUGGESTION_ROUTED_EXCEPTION",
+                as_of_date=as_of_date,
+                payload={
+                    "reason_code": reason_code,
+                    "suggestion_set_id": suggestion_set_id,
+                    "suggestion_id": suggestion_id,
+                    "decision": decision_norm,
+                    "confidence": confidence,
+                },
+                source="settlement-copilot",
+            )
+            response = {
+                "ok": False,
+                "status": "EXCEPTION_ROUTED",
+                "contract_id": contract_id,
+                "suggestion_set_id": suggestion_set_id,
+                "suggestion_id": suggestion_id,
+                "decision_class": decision_class,
+                "confidence": confidence,
+                "reason_code": reason_code,
+                "exception_case_id": str(case_row["exception_case_id"]),
+            }
+            self.repo.save_idempotent_response(
+                conn,
+                command_name="settlement-apply",
+                idempotency_key=apply_key,
+                response=response,
+            )
+            return response
+
+    def portfolio_kpi_strip(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int = 30,
+        benchmark_version: str = "phase2.pr10.v1",
+    ) -> dict[str, Any]:
+        from domain.automation import AutomationOrchestrator
+
+        orchestrator = AutomationOrchestrator(self.config, self.repo, self)
+        metrics = orchestrator.compute_metrics_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+        )
+        return {
+            "as_of_date": as_of_date,
+            "lookback_window_days": int(lookback_window_days),
+            "benchmark_version": benchmark_version,
+            "touchless_rate": metrics.get("touchless_rate"),
+            "touchless_rate_reason_code": metrics.get("touchless_rate_reason_code"),
+            "manual_inputs_per_delivery": metrics.get("manual_inputs_per_delivery"),
+            "manual_inputs_per_delivery_reason_code": metrics.get("manual_inputs_per_delivery_reason_code"),
+            "exception_resolution_time_hours_p50": metrics.get("exception_resolution_time_hours_p50"),
+            "exception_resolution_time_hours_p95": metrics.get("exception_resolution_time_hours_p95"),
+            "exception_resolution_time_reason_code": metrics.get("exception_resolution_time_reason_code"),
+            "first_time_lpo_to_pack_minutes": metrics.get("first_time_lpo_to_pack_minutes"),
+            "first_time_lpo_to_pack_reason_code": metrics.get("first_time_lpo_to_pack_reason_code"),
+            "auto_action_success_rate": metrics.get("auto_action_success_rate"),
+            "auto_action_success_rate_reason_code": metrics.get("auto_action_success_rate_reason_code"),
+            "payment_suggestion_acceptance_rate": metrics.get("payment_suggestion_acceptance_rate"),
+            "payment_suggestion_acceptance_rate_reason_code": metrics.get("payment_suggestion_acceptance_rate_reason_code"),
+            "pr10_gate_pass": metrics.get("pr10_gate_pass"),
+            "pr10_gate_reason_code": metrics.get("pr10_gate_reason_code"),
+        }
+
+    def portfolio_sla_trends(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int = 30,
+        benchmark_version: str = "phase2.pr10.v1",
+    ) -> dict[str, Any]:
+        from domain.automation import AutomationOrchestrator
+
+        orchestrator = AutomationOrchestrator(self.config, self.repo, self)
+        metrics = orchestrator.compute_metrics_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+        )
+        return {
+            "as_of_date": as_of_date,
+            "lookback_window_days": int(lookback_window_days),
+            "benchmark_version": benchmark_version,
+            "exception_resolution_trend_state": metrics.get("exception_resolution_trend_state"),
+            "exception_resolution_trend_reason_code": metrics.get("exception_resolution_trend_reason_code"),
+            "exception_resolution_current_p95_hours": metrics.get("exception_resolution_current_p95_hours"),
+            "exception_resolution_previous_p95_hours": metrics.get("exception_resolution_previous_p95_hours"),
+            "settlement_aging_trend_state": metrics.get("settlement_aging_trend_state"),
+            "settlement_aging_trend_reason_code": metrics.get("settlement_aging_trend_reason_code"),
+            "settlement_aging_current": metrics.get("settlement_aging_current"),
+            "settlement_aging_previous": metrics.get("settlement_aging_previous"),
+        }
 
     def export_drep(self, *, as_of_date: str, out_dir: Path) -> dict[str, Any]:
         exports = export_drep_views(self.repo, as_of_date=as_of_date, out_dir=out_dir)

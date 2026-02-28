@@ -131,6 +131,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
     route_execute_one = re.compile(r"^/v2/contracts/([^/]+)/execute/materialize-one$")
     route_generate_pack = re.compile(r"^/v2/contracts/([^/]+)/execute/generate-pack$")
     route_settle_paid = re.compile(r"^/v2/contracts/([^/]+)/settle/mark-paid$")
+    route_settle_suggest = re.compile(r"^/v2/contracts/([^/]+)/settle/suggest$")
+    route_settle_apply = re.compile(r"^/v2/contracts/([^/]+)/settle/apply-suggestion$")
     route_settle_export = re.compile(r"^/v2/contracts/([^/]+)/settle/export-drep$")
     route_run_recommended = re.compile(r"^/v2/contracts/([^/]+)/run-recommended$")
     route_run_all_preview = re.compile(r"^/v2/run-all-eligible$")
@@ -241,6 +243,14 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 if match:
                     self._handle_settle_mark_paid(match.group(1))
                     return
+                match = route_settle_suggest.match(route)
+                if match:
+                    self._handle_settle_suggest(match.group(1))
+                    return
+                match = route_settle_apply.match(route)
+                if match:
+                    self._handle_settle_apply_suggestion(match.group(1))
+                    return
                 match = route_settle_export.match(route)
                 if match:
                     self._handle_settle_export(match.group(1))
@@ -318,13 +328,26 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
 
         def _render_portfolio(self, query: dict[str, list[str]]) -> None:
             msg, level = self._msg(query)
-            as_of_date_utc = str((query.get("as_of_date") or [utc_today_iso()])[0] or utc_today_iso()).strip()
+            as_of_date_utc = str(
+                (query.get("as_of") or query.get("as_of_date") or [utc_today_iso()])[0] or utc_today_iso()
+            ).strip()
+            lookback_window_days = int(str((query.get("lookback_window_days") or ["30"])[0] or "30"))
             max_contracts_per_run = int(str((query.get("max_contracts_per_run") or ["20"])[0] or "20"))
             max_actions_per_run = int(str((query.get("max_actions_per_run") or ["200"])[0] or "200"))
-            benchmark_version = str((query.get("benchmark_version") or ["phase2.pr6.v1"])[0] or "phase2.pr6.v1").strip()
+            benchmark_version = str((query.get("benchmark_version") or ["phase2.pr10.v1"])[0] or "phase2.pr10.v1").strip()
             queue_data = service.command_center_sections(as_of_date=as_of_date_utc, limit=300)
             sections = queue_data["sections"]
             rows = queue_data["rows"]
+            kpi_strip = service.portfolio_kpi_strip(
+                as_of_date=as_of_date_utc,
+                lookback_window_days=lookback_window_days,
+                benchmark_version=benchmark_version,
+            )
+            trend_strip = service.portfolio_sla_trends(
+                as_of_date=as_of_date_utc,
+                lookback_window_days=lookback_window_days,
+                benchmark_version=benchmark_version,
+            )
             preview_token = str((query.get("preview_token") or [""])[0] or "").strip()
             preview_result: dict[str, object] | None = None
             preview_stale = False
@@ -339,9 +362,37 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 if str(preview_result.get("preview_token") or "") != preview_token:
                     preview_stale = True
 
+            def _fmt_metric(value: object) -> str:
+                if value is None:
+                    return "N/A"
+                if isinstance(value, float):
+                    return f"{value:.4f}"
+                return str(value)
+
             table = [
                 "<h2>Command Center</h2>",
-                "<p class='muted'>Primary path: run from here. Daily queueing and action windows use UTC date.</p>",
+                "<p class='muted'>Primary path: run from here. Daily queueing, KPI windows, and SLA windows use UTC date.</p>",
+                "<form method='GET' action='/v2/portfolio' class='inline-grid'>"
+                f"<label>As-of (UTC) <input type='date' name='as_of' value='{_escape(as_of_date_utc)}' /></label>"
+                f"<label>Lookback Days <input type='number' min='1' name='lookback_window_days' value='{_escape(lookback_window_days)}' /></label>"
+                f"<label>Benchmark Version <input type='text' name='benchmark_version' value='{_escape(benchmark_version)}' /></label>"
+                "<button type='submit'>Refresh KPI Window</button>"
+                "</form>",
+                "<h3>KPI Strip</h3>",
+                "<table><thead><tr><th>Metric</th><th>Value</th><th>Reason</th></tr></thead><tbody>"
+                f"<tr><td>touchless_rate</td><td>{_escape(_fmt_metric(kpi_strip.get('touchless_rate')))}</td><td>{_escape(kpi_strip.get('touchless_rate_reason_code') or 'pass')}</td></tr>"
+                f"<tr><td>manual_inputs_per_delivery</td><td>{_escape(_fmt_metric(kpi_strip.get('manual_inputs_per_delivery')))}</td><td>{_escape(kpi_strip.get('manual_inputs_per_delivery_reason_code') or 'pass')}</td></tr>"
+                f"<tr><td>exception_resolution_time_hours_p50/p95</td><td>{_escape(_fmt_metric(kpi_strip.get('exception_resolution_time_hours_p50')))} / {_escape(_fmt_metric(kpi_strip.get('exception_resolution_time_hours_p95')))}</td><td>{_escape(kpi_strip.get('exception_resolution_time_reason_code') or 'pass')}</td></tr>"
+                f"<tr><td>first_time_lpo_to_pack_minutes</td><td>{_escape(_fmt_metric(kpi_strip.get('first_time_lpo_to_pack_minutes')))}</td><td>{_escape(kpi_strip.get('first_time_lpo_to_pack_reason_code') or 'pass')}</td></tr>"
+                f"<tr><td>auto_action_success_rate</td><td>{_escape(_fmt_metric(kpi_strip.get('auto_action_success_rate')))}</td><td>{_escape(kpi_strip.get('auto_action_success_rate_reason_code') or 'pass')}</td></tr>"
+                f"<tr><td>payment_suggestion_acceptance_rate</td><td>{_escape(_fmt_metric(kpi_strip.get('payment_suggestion_acceptance_rate')))}</td><td>{_escape(kpi_strip.get('payment_suggestion_acceptance_rate_reason_code') or 'pass')}</td></tr>"
+                f"<tr><td>pr10_gate</td><td>{_escape(str(kpi_strip.get('pr10_gate_pass')))}</td><td>{_escape(kpi_strip.get('pr10_gate_reason_code') or '')}</td></tr>"
+                "</tbody></table>",
+                "<h3>SLA / Aging Trends</h3>",
+                "<table><thead><tr><th>Trend</th><th>State</th><th>Reason</th><th>Current</th><th>Previous</th></tr></thead><tbody>"
+                f"<tr><td>exception_resolution_p95_hours</td><td>{_escape(str(trend_strip.get('exception_resolution_trend_state') or ''))}</td><td>{_escape(str(trend_strip.get('exception_resolution_trend_reason_code') or ''))}</td><td>{_escape(_fmt_metric(trend_strip.get('exception_resolution_current_p95_hours')))}</td><td>{_escape(_fmt_metric(trend_strip.get('exception_resolution_previous_p95_hours')))}</td></tr>"
+                f"<tr><td>settlement_aging_90+</td><td>{_escape(str(trend_strip.get('settlement_aging_trend_state') or ''))}</td><td>{_escape(str(trend_strip.get('settlement_aging_trend_reason_code') or ''))}</td><td>{_escape(_fmt_metric((trend_strip.get('settlement_aging_current') or {}).get('90+') if isinstance(trend_strip.get('settlement_aging_current'), dict) else None))}</td><td>{_escape(_fmt_metric((trend_strip.get('settlement_aging_previous') or {}).get('90+') if isinstance(trend_strip.get('settlement_aging_previous'), dict) else None))}</td></tr>"
+                "</tbody></table>",
                 "<form method='POST' action='/v2/run-all-eligible' class='inline-grid'>"
                 f"<label>As-of (UTC) <input type='date' name='as_of_date' value='{_escape(as_of_date_utc)}' /></label>"
                 f"<label>Benchmark Version <input type='text' name='benchmark_version' value='{_escape(benchmark_version)}' /></label>"
@@ -676,12 +727,19 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 (contract_id,),
             )
             today = utc_today_iso()
+            as_of_date = str((query.get("as_of") or query.get("as_of_date") or [today])[0] or today).strip()
             sales_options = [(str(row["sales_transaction_id"]), f"{row['invoice_no']} | outstanding={row['outstanding_balance']}") for row in sales_rows]
             default_sale = sales_options[0][0] if sales_options else ""
             default_amount = float(sales_rows[0]["outstanding_balance"]) if sales_rows else 0.0
+            suggestion_set_id = str((query.get("suggestion_set_id") or [""])[0] or "").strip()
+            suggestion_result: dict[str, Any] | None = None
+            if suggestion_set_id:
+                loaded = service._load_idempotent_response(command_name="settlement-suggest", idempotency_key=suggestion_set_id)
+                if isinstance(loaded, dict) and str(loaded.get("contract_id") or "") == contract_id:
+                    suggestion_result = loaded
             parts = [
                 f"<h2>Settle - {_escape(contract.get('lpo_no') or contract_id)}</h2>",
-                "<p class='muted'>Receipt is generated only here on mark-paid.</p>",
+                "<p class='muted'>Settlement copilot suggests allocations; ambiguous/conflicting suggestions route to Exceptions. Receipt is generated only on mark-paid.</p>",
                 self._contract_summary(contract),
                 "<h3>Invoices / Outstanding</h3>",
                 "<table><thead><tr><th>Invoice</th><th>Amount Due</th><th>Paid</th><th>Certified Withheld</th><th>Outstanding</th><th>Due Date</th></tr></thead><tbody>",
@@ -701,6 +759,54 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 parts.append("<tr><td colspan='6' class='muted'>No invoices generated yet.</td></tr>")
             parts.append("</tbody></table>")
             parts.append(
+                f"<form method='POST' action='/v2/contracts/{_escape(contract_id)}/settle/suggest'><div class='inline-grid'>"
+                f"<label>As-of Date <input type='date' name='as_of_date' value='{_escape(as_of_date)}' /></label>"
+                f"<label>Payment Date <input type='date' name='payment_date' value='{_escape(today)}' /></label>"
+                f"<label>Amount Received <input type='number' step='0.01' name='amount_received' value='{default_amount:.2f}' /></label>"
+                "<label>Payment Method <input type='text' name='payment_method' value='Bank Transfer' /></label>"
+                "<label>Payment Reference <input type='text' name='payment_reference' value='' /></label>"
+                "<button type='submit'>Suggest Allocation</button>"
+                "</div></form>"
+            )
+            if suggestion_result:
+                decision_class = str(suggestion_result.get("decision_class") or "").upper()
+                reason_code = str(suggestion_result.get("reason_code") or "")
+                parts.append(
+                    "<h3>Settlement Copilot Suggestions</h3>"
+                    f"<p class='muted'>decision_class={_escape(decision_class)}; reason={_escape(reason_code)}; "
+                    f"suggestion_set_id={_escape(suggestion_set_id)}</p>"
+                )
+                parts.append("<table><thead><tr><th>Invoice</th><th>Outstanding</th><th>Suggested Amount</th><th>Confidence</th><th>Reason Bits</th><th>Decision</th></tr></thead><tbody>")
+                for suggestion in suggestion_result.get("suggestions") or []:
+                    if not isinstance(suggestion, dict):
+                        continue
+                    parts.append(
+                        "<tr>"
+                        f"<td>{_escape(suggestion.get('invoice_no'))}</td>"
+                        f"<td>{_escape(suggestion.get('outstanding_balance'))}</td>"
+                        f"<td>{_escape(suggestion.get('suggested_amount'))}</td>"
+                        f"<td>{_escape(suggestion.get('confidence'))}</td>"
+                        f"<td>{_escape(', '.join(str(item) for item in (suggestion.get('reason_bits') or [])))}</td>"
+                        f"<td>"
+                        f"<form method='POST' action='/v2/contracts/{_escape(contract_id)}/settle/apply-suggestion' class='inline-form'>"
+                        f"<input type='hidden' name='suggestion_set_id' value='{_escape(suggestion_set_id)}' />"
+                        f"<input type='hidden' name='suggestion_id' value='{_escape(str(suggestion.get('suggestion_id') or ''))}' />"
+                        f"<input type='hidden' name='as_of_date' value='{_escape(as_of_date)}' />"
+                        f"<input type='hidden' name='payment_date' value='{_escape(str(suggestion_result.get('payment_date') or today))}' />"
+                        f"<input type='hidden' name='payment_method' value='{_escape(str(suggestion_result.get('payment_method') or 'Bank Transfer'))}' />"
+                        f"<input type='hidden' name='payment_reference' value='{_escape(str(suggestion_result.get('payment_reference') or ''))}' />"
+                        f"<input type='hidden' name='amount_received' value='{_escape(str(suggestion_result.get('amount_received') or 0.0))}' />"
+                        "<input type='text' name='reason' placeholder='reason (required for non-auto)' />"
+                        "<button type='submit'>Apply / Route</button>"
+                        "</form>"
+                        "</td>"
+                        "</tr>"
+                    )
+                if not list(suggestion_result.get("suggestions") or []):
+                    parts.append("<tr><td colspan='6' class='muted'>No settlement-eligible invoices found.</td></tr>")
+                parts.append("</tbody></table>")
+            parts.append(
+                "<details class='advanced'><summary>Advanced: Manual mark-paid</summary>"
                 f"<form method='POST' action='/v2/contracts/{_escape(contract_id)}/settle/mark-paid'><div class='inline-grid'>"
                 f"<label>Sales transaction {self._select('sales_transaction_id', sales_options, selected=default_sale)}</label>"
                 f"<label>Payment Date <input type='date' name='payment_date' value='{today}' /></label>"
@@ -710,10 +816,11 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 "<label><input type='checkbox' name='skip_pdf' value='1' /> Skip PDF (metadata-only)</label>"
                 "<button type='submit'>Mark Paid + Generate Receipt</button>"
                 "</div></form>"
+                "</details>"
             )
             parts.append(
                 f"<form method='POST' action='/v2/contracts/{_escape(contract_id)}/settle/export-drep'><div class='inline-grid'>"
-                f"<label>As-of Date <input type='date' name='as_of_date' value='{today}' /></label>"
+                f"<label>As-of Date <input type='date' name='as_of_date' value='{_escape(as_of_date)}' /></label>"
                 "<button type='submit'>Export DREP</button>"
                 "</div></form>"
             )
@@ -1232,6 +1339,12 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             }
             contract = service.create_contract(payload, allow_placeholder_tin=bool(data.get("allow_placeholder_tin")))
             contract_id = str(contract["contract_id"])
+            self._record_intake_confirmed_event(
+                contract_id=contract_id,
+                as_of_date=issue_date,
+                source="intake_confirm",
+                intake_run_id=str(data.get("intake_run_id") or "").strip() or None,
+            )
             persisted_evidence = self._load_intake_evidence_paths(data=data) + [str(path) for path in uploaded_paths]
             evidence_count = 0
             try:
@@ -1337,6 +1450,12 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
 
             contract = service.create_contract(payload, allow_placeholder_tin=bool(data.get("allow_placeholder_tin")))
             contract_id = str(contract["contract_id"])
+            self._record_intake_confirmed_event(
+                contract_id=contract_id,
+                as_of_date=issue_date,
+                source="manual_intake",
+                intake_run_id=None,
+            )
             evidence_count = self._capture_uploaded_files(
                 form=form,
                 field_name="lpo_originals",
@@ -1639,6 +1758,71 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             self._flash_redirect(
                 f"/v2/contracts/{contract_id}/execute",
                 f"Generated pack {result['invoice_no']}",
+            )
+
+        def _handle_settle_suggest(self, contract_id: str) -> None:
+            fields = self._urlencoded_fields()
+            as_of_date = str(fields.get("as_of_date") or utc_today_iso()).strip()
+            payment_date = str(fields.get("payment_date") or as_of_date).strip()
+            payment_method = str(fields.get("payment_method") or "Bank Transfer").strip()
+            payment_reference = str(fields.get("payment_reference") or "").strip()
+            amount_received = float(fields.get("amount_received") or 0.0)
+            result = service.settlement_suggest_allocations(
+                contract_id=contract_id,
+                as_of_date=as_of_date,
+                payment_reference=payment_reference,
+                amount_received=amount_received,
+                payment_date=payment_date,
+                payment_method=payment_method,
+                dry_run=True,
+            )
+            suggestion_set_id = str(result.get("suggestion_set_id") or "")
+            self._flash_redirect(
+                (
+                    f"/v2/contracts/{contract_id}/settle"
+                    f"?as_of={quote_plus(as_of_date)}"
+                    f"&suggestion_set_id={quote_plus(suggestion_set_id)}"
+                ),
+                f"Generated {len(result.get('suggestions') or [])} settlement suggestions ({result.get('decision_class')})",
+            )
+
+        def _handle_settle_apply_suggestion(self, contract_id: str) -> None:
+            fields = self._urlencoded_fields()
+            suggestion_set_id = str(fields.get("suggestion_set_id") or "").strip()
+            suggestion_id = str(fields.get("suggestion_id") or "").strip()
+            if not suggestion_set_id or not suggestion_id:
+                raise ValueError("suggestion_set_id and suggestion_id are required")
+            as_of_date = str(fields.get("as_of_date") or utc_today_iso()).strip()
+            reason = str(fields.get("reason") or "").strip()
+            result = service.settlement_apply_suggestion(
+                contract_id=contract_id,
+                suggestion_set_id=suggestion_set_id,
+                suggestion_id=suggestion_id,
+                as_of_date=as_of_date,
+                decision="APPLY",
+                reason=reason,
+                payment_reference=str(fields.get("payment_reference") or "").strip(),
+                payment_date=str(fields.get("payment_date") or as_of_date).strip(),
+                payment_method=str(fields.get("payment_method") or "Bank Transfer").strip(),
+                amount_received=float(fields.get("amount_received") or 0.0),
+            )
+            status = str(result.get("status") or "").upper()
+            if status == "EXCEPTION_ROUTED":
+                case_id = str(result.get("exception_case_id") or "").strip()
+                self._flash_redirect(
+                    f"/v2/exceptions?contract_id={quote_plus(contract_id)}&case_id={quote_plus(case_id)}",
+                    f"Settlement suggestion routed to exception ({result.get('reason_code')})",
+                    level="error",
+                )
+                return
+            receipt_no = (
+                (result.get("mark_paid_result") or {}).get("receipt_no")
+                if isinstance(result.get("mark_paid_result"), dict)
+                else None
+            )
+            self._flash_redirect(
+                f"/v2/contracts/{contract_id}/settle",
+                f"Settlement suggestion applied{f' ({receipt_no})' if receipt_no else ''}",
             )
 
         def _handle_settle_mark_paid(self, contract_id: str) -> None:
@@ -2012,6 +2196,29 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 conn.execute(
                     "UPDATE automation_runs SET status = ?, updated_at = ? WHERE run_id = ?",
                     (next_status, now, run_id),
+                )
+
+        def _record_intake_confirmed_event(
+            self,
+            *,
+            contract_id: str,
+            as_of_date: str,
+            source: str,
+            intake_run_id: str | None,
+        ) -> None:
+            with repo.transaction() as conn:
+                repo.append_event(
+                    conn,
+                    entity_type="CONTRACT",
+                    entity_id=contract_id,
+                    event_type="INTAKE_CONFIRMED",
+                    as_of_date=str(as_of_date or utc_today_iso()),
+                    payload={
+                        "contract_id": contract_id,
+                        "source": source,
+                        "intake_run_id": str(intake_run_id or ""),
+                    },
+                    source="web_v2",
                 )
 
         def _record_ui_exception(

@@ -130,7 +130,7 @@ python3 run.py auto-resume --run-id <run_id>
 python3 run.py run-autonomy --as-of 2026-03-31 --dry-run
 python3 run.py list-cases --status OPEN
 python3 run.py decide-case --case-id <case_id> --decision APPROVE --reason "override"
-python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --benchmark-version phase2.pr9.v1 --out-dir .state/automation_metrics
+python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --benchmark-version phase2.pr10.v1 --out-dir .state/automation_metrics
 ```
 
 Phase 1 state writes to:
@@ -264,6 +264,28 @@ python3 run.py export-drep --as-of 2026-03-31 --out-dir .state/exports/2026-03-3
 Benchmark-version handling is explicit:
 - expected PR8 benchmark is `phase2.pr8.v1`
 - mismatch sets `benchmark_version_match_pr8=false` and `pr8_gate_pass=false`
+
+## Phase 2 PR10 Settlement Copilot + KPI/SLA Strip
+
+- Settle page now includes deterministic settlement suggestion ranking:
+  - `AUTO_APPLY` (safe + unambiguous),
+  - `REVIEW`,
+  - `BLOCKER` (routes to exceptions).
+- `POST /v2/contracts/{id}/settle/suggest` is idempotent and replay-safe.
+- `POST /v2/contracts/{id}/settle/apply-suggestion` is idempotent and does not duplicate allocations/receipts.
+- Ambiguous/conflicting suggestions route to `exception_cases` with machine-readable reason codes.
+- Portfolio now renders PR10 KPI strip + SLA/aging trends for:
+  - `touchless_rate`
+  - `manual_inputs_per_delivery`
+  - `exception_resolution_time_hours_p50/p95`
+  - `first_time_lpo_to_pack_minutes`
+  - `auto_action_success_rate`
+  - `payment_suggestion_acceptance_rate`
+- KPI behavior is denominator-safe:
+  - denominator `0` => metric `null` + `insufficient_*_data` reason code.
+- PR10 benchmark lock:
+  - expected benchmark is `phase2.pr10.v1`
+  - mismatch sets `benchmark_version_match_pr10=false` and `pr10_gate_pass=false`.
 
 ## Phase 2 PR3 Entity Intelligence (Transport + MDM)
 

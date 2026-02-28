@@ -3,7 +3,7 @@ from __future__ import annotations
 import difflib
 import json
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -457,7 +457,45 @@ class AutomationOrchestrator:
         as_of_date: str,
         out_dir: Path,
         lookback_window_days: int = 30,
-        benchmark_version: str = "phase2.pr8.v1",
+        benchmark_version: str = "phase2.pr10.v1",
+    ) -> dict[str, Any]:
+        metrics = self.compute_metrics_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = out_dir / f"autonomy_metrics_{as_of_date}.json"
+        metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+        with self.repo.transaction() as conn:
+            self.repo.append_event(
+                conn,
+                entity_type="METRICS",
+                entity_id=f"AUTONOMY::{as_of_date}::{benchmark_version}",
+                event_type="AUTONOMY_METRICS_EXPORTED",
+                as_of_date=as_of_date,
+                payload={
+                    "metrics_path": str(metrics_path),
+                    "lookback_window_days": int(lookback_window_days),
+                    "benchmark_version": benchmark_version,
+                    "generated_at_utc": str(metrics.get("generated_at_utc") or ""),
+                    "pr8_gate_pass": bool(metrics.get("pr8_gate_pass")),
+                    "pr8_gate_reason_code": str(metrics.get("pr8_gate_reason_code") or ""),
+                    "pr9_gate_pass": bool(metrics.get("pr9_gate_pass")),
+                    "pr9_gate_reason_code": str(metrics.get("pr9_gate_reason_code") or ""),
+                    "pr10_gate_pass": bool(metrics.get("pr10_gate_pass")),
+                    "pr10_gate_reason_code": str(metrics.get("pr10_gate_reason_code") or ""),
+                },
+                source="autonomy-metrics",
+            )
+        return {"ok": True, "metrics": metrics, "metrics_path": str(metrics_path)}
+
+    def compute_metrics_snapshot(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int = 30,
+        benchmark_version: str = "phase2.pr10.v1",
     ) -> dict[str, Any]:
         self.phase1.init_db()
         if lookback_window_days <= 0:
@@ -523,8 +561,8 @@ class AutomationOrchestrator:
         total_intents = len(intent_rows)
         success_exec = sum(1 for row in exec_rows if str(row.get("status") or "").upper() in {"SUCCESS", "SKIPPED"})
         open_count = len(cases_open)
-        touchless_rate = round((total_intents - open_count) / total_intents, 4) if total_intents else 0.0
-        auto_action_success_rate = round(success_exec / total_intents, 4) if total_intents else 0.0
+        touchless_rate_legacy = round((total_intents - open_count) / total_intents, 4) if total_intents else 0.0
+        auto_action_success_rate_legacy = round(success_exec / total_intents, 4) if total_intents else 0.0
         intake_metrics = self._pr8_intake_metrics(
             lookback_start_iso=lookback_start_iso,
             as_of_date=as_of_date,
@@ -535,8 +573,15 @@ class AutomationOrchestrator:
             as_of_date=as_of_date,
             benchmark_version=benchmark_version,
         )
+        pr10_metrics = self._pr10_settlement_metrics(
+            lookback_start_iso=lookback_start_iso,
+            as_of_date=as_of_date,
+            benchmark_version=benchmark_version,
+            manual_human_decisions=manual_via_exceptions,
+            manual_user_overrides=manual_user_overrides,
+        )
         generated_at_utc = utc_now_iso_z()
-        metrics = {
+        metrics: dict[str, Any] = {
             "as_of_date": as_of_date,
             "lookback_window_days": int(lookback_window_days),
             "lookback_window_start_date": lookback_start_iso,
@@ -546,8 +591,12 @@ class AutomationOrchestrator:
             "executions_success_or_skipped": success_exec,
             "exceptions_open": open_count,
             "manual_intervention_count": len(decisions),
-            "touchless_rate": touchless_rate,
-            "auto_action_success_rate": auto_action_success_rate,
+            "touchless_rate": pr10_metrics["touchless_rate"],
+            "touchless_rate_reason_code": pr10_metrics["touchless_rate_reason_code"],
+            "touchless_rate_legacy": touchless_rate_legacy,
+            "auto_action_success_rate": pr10_metrics["auto_action_success_rate"],
+            "auto_action_success_rate_reason_code": pr10_metrics["auto_action_success_rate_reason_code"],
+            "auto_action_success_rate_legacy": auto_action_success_rate_legacy,
             "manual_interactions_via_exceptions": manual_via_exceptions,
             "manual_interactions_user_overrides": manual_user_overrides,
             "manual_interactions_total": manual_total,
@@ -583,29 +632,8 @@ class AutomationOrchestrator:
             "pr9_gate_pass": pr9_metrics["pr9_gate_pass"],
             "pr9_gate_reason_code": pr9_metrics["pr9_gate_reason_code"],
         }
-        out_dir.mkdir(parents=True, exist_ok=True)
-        metrics_path = out_dir / f"autonomy_metrics_{as_of_date}.json"
-        metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
-        with self.repo.transaction() as conn:
-            self.repo.append_event(
-                conn,
-                entity_type="METRICS",
-                entity_id=f"AUTONOMY::{as_of_date}::{benchmark_version}",
-                event_type="AUTONOMY_METRICS_EXPORTED",
-                as_of_date=as_of_date,
-                payload={
-                    "metrics_path": str(metrics_path),
-                    "lookback_window_days": int(lookback_window_days),
-                    "benchmark_version": benchmark_version,
-                    "generated_at_utc": generated_at_utc,
-                    "pr8_gate_pass": bool(intake_metrics["pr8_gate_pass"]),
-                    "pr8_gate_reason_code": str(intake_metrics["pr8_gate_reason_code"]),
-                    "pr9_gate_pass": bool(pr9_metrics["pr9_gate_pass"]),
-                    "pr9_gate_reason_code": str(pr9_metrics["pr9_gate_reason_code"]),
-                },
-                source="autonomy-metrics",
-            )
-        return {"ok": True, "metrics": metrics, "metrics_path": str(metrics_path)}
+        metrics.update(pr10_metrics)
+        return metrics
 
     def _pr8_intake_metrics(
         self,
@@ -852,6 +880,374 @@ class AutomationOrchestrator:
             "benchmark_version_match_pr9": bool(benchmark_match),
             "pr9_gate_pass": bool(pr9_gate_pass),
             "pr9_gate_reason_code": pr9_reason,
+        }
+
+    def _parse_iso_dt(self, value: str) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            if text.endswith("Z"):
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _percentile(self, values: list[float], pct: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return round(float(ordered[0]), 4)
+        rank = (len(ordered) - 1) * (pct / 100.0)
+        lower = int(rank)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = rank - lower
+        value = ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+        return round(float(value), 4)
+
+    def _settlement_aging_counts(self, *, as_of_date: str) -> dict[str, int]:
+        row = self.repo.fetch_one(
+            """
+            SELECT
+              SUM(
+                CASE
+                  WHEN outstanding_balance <= 0 THEN 0
+                  WHEN due_date IS NULL THEN 1
+                  WHEN julianday(?) - julianday(due_date) <= 0 THEN 1
+                  ELSE 0
+                END
+              ) AS bucket_current,
+              SUM(
+                CASE
+                  WHEN outstanding_balance <= 0 THEN 0
+                  WHEN due_date IS NOT NULL AND julianday(?) - julianday(due_date) > 0 AND julianday(?) - julianday(due_date) <= 30 THEN 1
+                  ELSE 0
+                END
+              ) AS bucket_1_30,
+              SUM(
+                CASE
+                  WHEN outstanding_balance <= 0 THEN 0
+                  WHEN due_date IS NOT NULL AND julianday(?) - julianday(due_date) > 30 AND julianday(?) - julianday(due_date) <= 60 THEN 1
+                  ELSE 0
+                END
+              ) AS bucket_31_60,
+              SUM(
+                CASE
+                  WHEN outstanding_balance <= 0 THEN 0
+                  WHEN due_date IS NOT NULL AND julianday(?) - julianday(due_date) > 60 AND julianday(?) - julianday(due_date) <= 90 THEN 1
+                  ELSE 0
+                END
+              ) AS bucket_61_90,
+              SUM(
+                CASE
+                  WHEN outstanding_balance <= 0 THEN 0
+                  WHEN due_date IS NOT NULL AND julianday(?) - julianday(due_date) > 90 THEN 1
+                  ELSE 0
+                END
+              ) AS bucket_90_plus
+            FROM drep_sales
+            WHERE outstanding_balance > 0
+              AND (invoice_date IS NULL OR invoice_date <= ?)
+            """,
+            (
+                as_of_date,
+                as_of_date,
+                as_of_date,
+                as_of_date,
+                as_of_date,
+                as_of_date,
+                as_of_date,
+                as_of_date,
+                as_of_date,
+            ),
+        ) or {}
+        return {
+            "CURRENT": int(row.get("bucket_current") or 0),
+            "1-30": int(row.get("bucket_1_30") or 0),
+            "31-60": int(row.get("bucket_31_60") or 0),
+            "61-90": int(row.get("bucket_61_90") or 0),
+            "90+": int(row.get("bucket_90_plus") or 0),
+        }
+
+    def _pr10_settlement_metrics(
+        self,
+        *,
+        lookback_start_iso: str,
+        as_of_date: str,
+        benchmark_version: str,
+        manual_human_decisions: int,
+        manual_user_overrides: int,
+    ) -> dict[str, Any]:
+        expected_benchmark_version = "phase2.pr10.v1"
+        benchmark_match = benchmark_version == expected_benchmark_version
+        completed_row = self.repo.fetch_one(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM deliveries
+            WHERE status IN ('INVOICED', 'PAID')
+              AND substr(COALESCE(invoiced_at, paid_at, updated_at, created_at), 1, 10) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        ) or {"cnt": 0}
+        completed_deliveries = int(completed_row.get("cnt") or 0)
+        manual_delivery_row = self.repo.fetch_one(
+            """
+            SELECT COUNT(DISTINCT ec.delivery_id) AS cnt
+            FROM exception_cases ec
+            JOIN human_decisions hd ON hd.exception_case_id = ec.exception_case_id
+            JOIN deliveries d ON d.delivery_id = ec.delivery_id
+            WHERE ec.delivery_id IS NOT NULL
+              AND d.status IN ('INVOICED', 'PAID')
+              AND substr(hd.decided_at, 1, 10) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        ) or {"cnt": 0}
+        deliveries_with_manual_decisions = int(manual_delivery_row.get("cnt") or 0)
+        completed_without_manual = max(completed_deliveries - deliveries_with_manual_decisions, 0)
+        if completed_deliveries > 0:
+            touchless_rate = round(completed_without_manual / completed_deliveries, 4)
+            manual_inputs_per_delivery = round((manual_human_decisions + manual_user_overrides) / completed_deliveries, 4)
+            touchless_reason = "pass"
+            manual_inputs_reason = "pass"
+        else:
+            touchless_rate = None
+            manual_inputs_per_delivery = None
+            touchless_reason = "insufficient_touchless_data"
+            manual_inputs_reason = "insufficient_manual_input_data"
+
+        action_row = self.repo.fetch_one(
+            """
+            SELECT
+              COUNT(*) AS attempted_actions,
+              SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) AS successful_actions
+            FROM action_executions
+            WHERE substr(created_at, 1, 10) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        ) or {"attempted_actions": 0, "successful_actions": 0}
+        attempted_actions = int(action_row.get("attempted_actions") or 0)
+        successful_actions = int(action_row.get("successful_actions") or 0)
+        if attempted_actions > 0:
+            auto_action_success_rate = round(successful_actions / attempted_actions, 4)
+            auto_action_reason = "pass"
+        else:
+            auto_action_success_rate = None
+            auto_action_reason = "insufficient_action_execution_data"
+
+        suggestion_row = self.repo.fetch_one(
+            """
+            SELECT
+              SUM(CASE WHEN event_type = 'SETTLEMENT_SUGGESTION_ACCEPTED' THEN 1 ELSE 0 END) AS accepted_count,
+              SUM(CASE WHEN event_type IN ('SETTLEMENT_SUGGESTION_ACCEPTED', 'SETTLEMENT_SUGGESTION_ROUTED_EXCEPTION') THEN 1 ELSE 0 END) AS reviewed_count
+            FROM event_log
+            WHERE event_type IN ('SETTLEMENT_SUGGESTION_ACCEPTED', 'SETTLEMENT_SUGGESTION_ROUTED_EXCEPTION')
+              AND substr(created_at, 1, 10) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        ) or {"accepted_count": 0, "reviewed_count": 0}
+        accepted_suggestions = int(suggestion_row.get("accepted_count") or 0)
+        reviewed_suggestions = int(suggestion_row.get("reviewed_count") or 0)
+        if reviewed_suggestions > 0:
+            payment_suggestion_acceptance_rate = round(accepted_suggestions / reviewed_suggestions, 4)
+            payment_suggestion_reason = "pass"
+        else:
+            payment_suggestion_acceptance_rate = None
+            payment_suggestion_reason = "insufficient_payment_suggestion_data"
+
+        resolution_rows = self.repo.fetch_all(
+            """
+            SELECT created_at, resolved_at
+            FROM exception_cases
+            WHERE resolved_at IS NOT NULL
+              AND status = 'RESOLVED'
+              AND substr(resolved_at, 1, 10) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        )
+        resolution_hours: list[float] = []
+        for row in resolution_rows:
+            created_dt = self._parse_iso_dt(str(row.get("created_at") or ""))
+            resolved_dt = self._parse_iso_dt(str(row.get("resolved_at") or ""))
+            if created_dt is None or resolved_dt is None:
+                continue
+            resolution_hours.append(max((resolved_dt - created_dt).total_seconds(), 0.0) / 3600.0)
+        if resolution_hours:
+            exception_p50 = self._percentile(resolution_hours, 50.0)
+            exception_p95 = self._percentile(resolution_hours, 95.0)
+            exception_reason = "pass"
+        else:
+            exception_p50 = None
+            exception_p95 = None
+            exception_reason = "insufficient_exception_resolution_data"
+
+        lpo_pack_rows = self.repo.fetch_all(
+            """
+            SELECT
+              c.contract_id,
+              COALESCE(
+                (
+                  SELECT MIN(el.created_at)
+                  FROM event_log el
+                  WHERE el.entity_type = 'CONTRACT'
+                    AND el.entity_id = c.contract_id
+                    AND el.event_type = 'INTAKE_CONFIRMED'
+                ),
+                c.created_at
+              ) AS intake_confirmed_at,
+              (
+                SELECT MIN(d.generated_at)
+                FROM documents d
+                JOIN sales_transactions st ON st.sales_transaction_id = d.sales_transaction_id
+                WHERE d.doc_type = 'INVOICE'
+                  AND st.contract_id = c.contract_id
+              ) AS first_pack_generated_at
+            FROM contracts c
+            WHERE substr(
+              COALESCE(
+                (
+                  SELECT MIN(el.created_at)
+                  FROM event_log el
+                  WHERE el.entity_type = 'CONTRACT'
+                    AND el.entity_id = c.contract_id
+                    AND el.event_type = 'INTAKE_CONFIRMED'
+                ),
+                c.created_at
+              ),
+              1,
+              10
+            ) BETWEEN ? AND ?
+            """,
+            (lookback_start_iso, as_of_date),
+        )
+        lpo_to_pack_minutes_values: list[float] = []
+        for row in lpo_pack_rows:
+            intake_dt = self._parse_iso_dt(str(row.get("intake_confirmed_at") or ""))
+            pack_dt = self._parse_iso_dt(str(row.get("first_pack_generated_at") or ""))
+            if intake_dt is None or pack_dt is None:
+                continue
+            lpo_to_pack_minutes_values.append(max((pack_dt - intake_dt).total_seconds(), 0.0) / 60.0)
+        if lpo_to_pack_minutes_values:
+            first_time_lpo_to_pack_minutes = self._percentile(lpo_to_pack_minutes_values, 50.0)
+            first_time_lpo_reason = "pass"
+        else:
+            first_time_lpo_to_pack_minutes = None
+            first_time_lpo_reason = "insufficient_lpo_pack_data"
+
+        as_of_dt = date.fromisoformat(as_of_date)
+        current_start = (as_of_dt - timedelta(days=6)).isoformat()
+        prev_start = (as_of_dt - timedelta(days=13)).isoformat()
+        prev_end = (as_of_dt - timedelta(days=7)).isoformat()
+        current_rows = self.repo.fetch_all(
+            """
+            SELECT created_at, resolved_at
+            FROM exception_cases
+            WHERE resolved_at IS NOT NULL
+              AND status = 'RESOLVED'
+              AND substr(resolved_at, 1, 10) BETWEEN ? AND ?
+            """,
+            (current_start, as_of_date),
+        )
+        previous_rows = self.repo.fetch_all(
+            """
+            SELECT created_at, resolved_at
+            FROM exception_cases
+            WHERE resolved_at IS NOT NULL
+              AND status = 'RESOLVED'
+              AND substr(resolved_at, 1, 10) BETWEEN ? AND ?
+            """,
+            (prev_start, prev_end),
+        )
+        current_hours: list[float] = []
+        previous_hours: list[float] = []
+        for bucket, rows in ((current_hours, current_rows), (previous_hours, previous_rows)):
+            for row in rows:
+                created_dt = self._parse_iso_dt(str(row.get("created_at") or ""))
+                resolved_dt = self._parse_iso_dt(str(row.get("resolved_at") or ""))
+                if created_dt is None or resolved_dt is None:
+                    continue
+                bucket.append(max((resolved_dt - created_dt).total_seconds(), 0.0) / 3600.0)
+        current_p95 = self._percentile(current_hours, 95.0)
+        previous_p95 = self._percentile(previous_hours, 95.0)
+        if current_p95 is None or previous_p95 is None:
+            exception_trend_state = "insufficient_data"
+            exception_trend_reason = "insufficient_exception_trend_data"
+        elif float(current_p95) <= float(previous_p95):
+            exception_trend_state = "stable_or_improving"
+            exception_trend_reason = "pass"
+        else:
+            exception_trend_state = "worsening"
+            exception_trend_reason = "exception_p95_worsening"
+
+        settlement_aging_current = self._settlement_aging_counts(as_of_date=as_of_date)
+        settlement_aging_previous = self._settlement_aging_counts(as_of_date=prev_end)
+        current_total_aging = int(sum(settlement_aging_current.values()))
+        previous_total_aging = int(sum(settlement_aging_previous.values()))
+        if current_total_aging <= 0 or previous_total_aging <= 0:
+            settlement_aging_trend_state = "insufficient_data"
+            settlement_aging_trend_reason = "insufficient_settlement_aging_data"
+        elif int(settlement_aging_current.get("90+", 0)) <= int(settlement_aging_previous.get("90+", 0)):
+            settlement_aging_trend_state = "stable_or_improving"
+            settlement_aging_trend_reason = "pass"
+        else:
+            settlement_aging_trend_state = "worsening"
+            settlement_aging_trend_reason = "settlement_aging_90_plus_worsening"
+
+        payment_acceptance_gate_pass = (
+            payment_suggestion_acceptance_rate is not None and payment_suggestion_acceptance_rate >= 0.70
+        )
+        exception_trend_gate_pass = exception_trend_state == "stable_or_improving"
+        if not benchmark_match:
+            pr10_gate_pass = False
+            pr10_gate_reason = "benchmark_version_mismatch"
+        elif payment_suggestion_acceptance_rate is None:
+            pr10_gate_pass = False
+            pr10_gate_reason = "insufficient_payment_suggestion_data"
+        elif not payment_acceptance_gate_pass:
+            pr10_gate_pass = False
+            pr10_gate_reason = "payment_suggestion_acceptance_rate_failed"
+        elif not exception_trend_gate_pass:
+            pr10_gate_pass = False
+            pr10_gate_reason = exception_trend_reason
+        else:
+            pr10_gate_pass = True
+            pr10_gate_reason = "pass"
+
+        return {
+            "completed_deliveries": completed_deliveries,
+            "completed_deliveries_without_manual_decisions": completed_without_manual,
+            "touchless_rate": touchless_rate,
+            "touchless_rate_reason_code": touchless_reason,
+            "manual_inputs_per_delivery": manual_inputs_per_delivery,
+            "manual_inputs_per_delivery_reason_code": manual_inputs_reason,
+            "attempted_action_executions": attempted_actions,
+            "successful_action_executions": successful_actions,
+            "auto_action_success_rate": auto_action_success_rate,
+            "auto_action_success_rate_reason_code": auto_action_reason,
+            "accepted_payment_suggestions": accepted_suggestions,
+            "total_payment_suggestions_reviewed": reviewed_suggestions,
+            "payment_suggestion_acceptance_rate": payment_suggestion_acceptance_rate,
+            "payment_suggestion_acceptance_rate_reason_code": payment_suggestion_reason,
+            "exception_resolution_time_hours_p50": exception_p50,
+            "exception_resolution_time_hours_p95": exception_p95,
+            "exception_resolution_time_reason_code": exception_reason,
+            "first_time_lpo_to_pack_minutes": first_time_lpo_to_pack_minutes,
+            "first_time_lpo_to_pack_reason_code": first_time_lpo_reason,
+            "exception_resolution_current_p95_hours": current_p95,
+            "exception_resolution_previous_p95_hours": previous_p95,
+            "exception_resolution_trend_state": exception_trend_state,
+            "exception_resolution_trend_reason_code": exception_trend_reason,
+            "settlement_aging_current": settlement_aging_current,
+            "settlement_aging_previous": settlement_aging_previous,
+            "settlement_aging_trend_state": settlement_aging_trend_state,
+            "settlement_aging_trend_reason_code": settlement_aging_trend_reason,
+            "benchmark_version_expected_pr10": expected_benchmark_version,
+            "benchmark_version_match_pr10": bool(benchmark_match),
+            "pr10_gate_pass": bool(pr10_gate_pass),
+            "pr10_gate_reason_code": pr10_gate_reason,
         }
 
     def _contracts_for_autonomy(self, *, contract_id: str | None) -> list[dict[str, Any]]:

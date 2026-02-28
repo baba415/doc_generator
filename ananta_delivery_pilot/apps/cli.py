@@ -144,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     autonomy_metrics.add_argument("--as-of", required=True)
     autonomy_metrics.add_argument("--out-dir", default="")
     autonomy_metrics.add_argument("--lookback-window-days", type=int, default=30)
-    autonomy_metrics.add_argument("--benchmark-version", default="phase2.pr8.v1")
+    autonomy_metrics.add_argument("--benchmark-version", default="phase2.pr10.v1")
 
     return parser
 

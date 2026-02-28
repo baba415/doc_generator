@@ -50,8 +50,8 @@ class Phase2UiRouteTests(unittest.TestCase):
                 "expected_total_value": 340500000.0,
                 "lines": [
                     {
-                        "product_code": "RBDPO",
-                        "description": "RBDPO route test",
+                        "product_code": "RBDSO",
+                        "description": "RBDSO route test",
                         "expected_qty": 150.0,
                         "unit": "mt",
                         "unit_price": 2270.0,
@@ -69,6 +69,38 @@ class Phase2UiRouteTests(unittest.TestCase):
             cadence="daily",
             max_lots_per_day=2,
         )
+
+    def _create_invoiced_delivery(self, *, suffix: str, delivery_date: str = "2026-02-23") -> dict[str, str]:
+        delivery = self.service.add_delivery(
+            {
+                "contract_id": self.contract_id,
+                "line_no": 1,
+                "delivery_ref": f"DLV-UI-{suffix}",
+                "run_id": f"RUN-UI-{suffix}",
+                "batch_id": f"AFL-RBDSO-UI-{suffix}",
+                "delivery_date": delivery_date,
+                "delivered_qty": 30000,
+                "unit": "kgs",
+                "unit_price": 2270.0,
+                "unit_price_basis": "KG",
+            }
+        )
+        delivery_id = str(delivery["delivery_id"])
+        self.service.mark_dispatched(delivery_id)
+        self.service.mark_delivered(delivery_id)
+        coa_payload = self.service.coa_template_for_delivery(delivery_id, default_result="PASS")
+        self.service.record_coa(coa_payload)
+        pack = self.service.generate_pack(
+            delivery_id=delivery_id,
+            allow_placeholder_tin=True,
+            skip_pdf=True,
+            original_docs=[],
+        )
+        return {
+            "delivery_id": delivery_id,
+            "invoice_no": str(pack["invoice_no"]),
+            "sales_transaction_id": str(pack["sales_transaction_id"]),
+        }
 
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -442,6 +474,53 @@ class Phase2UiRouteTests(unittest.TestCase):
                 (str(target_case["exception_case_id"]),),
             )
             self.assertTrue(decision_rows)
+        finally:
+            _stop_process(proc)
+
+    def test_settle_suggestions_render_and_ambiguity_routes_to_exceptions(self) -> None:
+        self._create_invoiced_delivery(suffix="A")
+        self._create_invoiced_delivery(suffix="B")
+        try:
+            port = _pick_free_port()
+        except PermissionError:
+            self.skipTest("socket bind not permitted in current sandbox")
+        proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
+        try:
+            _wait_for_route(port, f"/v2/contracts/{self.contract_id}/settle")
+            suggest_html = _post_form(
+                port=port,
+                path=f"/v2/contracts/{self.contract_id}/settle/suggest",
+                fields={
+                    "as_of_date": "2026-02-23",
+                    "payment_date": "2026-02-23",
+                    "amount_received": "68100000.00",
+                    "payment_method": "Bank Transfer",
+                    "payment_reference": "INV-2026",
+                },
+            )
+            self.assertIn("Settlement Copilot Suggestions", suggest_html)
+            self.assertIn("decision_class=BLOCKER", suggest_html)
+            suggestion_set_id = _hidden_value(suggest_html, "suggestion_set_id")
+            suggestion_id = _hidden_value(suggest_html, "suggestion_id")
+            self.assertTrue(suggestion_set_id)
+            self.assertTrue(suggestion_id)
+
+            routed_html = _post_form(
+                port=port,
+                path=f"/v2/contracts/{self.contract_id}/settle/apply-suggestion",
+                fields={
+                    "suggestion_set_id": suggestion_set_id,
+                    "suggestion_id": suggestion_id,
+                    "as_of_date": "2026-02-23",
+                    "payment_date": "2026-02-23",
+                    "payment_method": "Bank Transfer",
+                    "payment_reference": "INV-2026",
+                    "amount_received": "68100000.00",
+                    "reason": "ambiguous allocation",
+                },
+            )
+            self.assertIn("Exceptions Queue", routed_html)
+            self.assertIn(self.contract_id, routed_html)
         finally:
             _stop_process(proc)
 
