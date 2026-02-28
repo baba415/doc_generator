@@ -2,10 +2,10 @@ from __future__ import annotations
 
 """Phase 2 workflow-first UI routes.
 
-Primary orchestration flow:
-  /v2/intake -> /v2/contracts/{id}/plan -> /v2/contracts/{id}/execute -> /v2/contracts/{id}/settle
-Global helper pages:
-  /v2/portfolio and /v2/exceptions
+Primary command-center flow:
+  /v2/portfolio -> run recommended -> exception-only intervention
+Advanced pages:
+  /v2/intake, /v2/contracts/{id}/plan, /v2/contracts/{id}/execute, /v2/contracts/{id}/settle
 """
 
 import cgi
@@ -19,6 +19,7 @@ from pathlib import Path
 from tempfile import mkdtemp
 from urllib.parse import parse_qs, quote_plus, urlparse
 
+from adapters.lpo_parser import PARSER_VERSION, parse_lpo
 from adapters.sqlite_repo import SQLiteRepo
 from core.config import RuntimeConfig
 from core.ids import new_ulid
@@ -54,6 +55,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
     route_plan = re.compile(r"^/v2/contracts/([^/]+)/plan$")
     route_execute = re.compile(r"^/v2/contracts/([^/]+)/execute$")
     route_settle = re.compile(r"^/v2/contracts/([^/]+)/settle$")
+    route_intake_parse = re.compile(r"^/v2/intake/parse$")
+    route_intake_confirm = re.compile(r"^/v2/intake/confirm$")
     route_plan_rebuild = re.compile(r"^/v2/contracts/([^/]+)/plan/rebuild$")
     route_plan_update = re.compile(r"^/v2/contracts/([^/]+)/plan/update$")
     route_execute_due = re.compile(r"^/v2/contracts/([^/]+)/execute/materialize-due$")
@@ -61,6 +64,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
     route_generate_pack = re.compile(r"^/v2/contracts/([^/]+)/execute/generate-pack$")
     route_settle_paid = re.compile(r"^/v2/contracts/([^/]+)/settle/mark-paid$")
     route_settle_export = re.compile(r"^/v2/contracts/([^/]+)/settle/export-drep$")
+    route_run_recommended = re.compile(r"^/v2/contracts/([^/]+)/run-recommended$")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:  # noqa: A003
@@ -111,8 +115,17 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     service.init_db()
                     self._flash_redirect("/v2/portfolio", "Database initialized")
                     return
-                if route in {"/v2/intake", "/v2/intake-plan"}:
+                if route == "/v2/intake":
+                    self._handle_intake_parse()
+                    return
+                if route == "/v2/intake-plan":
                     self._handle_intake()
+                    return
+                if route_intake_parse.match(route):
+                    self._handle_intake_parse()
+                    return
+                if route_intake_confirm.match(route):
+                    self._handle_intake_confirm()
                     return
                 if route == "/v2/exceptions/resolve":
                     self._handle_exception_resolve()
@@ -155,6 +168,13 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 if match:
                     self._handle_settle_export(match.group(1))
                     return
+                match = route_run_recommended.match(route)
+                if match:
+                    self._handle_run_recommended(match.group(1))
+                    return
+                if route == "/v2/exceptions/decide":
+                    self._handle_exception_decide()
+                    return
                 self.send_error(404)
             except Exception as error:  # pragma: no cover - runtime path
                 self._render_error(error)
@@ -174,98 +194,92 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 }
             )
             body = [
-                "<h2>Intake (upload/create LPO)</h2>",
-                "<p class='muted'>Automation-first: one action creates contract and plans deliveries using lot policy.</p>",
-                "<form method='POST' action='/v2/intake' enctype='multipart/form-data'>",
+                "<h2>Intake (parser-assisted)</h2>",
+                "<p class='muted'>Default path: upload LPO, review critical fields, confirm. Manual entry is only for missing docs.</p>",
+                "<form method='POST' action='/v2/intake/parse' enctype='multipart/form-data'>",
                 "<div class='grid'>",
                 "<label>LPO No / Contract Ref</label><input type='text' name='lpo_no' required />",
-                f"<label>LPO Date</label><input type='date' name='lpo_date' value='{today}' />",
-                f"<label>Issue Date</label><input type='date' name='issue_date' value='{today}' required />",
-                f"<label>LPO Valid From</label><input type='date' name='lpo_valid_from' value='{today}' />",
-                f"<label>LPO Valid To</label><input type='date' name='lpo_valid_to' value='{due}' />",
                 f"<label>Buyer</label>{self._select('buyer_id', buyers, selected='buyer_nycil')}",
                 f"<label>Vendor-of-record (Lane A/B)</label>{self._select('vendor_of_record_id', vendors, selected='ananta_flows')}",
-                f"<label>Source / Producer</label>{self._select('source_id', sources, selected='ananta_flows')}",
-                f"<label>Processor</label>{self._select('processor_id', processors, selected='processor_partner_refinery')}",
                 f"<label>Product Code</label>{self._select('product_code', [(item, item) for item in product_codes], selected='RBDPO')}",
-                "<label>Description</label><input type='text' name='description' value='Supply linked to contract' />",
                 "<label>Expected Qty (MT)</label><input type='number' step='0.001' name='expected_qty_mt' value='150' />",
                 "<label>Unit Price (per KG)</label><input type='number' step='0.01' name='unit_price' value='2270' />",
-                "<label>Currency</label><input type='text' name='currency' value='NGN' />",
-                f"<label>Plan Start Date</label><input type='date' name='start_date' value='{today}' />",
-                "<label>Cadence</label><select name='cadence'><option value='daily'>daily</option><option value='manual'>manual</option></select>",
-                "<label>Max Lots / Day</label><input type='number' min='1' name='max_lots_per_day' value='1' />",
-                "<label>Tolerance %</label><input type='number' step='0.01' name='tolerance_pct' value='5.0' />",
                 "<label>Original LPO / evidence files</label><input type='file' name='lpo_originals' multiple />",
                 "<label>Options</label><div>"
                 + _checkbox("allow_placeholder_tin", "Allow placeholder TIN (dev)", True)
                 + "</div>",
                 "</div>",
-                "<div class='actions'><button type='submit'>Create Contract + Auto Plan</button></div>",
+                "<details class='advanced'><summary>Advanced intake fields</summary>",
+                "<div class='grid'>",
+                f"<label>LPO Date</label><input type='date' name='lpo_date' value='{today}' />",
+                f"<label>Issue Date</label><input type='date' name='issue_date' value='{today}' required />",
+                f"<label>LPO Valid From</label><input type='date' name='lpo_valid_from' value='{today}' />",
+                f"<label>LPO Valid To</label><input type='date' name='lpo_valid_to' value='{due}' />",
+                f"<label>Source / Producer</label>{self._select('source_id', sources, selected='ananta_flows')}",
+                f"<label>Processor</label>{self._select('processor_id', processors, selected='processor_partner_refinery')}",
+                "<label>Description</label><input type='text' name='description' value='Supply linked to contract' />",
+                "<label>Currency</label><input type='text' name='currency' value='NGN' />",
+                f"<label>Plan Start Date</label><input type='date' name='start_date' value='{today}' />",
+                "<label>Cadence</label><select name='cadence'><option value='daily'>daily</option><option value='manual'>manual</option></select>",
+                "<label>Max Lots / Day</label><input type='number' min='1' name='max_lots_per_day' value='1' />",
+                "<label>Tolerance %</label><input type='number' step='0.01' name='tolerance_pct' value='5.0' />",
+                "</div>",
+                "</details>",
+                "<div class='actions'>"
+                "<button type='submit'>Parse LPO + Review</button>"
+                "<button type='submit' formaction='/v2/intake/confirm'>Create Manual (No LPO)</button>"
+                "</div>",
                 "</form>",
             ]
             self._render_page("Intake", "".join(body), active="intake", msg=msg, level=level)
 
         def _render_portfolio(self, query: dict[str, list[str]]) -> None:
             msg, level = self._msg(query)
-            rows = service.dashboard_rows(limit=300)
-            plan_stats_rows = repo.fetch_all(
-                """
-                SELECT
-                  contract_id,
-                  COUNT(*) AS planned_total,
-                  SUM(CASE WHEN status IN ('PLANNED','SCHEDULED') THEN 1 ELSE 0 END) AS open_plans
-                FROM planned_deliveries
-                GROUP BY contract_id
-                """
-            )
-            sales_stats_rows = repo.fetch_all(
-                """
-                SELECT
-                  contract_id,
-                  COUNT(*) AS invoice_count,
-                  SUM(outstanding_balance) AS outstanding_total
-                FROM drep_sales
-                GROUP BY contract_id
-                """
-            )
-            plan_stats = {row["contract_id"]: row for row in plan_stats_rows}
-            sales_stats = {row["contract_id"]: row for row in sales_stats_rows}
-
+            today = dt.date.today().isoformat()
+            rows = service.command_center_rows(as_of_date=today, limit=300)
             table = [
-                "<h2>Portfolio (workflow landing)</h2>",
-                "<p class='muted'>Open LPOs with next actions: Plan, Execute, Settle.</p>",
-                "<table><thead><tr><th>Contract</th><th>Buyer</th><th>Vendor</th><th>LPO State</th><th>Status</th><th>Expected (MT)</th><th>Delivered (MT)</th><th>Open Plans</th><th>Outstanding</th><th>Next Action</th></tr></thead><tbody>",
+                "<h2>Command Center</h2>",
+                "<p class='muted'>Primary path: Run Recommended. Only unresolved exception cases require manual action.</p>",
+                "<table><thead><tr><th>Contract</th><th>Buyer</th><th>LPO State</th><th>Expected/Delivered (MT)</th><th>Open Lots</th><th>Due Lots</th><th>Delivered Not Invoiced</th><th>Outstanding</th><th>Needs Decision</th><th>Actions</th></tr></thead><tbody>",
             ]
-            for row in rows["contracts"]:
+            for row in rows:
                 contract_id = str(row["contract_id"])
-                plan_stat = plan_stats.get(contract_id, {})
-                sales_stat = sales_stats.get(contract_id, {})
-                open_plans = int(plan_stat.get("open_plans") or 0)
-                outstanding = float(sales_stat.get("outstanding_total") or 0.0)
-                next_action = "Plan" if open_plans == 0 else ("Settle" if outstanding > 0 else "Execute")
-                next_href = (
-                    f"/v2/contracts/{contract_id}/plan"
-                    if next_action == "Plan"
-                    else (f"/v2/contracts/{contract_id}/settle" if next_action == "Settle" else f"/v2/contracts/{contract_id}/execute")
+                needs_decision = int(row.get("needs_decision_count") or 0)
+                outstanding = float(row.get("outstanding_total") or 0.0)
+                action_links = (
+                    f"<form method='POST' action='/v2/contracts/{_escape(contract_id)}/run-recommended' class='inline-form'>"
+                    f"<input type='hidden' name='as_of_date' value='{_escape(today)}' />"
+                    "<button type='submit'>Run Recommended</button>"
+                    "</form>"
+                    f"<a href='/v2/contracts/{_escape(contract_id)}/plan'>Plan</a> "
+                    f"<a href='/v2/contracts/{_escape(contract_id)}/execute'>Execute</a> "
+                    f"<a href='/v2/contracts/{_escape(contract_id)}/settle'>Settle</a>"
                 )
                 table.append(
                     "<tr>"
                     f"<td>{_escape(row.get('lpo_no') or row.get('contract_ref'))}</td>"
                     f"<td>{_escape(row.get('buyer_id'))}</td>"
-                    f"<td>{_escape(row.get('vendor_of_record_id'))}</td>"
                     f"<td><span class='pill'>{_escape(row.get('lpo_state'))}</span></td>"
-                    f"<td><span class='pill'>{_escape(row.get('status'))}</span></td>"
-                    f"<td>{_escape(_fmt_qty_mt_from_kg(row.get('expected_total_qty_kg')))}</td>"
-                    f"<td>{_escape(_fmt_qty_mt_from_kg(row.get('delivered_qty_total_kg')))}</td>"
-                    f"<td>{_escape(open_plans)}</td>"
+                    f"<td>{_escape(_fmt_qty_mt_from_kg(row.get('expected_total_qty_kg')))} / {_escape(_fmt_qty_mt_from_kg(row.get('delivered_qty_kg')))}</td>"
+                    f"<td>{_escape(row.get('open_planned_lots'))}</td>"
+                    f"<td>{_escape(row.get('due_planned_lots'))}</td>"
+                    f"<td>{_escape(row.get('delivered_not_invoiced'))}</td>"
                     f"<td>{_escape(f'{outstanding:,.2f}')}</td>"
-                    f"<td><a href='{_escape(next_href)}'>{_escape(next_action)}</a></td>"
+                    f"<td><a href='/v2/exceptions?contract_id={quote_plus(contract_id)}'><span class='pill'>{_escape(needs_decision)}</span></a></td>"
+                    f"<td>{action_links}</td>"
                     "</tr>"
                 )
-            if not rows["contracts"]:
+            if not rows:
                 table.append("<tr><td colspan='10' class='muted'>No contracts yet.</td></tr>")
             table.append("</tbody></table>")
+            table.append(
+                "<details class='advanced'><summary>Advanced</summary>"
+                "<ul>"
+                "<li><a href='/v2/intake'>Intake (manual/parser review)</a></li>"
+                "<li><a href='/v2/exceptions'>Exceptions Inbox</a></li>"
+                "</ul>"
+                "</details>"
+            )
             self._render_page("Portfolio", "".join(table), active="portfolio", msg=msg, level=level)
 
         def _render_plan(self, contract_id: str, query: dict[str, list[str]]) -> None:
@@ -329,6 +343,11 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 (contract_id,),
             )
             today = dt.date.today().isoformat()
+            run_id = str((query.get("run_id") or [""])[0] or "").strip()
+            run_timeline = service.command_center_timeline(
+                autonomy_run_id=run_id,
+                contract_id=contract_id,
+            ) if run_id else []
             parts = [
                 f"<h2>Execute - {_escape(contract.get('lpo_no') or contract_id)}</h2>",
                 "<p class='muted'>Materialize due lots, progress states, capture evidence, and generate 4-doc pack.</p>",
@@ -346,9 +365,36 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 "<label><input type='checkbox' name='force_no_evidence' value='1' /> Override missing evidence gate</label>"
                 "<button type='submit'>Materialize All Due Eligible Lots</button>"
                 "</div></form>",
+            ]
+            if run_id:
+                parts.extend(
+                    [
+                        "<h3>Recommended Run Timeline</h3>",
+                        "<table><thead><tr><th>Intent</th><th>Intent Status</th><th>Execution Status</th><th>Policy</th><th>Details</th></tr></thead><tbody>",
+                    ]
+                )
+                for row in run_timeline:
+                    response = row.get("response") if isinstance(row.get("response"), dict) else {}
+                    error = row.get("error") if isinstance(row.get("error"), dict) else {}
+                    details = response if response else error
+                    parts.append(
+                        "<tr>"
+                        f"<td>{_escape(row.get('intent_type'))}</td>"
+                        f"<td>{_escape(row.get('intent_status'))}</td>"
+                        f"<td>{_escape(row.get('execution_status'))}</td>"
+                        f"<td>{_escape(row.get('policy_version'))}</td>"
+                        f"<td><code>{_escape(json.dumps(details, sort_keys=True))}</code></td>"
+                        "</tr>"
+                    )
+                if not run_timeline:
+                    parts.append("<tr><td colspan='5' class='muted'>No action-intent timeline found for this run.</td></tr>")
+                parts.append("</tbody></table>")
+            parts.extend(
+                [
                 "<h3>Planned Runboard</h3>",
                 "<table><thead><tr><th>Seq</th><th>Date</th><th>Qty (MT)</th><th>Status</th><th>Delivery</th><th>Action</th></tr></thead><tbody>",
-            ]
+                ]
+            )
             for row in planned_rows:
                 planned_id = str(row["planned_delivery_id"])
                 status = str(row.get("status") or "")
@@ -461,35 +507,419 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
 
         def _render_exceptions(self, query: dict[str, list[str]]) -> None:
             msg, level = self._msg(query)
-            rows = repo.list_exceptions(status="OPEN")
+            contract_filter = str((query.get("contract_id") or [""])[0] or "").strip()
+            rows = repo.list_exception_cases(status="OPEN")
+            if contract_filter:
+                rows = [row for row in rows if str(row.get("contract_id") or "") == contract_filter]
+            grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+            for row in rows:
+                key = (str(row.get("severity") or "REVIEW"), str(row.get("reason_code") or "unspecified"))
+                grouped.setdefault(key, []).append(row)
             parts = [
                 "<h2>Exceptions Queue</h2>",
-                "<p class='muted'>Resolve blocker/review items and resume automation runs if needed.</p>",
-                "<table><thead><tr><th>Created</th><th>Run</th><th>Stage</th><th>Type</th><th>Severity</th><th>Reason</th><th>Resolve</th></tr></thead><tbody>",
+                "<p class='muted'>Decision inbox (approve/reject/override). Manual action is needed only for unresolved blockers.</p>",
             ]
-            for row in rows:
+            if grouped:
+                severity_order = {"BLOCKER": 0, "REVIEW": 1}
+                for (severity, reason_code), group_rows in sorted(
+                    grouped.items(),
+                    key=lambda item: (severity_order.get(item[0][0], 99), item[0][0], item[0][1]),
+                ):
+                    parts.append(
+                        f"<h3>{_escape(severity)} · {_escape(reason_code)} ({len(group_rows)})</h3>"
+                        "<table><thead><tr><th>Created</th><th>Contract</th><th>Case Type</th><th>Details</th><th>Decision</th></tr></thead><tbody>"
+                    )
+                    for row in group_rows:
+                        details_json = row.get("details_json")
+                        try:
+                            details = json.loads(details_json or "{}")
+                        except Exception:
+                            details = {"raw": str(details_json)}
+                        parts.append(
+                            "<tr>"
+                            f"<td>{_escape(row.get('created_at'))}</td>"
+                            f"<td>{_escape(row.get('contract_id') or '-')}</td>"
+                            f"<td>{_escape(row.get('case_type'))}</td>"
+                            f"<td><code>{_escape(json.dumps(details, sort_keys=True))}</code></td>"
+                            "<td>"
+                            f"<form method='POST' action='/v2/exceptions/decide' class='inline-form'>"
+                            f"<input type='hidden' name='case_id' value='{_escape(str(row['exception_case_id']))}' />"
+                            "<select name='decision'>"
+                            "<option value='APPROVE'>APPROVE</option>"
+                            "<option value='REJECT'>REJECT</option>"
+                            "<option value='OVERRIDE'>OVERRIDE</option>"
+                            "</select>"
+                            "<input type='text' name='reason' placeholder='reason' required />"
+                            "<label><input type='checkbox' name='resume' value='1' checked /> Resume</label>"
+                            "<label><input type='checkbox' name='dry_run_resume' value='1' /> Dry run resume</label>"
+                            "<button type='submit'>Submit</button>"
+                            "</form>"
+                            "</td>"
+                            "</tr>"
+                        )
+                    parts.append("</tbody></table>")
+            else:
+                parts.append("<p class='muted'>No open exception cases.</p>")
+
+            legacy_rows = repo.list_exceptions(status="OPEN")
+            if legacy_rows:
+                parts.append("<details class='advanced'><summary>Advanced: Intake parser exception queue</summary>")
                 parts.append(
+                    "<table><thead><tr><th>Created</th><th>Run</th><th>Stage</th><th>Type</th><th>Severity</th><th>Reason</th><th>Resolve</th></tr></thead><tbody>"
+                )
+                for row in legacy_rows:
+                    parts.append(
+                        "<tr>"
+                        f"<td>{_escape(row.get('created_at'))}</td>"
+                        f"<td>{_escape(row.get('run_id'))}</td>"
+                        f"<td>{_escape(row.get('stage'))}</td>"
+                        f"<td>{_escape(row.get('exception_type'))}</td>"
+                        f"<td><span class='pill'>{_escape(row.get('severity'))}</span></td>"
+                        f"<td>{_escape(row.get('reason'))}</td>"
+                        "<td>"
+                        f"<form method='POST' action='/v2/exceptions/resolve' class='inline-form'>"
+                        f"<input type='hidden' name='exception_id' value='{_escape(str(row['exception_id']))}' />"
+                        "<input type='text' name='value' placeholder='resolved value' required />"
+                        "<input type='text' name='note' placeholder='note' required />"
+                        "<button type='submit'>Resolve</button>"
+                        "</form>"
+                        "</td>"
+                        "</tr>"
+                    )
+                parts.append("</tbody></table></details>")
+            self._render_page("Exceptions", "".join(parts), active="exceptions", msg=msg, level=level)
+
+        def _render_intake_review(
+            self,
+            *,
+            prefill: dict[str, object],
+            field_rows: list[dict[str, object]],
+            run_id: str,
+            evidence_paths: list[str],
+            reused: bool = False,
+        ) -> None:
+            buyers = self._entity_options(prefix="buyer_")
+            vendors = [("guildgate", config.registry.get("guildgate").name), ("ananta_flows", config.registry.get("ananta_flows").name)]
+            processors = self._entity_options(prefix="processor_")
+            sources = self._entity_options(prefix="", exclude_prefixes=("buyer_", "funder_"))
+            product_codes = sorted(
+                {
+                    *[str(code).upper() for code in config.coa_profiles.keys()],
+                    *[str(code).upper() for code in (config.delivery_policies.get("products") or {}).keys()],
+                }
+            )
+            today = dt.date.today().isoformat()
+            info = "Existing parse context reused (idempotent)." if reused else "Review auto-prefilled fields and confirm."
+            row_index = {str(row.get("field_name") or ""): row for row in field_rows}
+
+            def _badge(name: str) -> str:
+                row = row_index.get(name) or {}
+                confidence = float(row.get("confidence") or 0.0)
+                decision = str(row.get("decision") or "needs_review")
+                reason = str(row.get("reason_code") or "")
+                return (
+                    f"<span class='pill'>{_escape(decision)} | {confidence:.2f}</span>"
+                    f"<span class='muted'> {_escape(reason)}</span>"
+                )
+
+            body = [
+                "<h2>Intake Review</h2>",
+                f"<p class='muted'>{_escape(info)}</p>",
+                "<form method='POST' action='/v2/intake/confirm'>",
+                f"<input type='hidden' name='intake_run_id' value='{_escape(run_id)}' />",
+                f"<input type='hidden' name='intake_evidence_paths_json' value='{_escape(json.dumps(evidence_paths))}' />",
+                "<div class='grid'>",
+                f"<label>LPO No / Contract Ref</label><input type='text' name='lpo_no' value='{_escape(prefill.get('lpo_no') or '')}' required />",
+                f"<label>Confidence</label><div>{_badge('lpo_no')}</div>",
+                f"<label>LPO Date</label><input type='date' name='lpo_date' value='{_escape(prefill.get('lpo_date') or '')}' />",
+                f"<label>Confidence</label><div>{_badge('lpo_date')}</div>",
+                f"<label>Issue Date</label><input type='date' name='issue_date' value='{_escape(prefill.get('issue_date') or today)}' required />",
+                f"<label>Confidence</label><div>{_badge('issue_date')}</div>",
+                f"<label>LPO Valid From</label><input type='date' name='lpo_valid_from' value='{_escape(prefill.get('lpo_valid_from') or prefill.get('issue_date') or today)}' />",
+                f"<label>Confidence</label><div>{_badge('lpo_valid_from')}</div>",
+                f"<label>LPO Valid To</label><input type='date' name='lpo_valid_to' value='{_escape(prefill.get('lpo_valid_to') or '')}' />",
+                f"<label>Confidence</label><div>{_badge('lpo_valid_to')}</div>",
+                f"<label>Buyer</label>{self._select('buyer_id', buyers, selected=str(prefill.get('buyer_id') or ''))}",
+                f"<label>Confidence</label><div>{_badge('buyer_id')}</div>",
+                f"<label>Vendor-of-record</label>{self._select('vendor_of_record_id', vendors, selected=str(prefill.get('vendor_of_record_id') or 'ananta_flows'))}",
+                f"<label>Confidence</label><div>{_badge('vendor_of_record_id')}</div>",
+                f"<label>Source / Producer</label>{self._select('source_id', sources, selected=str(prefill.get('source_id') or 'ananta_flows'))}",
+                f"<label>Confidence</label><div>{_badge('source_id')}</div>",
+                f"<label>Processor</label>{self._select('processor_id', processors, selected=str(prefill.get('processor_id') or 'processor_partner_refinery'))}",
+                f"<label>Confidence</label><div>{_badge('processor_id')}</div>",
+                f"<label>Product Code</label>{self._select('product_code', [(item, item) for item in product_codes], selected=str(prefill.get('product_code') or ''))}",
+                f"<label>Confidence</label><div>{_badge('product_code')}</div>",
+                f"<label>Description</label><input type='text' name='description' value='{_escape(prefill.get('description') or '')}' />",
+                f"<label>Confidence</label><div>{_badge('description')}</div>",
+                f"<label>Expected Qty (MT)</label><input type='number' step='0.001' name='expected_qty_mt' value='{_escape(prefill.get('expected_qty_mt') or '')}' required />",
+                f"<label>Confidence</label><div>{_badge('expected_qty_mt')}</div>",
+                f"<label>Unit Price</label><input type='number' step='0.01' name='unit_price' value='{_escape(prefill.get('unit_price') or '')}' required />",
+                f"<label>Confidence</label><div>{_badge('unit_price')}</div>",
+                "<label>Unit Price Basis</label><select name='unit_price_basis'>"
+                f"<option value='KG'{' selected' if str(prefill.get('unit_price_basis') or 'KG').upper() == 'KG' else ''}>KG</option>"
+                f"<option value='MT'{' selected' if str(prefill.get('unit_price_basis') or '').upper() == 'MT' else ''}>MT</option>"
+                "</select>",
+                f"<label>Confidence</label><div>{_badge('unit_price_basis')}</div>",
+                f"<label>Currency</label><input type='text' name='currency' value='{_escape(prefill.get('currency') or 'NGN')}' />",
+                f"<label>Confidence</label><div>{_badge('currency')}</div>",
+                f"<label>Plan Start Date</label><input type='date' name='start_date' value='{_escape(prefill.get('start_date') or prefill.get('issue_date') or today)}' />",
+                "<label>Cadence</label><select name='cadence'><option value='daily'>daily</option><option value='manual'>manual</option></select>",
+                "<label>Max Lots / Day</label><input type='number' min='1' name='max_lots_per_day' value='1' />",
+                f"<label>Tolerance %</label><input type='number' step='0.01' name='tolerance_pct' value='{_escape(prefill.get('tolerance_pct') or 5.0)}' />",
+                "<label>Options</label><div>"
+                + _checkbox("allow_placeholder_tin", "Allow placeholder TIN (dev)", True)
+                + "</div>",
+                "</div>",
+                "<div class='actions'>"
+                "<button type='submit'>Confirm Intake + Create Contract + Plan</button>"
+                "<a class='btn' href='/v2/intake'>Back</a>"
+                "</div>",
+                "</form>",
+                "<h3>Parser Decision Trace</h3>",
+                "<table><thead><tr><th>Field</th><th>Proposed</th><th>Confidence</th><th>Decision</th><th>Reason</th></tr></thead><tbody>",
+            ]
+            for row in field_rows:
+                body.append(
                     "<tr>"
-                    f"<td>{_escape(row.get('created_at'))}</td>"
-                    f"<td>{_escape(row.get('run_id'))}</td>"
-                    f"<td>{_escape(row.get('stage'))}</td>"
-                    f"<td>{_escape(row.get('exception_type'))}</td>"
-                    f"<td><span class='pill'>{_escape(row.get('severity'))}</span></td>"
-                    f"<td>{_escape(row.get('reason'))}</td>"
-                    "<td>"
-                    f"<form method='POST' action='/v2/exceptions/resolve' class='inline-form'>"
-                    f"<input type='hidden' name='exception_id' value='{_escape(str(row['exception_id']))}' />"
-                    "<input type='text' name='value' placeholder='resolved value' required />"
-                    "<input type='text' name='note' placeholder='note' required />"
-                    "<button type='submit'>Resolve</button>"
-                    "</form>"
-                    "</td>"
+                    f"<td>{_escape(row.get('field_name'))}</td>"
+                    f"<td>{_escape(row.get('proposed_value'))}</td>"
+                    f"<td>{_escape(row.get('confidence'))}</td>"
+                    f"<td>{_escape(row.get('decision'))}</td>"
+                    f"<td>{_escape(row.get('reason_code'))}</td>"
                     "</tr>"
                 )
-            if not rows:
-                parts.append("<tr><td colspan='7' class='muted'>No open exceptions.</td></tr>")
-            parts.append("</tbody></table>")
-            self._render_page("Exceptions", "".join(parts), active="exceptions", msg=msg, level=level)
+            if not field_rows:
+                body.append("<tr><td colspan='5' class='muted'>No parser field rows available.</td></tr>")
+            body.append("</tbody></table>")
+            self._render_page("Intake Review", "".join(body), active="intake")
+
+        def _handle_intake_parse(self) -> None:
+            form = self._multipart()
+            data = self._form_values(form)
+            uploaded = self._collect_temp_uploads(form=form, field_name="lpo_originals")
+            if not uploaded:
+                self._flash_redirect("/v2/intake", "Upload an LPO file for parser-assisted intake.", level="error")
+                return
+
+            primary = uploaded[0]
+            parsed = parse_lpo(primary, config=config, hints=data)
+            idempotency_key = f"{parsed.file_sha256}+{parsed.parser_version}"
+            existing = repo.get_automation_run_by_idempotency(idempotency_key)
+            if existing:
+                run_id = str(existing["run_id"])
+                normalized = json.loads(existing.get("normalized_input_json") or "{}")
+                prefill = normalized.get("prefill") if isinstance(normalized, dict) else None
+                field_rows = normalized.get("field_rows") if isinstance(normalized, dict) else None
+                evidence_paths = normalized.get("evidence_paths") if isinstance(normalized, dict) else None
+                if not isinstance(prefill, dict):
+                    prefill = self._intake_prefill_from_fields(fields=[field.as_dict() for field in parsed.fields], fallback=data)
+                if not isinstance(field_rows, list):
+                    field_rows = [field.as_dict() for field in parsed.fields]
+                if not isinstance(evidence_paths, list):
+                    evidence_paths = [str(path) for path in self._persist_intake_uploads(uploaded, run_id=run_id)]
+                for path in uploaded:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                self._render_intake_review(
+                    prefill=prefill,
+                    field_rows=field_rows,
+                    run_id=run_id,
+                    evidence_paths=[str(item) for item in evidence_paths],
+                    reused=True,
+                )
+                return
+
+            run_id = new_ulid()
+            evidence_paths = [str(path) for path in self._persist_intake_uploads(uploaded, run_id=run_id)]
+            for path in uploaded:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            auto_min = self._intake_auto_apply_min()
+            critical_fields = self._intake_critical_fields()
+            now = utc_now_iso_z()
+            field_rows: list[dict[str, object]] = []
+            exception_count = 0
+            with repo.transaction() as conn:
+                repo.create_automation_run(
+                    conn,
+                    run_id=run_id,
+                    idempotency_key=idempotency_key,
+                    as_of_date=dt.date.today().isoformat(),
+                    dry_run=False,
+                    input_payload={
+                        "source": "web_v2_intake",
+                        "stage": "intake_parser",
+                        "uploaded_file": str(primary),
+                        "file_sha256": parsed.file_sha256,
+                        "parser_version": parsed.parser_version,
+                    },
+                )
+                for field in parsed.fields:
+                    confidence = float(field.confidence)
+                    decision = "auto_applied" if confidence >= auto_min else "needs_review"
+                    row = field.as_dict()
+                    row["decision"] = decision
+                    field_rows.append(row)
+                    repo.add_automation_decision(
+                        conn,
+                        run_id=run_id,
+                        stage="intake_parser",
+                        field_name=field.field_name,
+                        required_flag=field.field_name in critical_fields,
+                        proposed_value=field.proposed_value,
+                        source_type=field.source_type,
+                        source_ref=field.source_ref,
+                        confidence=confidence,
+                        decision=decision,
+                        reason_code=field.reason_code,
+                        rule_path=f"intake_parser.{field.field_name}",
+                    )
+                    if decision == "auto_applied":
+                        continue
+                    severity = "BLOCKER" if field.field_name in critical_fields else "REVIEW"
+                    repo.add_exception(
+                        conn,
+                        run_id=run_id,
+                        stage="intake_parser",
+                        exception_type="low_confidence_field",
+                        severity=severity,
+                        field_name=field.field_name,
+                        proposed_value=field.proposed_value,
+                        reason=f"{field.field_name} confidence={confidence:.2f} ({field.reason_code})",
+                        suggestions=field.suggestions,
+                    )
+                    exception_count += 1
+                prefill = self._intake_prefill_from_fields(fields=field_rows, fallback=data)
+                repo.complete_automation_run(
+                    conn,
+                    run_id=run_id,
+                    status="NEEDS_REVIEW" if exception_count else "COMPLETED",
+                    normalized_payload={
+                        "prefill": prefill,
+                        "field_rows": field_rows,
+                        "evidence_paths": evidence_paths,
+                        "parser_result": parsed.to_dict(),
+                    },
+                    metrics={
+                        "decision_count": len(field_rows),
+                        "exception_count": exception_count,
+                        "stage": "intake_parser",
+                    },
+                    started_at=now,
+                    failure_reason=None,
+                )
+            self._render_intake_review(
+                prefill=prefill,
+                field_rows=field_rows,
+                run_id=run_id,
+                evidence_paths=evidence_paths,
+                reused=False,
+            )
+
+        def _handle_intake_confirm(self) -> None:
+            content_type = str(self.headers.get("Content-Type", "") or "")
+            uploaded_paths: list[Path] = []
+            if "multipart/form-data" in content_type:
+                form = self._multipart()
+                data = self._form_values(form)
+                uploaded_paths = self._collect_temp_uploads(form=form, field_name="lpo_originals")
+            else:
+                data = self._urlencoded_fields()
+            issue_date = data.get("issue_date") or dt.date.today().isoformat()
+            expected_qty_kg_raw = str(data.get("expected_qty_kg") or "").strip()
+            if expected_qty_kg_raw:
+                expected_qty_kg = int(float(expected_qty_kg_raw))
+            else:
+                expected_qty_mt = float(data.get("expected_qty_mt") or 0.0)
+                expected_qty_kg = mt_to_kg_int(expected_qty_mt)
+            if expected_qty_kg <= 0:
+                raise ValueError("expected_qty_mt must be > 0")
+            unit_price = float(data.get("unit_price") or 0.0)
+            if unit_price <= 0:
+                raise ValueError("unit_price must be > 0")
+            unit_price_basis = str(data.get("unit_price_basis") or "KG").strip().upper()
+            if unit_price_basis not in {"KG", "MT"}:
+                unit_price_basis = "KG"
+
+            qty_mt_value = float(expected_qty_kg) / 1000.0
+            if unit_price_basis == "MT":
+                expected_total_value = round(qty_mt_value * unit_price, 2)
+            else:
+                expected_total_value = round(expected_qty_kg * unit_price, 2)
+
+            lpo_no = str(data.get("lpo_no") or "").strip()
+            if not lpo_no:
+                raise ValueError("lpo_no is required")
+
+            payload = {
+                "contract_ref": lpo_no,
+                "lpo_no": lpo_no,
+                "lpo_date": data.get("lpo_date") or None,
+                "buyer_id": data.get("buyer_id"),
+                "vendor_of_record_id": data.get("vendor_of_record_id"),
+                "operator_id": config.system_profile.operator_entity_id or "guildgate",
+                "source_id": data.get("source_id") or None,
+                "processor_id": data.get("processor_id") or None,
+                "currency": data.get("currency") or "NGN",
+                "issue_date": issue_date,
+                "lpo_valid_from": data.get("lpo_valid_from") or issue_date,
+                "lpo_valid_to": data.get("lpo_valid_to") or None,
+                "due_date": data.get("lpo_valid_to") or None,
+                "due_terms": "14 days",
+                "expected_total_qty": qty_mt_value,
+                "expected_total_qty_kg": expected_qty_kg,
+                "expected_total_value": expected_total_value,
+                "over_delivery_tolerance_pct": float(data.get("tolerance_pct") or 5.0),
+                "unit_price_basis": unit_price_basis,
+                "lines": [
+                    {
+                        "product_code": str(data.get("product_code") or "").upper(),
+                        "description": data.get("description") or f"Supply linked to {lpo_no}",
+                        "expected_qty": expected_qty_kg,
+                        "unit": "kgs",
+                        "unit_price": unit_price,
+                        "unit_price_basis": unit_price_basis,
+                    }
+                ],
+            }
+            contract = service.create_contract(payload, allow_placeholder_tin=bool(data.get("allow_placeholder_tin")))
+            persisted_evidence = self._load_intake_evidence_paths(data=data) + [str(path) for path in uploaded_paths]
+            evidence_count = 0
+            try:
+                for raw_path in persisted_evidence:
+                    path = Path(str(raw_path)).expanduser()
+                    if not path.is_absolute():
+                        path = (config.root_dir / path).resolve()
+                    if not path.exists():
+                        continue
+                    service.capture_evidence_original(contract_id=str(contract["contract_id"]), source_path=path)
+                    evidence_count += 1
+            finally:
+                for file_path in uploaded_paths:
+                    try:
+                        file_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            start_date = data.get("start_date") or issue_date
+            plan_result = service.plan_deliveries(
+                contract_id=str(contract["contract_id"]),
+                start_date=start_date,
+                cadence=data.get("cadence") or "daily",
+                max_lots_per_day=int(data.get("max_lots_per_day") or 1),
+            )
+            self._record_intake_confirm_decisions(
+                run_id=str(data.get("intake_run_id") or "").strip(),
+                submitted=data,
+            )
+            message = (
+                f"Created contract {contract['contract_id']} and planned {plan_result['planned_count']} deliveries"
+                + (f" ({evidence_count} evidence files captured)" if evidence_count else "")
+            )
+            self._flash_redirect(f"/v2/contracts/{contract['contract_id']}/plan", message)
 
         def _handle_intake(self) -> None:
             form = self._multipart()
@@ -605,6 +1035,24 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             data = self._form_values(form)
             uploaded = self._collect_temp_uploads(form=form, field_name="original_docs")
             try:
+                as_of_date = str(data.get("as_of_date") or dt.date.today().isoformat()).strip()
+                service.refresh_contract_state(as_of_date=as_of_date)
+                contract_row = repo.fetch_one("SELECT lpo_state FROM contracts WHERE contract_id = ?", (contract_id,))
+                if not contract_row or str(contract_row.get("lpo_state") or "").upper() != "ACTIVE":
+                    self._record_ui_exception(
+                        stage="execute.materialize_due",
+                        exception_type="materialization_contract_not_active",
+                        severity="BLOCKER",
+                        field_name="lpo_state",
+                        proposed_value=contract_row.get("lpo_state") if contract_row else None,
+                        reason="Materialize blocked: contract must be ACTIVE after refresh",
+                    )
+                    self._flash_redirect(
+                        f"/v2/contracts/{contract_id}/execute",
+                        "Blocked: contract is not ACTIVE after refresh",
+                        level="error",
+                    )
+                    return
                 existing_evidence = repo.fetch_one(
                     "SELECT COUNT(*) AS total FROM evidence_originals WHERE contract_id = ?",
                     (contract_id,),
@@ -631,7 +1079,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
 
                 result = service.materialize_due_deliveries(
                     contract_id=contract_id,
-                    as_of_date=str(data.get("as_of_date") or dt.date.today().isoformat()).strip(),
+                    as_of_date=as_of_date,
                     run_id=str(data.get("run_id") or "").strip() or None,
                     batch_id=str(data.get("batch_id") or "").strip() or None,
                     auto_progress=bool(data.get("auto_progress")),
@@ -672,11 +1120,30 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             planned_delivery_id = str(fields.get("planned_delivery_id") or "").strip()
             if not planned_delivery_id:
                 raise ValueError("planned_delivery_id is required")
+            as_of_date = dt.date.today().isoformat()
+            service.refresh_contract_state(as_of_date=as_of_date)
+            contract_row = repo.fetch_one("SELECT lpo_state FROM contracts WHERE contract_id = ?", (contract_id,))
+            if not contract_row or str(contract_row.get("lpo_state") or "").upper() != "ACTIVE":
+                self._record_ui_exception(
+                    stage="execute.materialize_one",
+                    exception_type="materialization_contract_not_active",
+                    severity="BLOCKER",
+                    field_name="lpo_state",
+                    proposed_value=contract_row.get("lpo_state") if contract_row else None,
+                    reason="Materialize blocked: contract must be ACTIVE after refresh",
+                )
+                self._flash_redirect(
+                    f"/v2/contracts/{contract_id}/execute",
+                    "Blocked: contract is not ACTIVE after refresh",
+                    level="error",
+                )
+                return
             qty_raw = str(fields.get("qty_mt") or "").strip()
             qty_mt = float(qty_raw) if qty_raw else None
             materialized = service.materialize_delivery(
                 planned_delivery_id=planned_delivery_id,
                 qty_mt=qty_mt,
+                as_of_date=as_of_date,
             )
             delivery_id = str(materialized["delivery_id"])
             service.mark_dispatched(delivery_id)
@@ -743,6 +1210,60 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 f"DREP exported ({len(result['exports'])} files) for {as_of}",
             )
 
+        def _handle_run_recommended(self, contract_id: str) -> None:
+            fields = self._urlencoded_fields()
+            as_of = str(fields.get("as_of_date") or dt.date.today().isoformat()).strip()
+            cycle = service.run_recommended_cycle(
+                contract_id=contract_id,
+                as_of_date=as_of,
+                dry_run=bool(fields.get("dry_run")),
+            )
+            run_id = str(cycle.get("autonomy_run_id") or "").strip()
+            if cycle.get("ok"):
+                message = "Run Recommended completed"
+                if run_id:
+                    message += f" (run {run_id})"
+                target = f"/v2/contracts/{contract_id}/execute"
+                if run_id:
+                    target += f"?run_id={quote_plus(run_id)}"
+                self._flash_redirect(target, message)
+                return
+
+            blocked = ", ".join(cycle.get("case_ids", []))
+            target = f"/v2/exceptions?contract_id={quote_plus(contract_id)}"
+            query_parts: list[str] = []
+            if run_id:
+                query_parts.append(f"run_id={quote_plus(run_id)}")
+            if blocked:
+                query_parts.append(f"case_ids={quote_plus(blocked)}")
+            if query_parts:
+                target += "&" + "&".join(query_parts)
+            self._flash_redirect(
+                target,
+                f"Run Recommended blocked. Open cases: {blocked or 'none'}",
+                level="error",
+            )
+
+        def _handle_exception_decide(self) -> None:
+            fields = self._urlencoded_fields()
+            case_id = str(fields.get("case_id") or "").strip()
+            decision = str(fields.get("decision") or "").strip().upper()
+            reason = str(fields.get("reason") or "").strip()
+            if not case_id or decision not in {"APPROVE", "REJECT", "OVERRIDE"} or not reason:
+                raise ValueError("case_id, decision(APPROVE|REJECT|OVERRIDE), and reason are required")
+            result = service.decide_exception_case(
+                case_id=case_id,
+                decision=decision,
+                reason=reason,
+                resume=bool(fields.get("resume")),
+                dry_run_resume=bool(fields.get("dry_run_resume")),
+            )
+            message = f"Case {case_id} resolved via {decision}"
+            resume_result = result.get("resume_result")
+            if isinstance(resume_result, dict) and resume_result.get("autonomy_run_id"):
+                message += f" (resume run {resume_result['autonomy_run_id']})"
+            self._flash_redirect("/v2/exceptions", message)
+
         def _handle_exception_resolve(self) -> None:
             fields = self._urlencoded_fields()
             exception_id = str(fields.get("exception_id") or "").strip()
@@ -805,6 +1326,146 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             out_dir = config.state_dir / "exports" / "web_v2" / as_of / dt.datetime.utcnow().strftime("%Y%m%d%H%M%S")
             service.export_drep(as_of_date=as_of, out_dir=out_dir)
             self._flash_redirect("/v2/portfolio", f"Legacy export completed for {as_of}")
+
+        def _intake_auto_apply_min(self) -> float:
+            root = config.automation_thresholds if isinstance(config.automation_thresholds, dict) else {}
+            intake = root.get("intake") if isinstance(root.get("intake"), dict) else {}
+            return float(intake.get("field_auto_apply_min", 0.90))
+
+        def _intake_critical_fields(self) -> set[str]:
+            return {
+                "lpo_no",
+                "buyer_id",
+                "vendor_of_record_id",
+                "product_code",
+                "expected_qty_mt",
+                "unit_price",
+            }
+
+        def _intake_prefill_from_fields(self, *, fields: list[dict[str, object]], fallback: dict[str, str]) -> dict[str, object]:
+            prefill: dict[str, object] = {key: value for key, value in fallback.items()}
+            for row in fields:
+                name = str(row.get("field_name") or "").strip()
+                if not name:
+                    continue
+                value = row.get("proposed_value")
+                if value in ("", None):
+                    continue
+                prefill[name] = value
+            if not prefill.get("expected_qty_mt"):
+                qty_kg = prefill.get("expected_qty_kg")
+                if qty_kg not in (None, ""):
+                    prefill["expected_qty_mt"] = kg_to_mt_str(int(float(str(qty_kg))))
+            if not prefill.get("issue_date"):
+                prefill["issue_date"] = dt.date.today().isoformat()
+            if not prefill.get("lpo_valid_from"):
+                prefill["lpo_valid_from"] = prefill.get("issue_date")
+            if not prefill.get("start_date"):
+                prefill["start_date"] = prefill.get("issue_date")
+            if not prefill.get("unit_price_basis"):
+                prefill["unit_price_basis"] = "KG"
+            if not prefill.get("currency"):
+                prefill["currency"] = "NGN"
+            if not prefill.get("tolerance_pct"):
+                prefill["tolerance_pct"] = 5.0
+            return prefill
+
+        def _persist_intake_uploads(self, uploaded: list[Path], *, run_id: str) -> list[Path]:
+            if not uploaded:
+                return []
+            target_dir = config.state_dir / "intake_uploads" / run_id
+            target_dir.mkdir(parents=True, exist_ok=True)
+            saved: list[Path] = []
+            for index, source in enumerate(uploaded, start=1):
+                destination = target_dir / f"{index:02d}-{_safe_filename(source.name)}"
+                destination.write_bytes(source.read_bytes())
+                saved.append(destination)
+            return saved
+
+        def _load_intake_evidence_paths(self, *, data: dict[str, str]) -> list[str]:
+            raw = str(data.get("intake_evidence_paths_json") or "").strip()
+            if not raw:
+                return []
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return []
+            if not isinstance(parsed, list):
+                return []
+            return [str(item) for item in parsed if str(item).strip()]
+
+        def _record_intake_confirm_decisions(self, *, run_id: str, submitted: dict[str, str]) -> None:
+            run_id = run_id.strip()
+            if not run_id:
+                return
+            run = repo.get_automation_run(run_id)
+            if not run:
+                return
+            parser_rows = repo.fetch_all(
+                """
+                SELECT field_name, proposed_value
+                FROM automation_decisions
+                WHERE run_id = ? AND stage = 'intake_parser'
+                ORDER BY created_at ASC
+                """,
+                (run_id,),
+            )
+            proposed_map: dict[str, str] = {}
+            for row in parser_rows:
+                field_name = str(row.get("field_name") or "")
+                if not field_name:
+                    continue
+                proposed_map[field_name] = str(row.get("proposed_value") or "")
+            tracked_fields = sorted(set(self._intake_critical_fields()) | set(proposed_map.keys()))
+            now = utc_now_iso_z()
+            with repo.transaction() as conn:
+                for field_name in tracked_fields:
+                    final_value = str(submitted.get(field_name) or "").strip()
+                    proposed_value = str(proposed_map.get(field_name) or "").strip()
+                    if not final_value:
+                        continue
+                    decision = "user_confirmed" if final_value == proposed_value else "user_corrected"
+                    repo.add_automation_decision(
+                        conn,
+                        run_id=run_id,
+                        stage="intake_confirm",
+                        field_name=field_name,
+                        required_flag=field_name in self._intake_critical_fields(),
+                        proposed_value=final_value,
+                        source_type="user_input",
+                        source_ref="/v2/intake/confirm",
+                        confidence=1.0,
+                        decision=decision,
+                        reason_code=decision,
+                        rule_path=f"intake_confirm.{field_name}",
+                    )
+                    conn.execute(
+                        """
+                        UPDATE exception_queue
+                        SET status = 'RESOLVED',
+                            resolved_value = ?,
+                            resolution_note = 'intake_confirm',
+                            resolved_at = ?
+                        WHERE run_id = ?
+                          AND stage = 'intake_parser'
+                          AND field_name = ?
+                          AND status = 'OPEN'
+                        """,
+                        (final_value, now, run_id, field_name),
+                    )
+                blockers = conn.execute(
+                    """
+                    SELECT COUNT(*) AS total
+                    FROM exception_queue
+                    WHERE run_id = ? AND status = 'OPEN' AND severity = 'BLOCKER'
+                    """,
+                    (run_id,),
+                ).fetchone()
+                next_status = "NEEDS_REVIEW" if int((blockers or {"total": 0})["total"] or 0) > 0 else "COMPLETED"
+                conn.execute(
+                    "UPDATE automation_runs SET status = ?, updated_at = ? WHERE run_id = ?",
+                    (next_status, now, run_id),
+                )
 
         def _record_ui_exception(
             self,
@@ -951,7 +1612,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 alert = f"<div class='alert {css_class}'>{_escape(msg)}</div>"
             nav = (
                 "<nav>"
-                f"{self._nav_link('/v2/portfolio', 'Portfolio', active == 'portfolio')}"
+                f"{self._nav_link('/v2/portfolio', 'Command Center', active == 'portfolio')}"
                 f"{self._nav_link('/v2/intake', 'Intake', active == 'intake')}"
                 f"{self._nav_link('/v2/exceptions', 'Exceptions', active == 'exceptions')}"
                 "<form method='POST' action='/v2/init-db' style='display:inline-block;margin-left:auto'>"
@@ -981,6 +1642,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 "th{background:#f9fafb} .pill{display:inline-block;padding:2px 8px;border:1px solid #d1d5db;border-radius:999px;font-size:11px}"
                 ".summary{display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:8px;margin:10px 0;padding:10px;border:1px solid #e5e7eb;border-radius:8px;background:#fafafa}"
                 ".actions{margin-top:10px}"
+                "details.advanced{margin-top:10px;border:1px solid #e5e7eb;padding:8px;border-radius:8px;background:#fcfcfd}"
+                "details.advanced summary{cursor:pointer;font-weight:600}"
                 "</style></head><body>"
                 "<h1 style='margin:0 0 8px 0;font-size:22px'>Ananta Delivery Pilot - Phase 2 (Ledger UI)</h1>"
                 f"{nav}{alert}<main><h2>{_escape(title)}</h2>{body_html}</main></body></html>"

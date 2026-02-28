@@ -63,10 +63,20 @@ UI route smoke test:
 PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m unittest -v tests.test_phase2_ui
 ```
 
+Host-level UI smoke (non-sandbox, non-skipped):
+
+```bash
+cd /Users/macbookairv2/doc_generator/ananta_delivery_pilot
+./scripts/host_ui_smoke.sh 8865
+```
+
+This writes proof artifacts under `.state/phase2-proof/pr5/host-smoke-<timestamp>/`.
+Release-candidate CI now runs the same script in `.github/workflows/release-candidate-host-smoke.yml`.
+
 ### Primary UI flow
 
 1. **Intake** (`/v2/intake`)  
-   Create/upload LPO, choose lane via vendor-of-record (Guildgate or Ananta Flows), auto-plan deliveries.
+   Upload LPO for parser-assisted prefill (confidence badges + exception routing), then confirm to create contract and auto-plan deliveries. Manual create path remains available when no LPO is provided.
 2. **Plan** (`/v2/contracts/<contract_id>/plan`)  
    Review lot split, edit planned date/qty for exceptions, rebuild schedule if needed.
 3. **Execute** (`/v2/contracts/<contract_id>/execute`)  
@@ -104,6 +114,10 @@ python3 run.py auto-run --input examples/stp/known_complete.json --as-of 2026-03
 python3 run.py exceptions list
 python3 run.py exceptions resolve --exception-id <id> --value <value> --note "resolution"
 python3 run.py auto-resume --run-id <run_id>
+python3 run.py run-autonomy --as-of 2026-03-31 --dry-run
+python3 run.py list-cases --status OPEN
+python3 run.py decide-case --case-id <case_id> --decision APPROVE --reason "override"
+python3 run.py autonomy-metrics --as-of 2026-03-31 --out-dir .state/automation_metrics
 ```
 
 Phase 1 state writes to:
@@ -218,12 +232,45 @@ python3 run.py export-drep --as-of 2026-03-31 --out-dir .state/exports/2026-03-3
 - Spec: `SPEC_PHASE1_5.md`
 - Runbook: `AUTOMATION_RUNBOOK.md`
 
+## Phase 2 PR2 Gate + Intent Engine
+
+- CLI autonomy runner: `run-autonomy`
+- Case queue and decisions: `list-cases`, `decide-case`
+- Deterministic metric export: `autonomy-metrics`
+- Persistent tables used: `gate_evaluations`, `action_intents`, `action_executions`, `exception_cases`, `event_log`
+
+## Phase 2 PR3 Entity Intelligence (Transport + MDM)
+
+- Materialization now applies transport suggestion logic from assignment history + aliases.
+- Auto-apply when confidence meets threshold and compliance is valid.
+- Creates immutable `delivery_transport_snapshot` records, and document rendering reads snapshot values first.
+- Low-confidence/conflict/compliance-expired outcomes open transport exception cases and log decision features/outcomes.
+- Key tests: `tests/test_phase2_pr3_transport.py`.
+
+## Phase 2 PR3.1 Policy Runtime Closure
+
+- Runtime policy now resolves from DB tables `policy_sets` + `policy_overrides` with precedence:
+  `contract > master_contract > buyer > global` (active/effective-date bounded).
+- `plan-deliveries` and autonomy gate evaluation use resolved policy values, with config fallback when no active DB policy exists.
+- `action_intents` / `action_executions` payloads now persist policy metadata (`policy_source_key`, `policy_version`, selected policy set IDs) and idempotency keys include the resolved policy reference.
+- Key tests: `tests/test_phase2_pr3_1_policy_runtime.py`.
+
+## Recommended Daily Ops Flow (Phase 2 UI)
+
+1. Open `/v2/portfolio` (Command Center).
+2. Review `Needs Decision` badges; resolve blockers in `/v2/exceptions`.
+3. Click `Run Recommended` per active contract.
+4. Review timeline on `/v2/contracts/{id}/execute?run_id=...` for executed/skipped/blocked intents.
+5. Confirm materialized deliveries and generate missing 4-doc packs when needed.
+6. Go to `/v2/contracts/{id}/settle` to record payment and generate receipt.
+7. Export DREP snapshot for a fixed as-of date from Settle (or command-center export step).
+
 ## Testing
 
 Run tests:
 
 ```bash
-python3 -m unittest discover -s tests -p "test_*.py"
+./scripts/test_default.sh
 ```
 
 Focused Phase 2 regression run:

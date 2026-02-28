@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import json
 import time
+from datetime import date
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,9 +37,19 @@ class AutomationOrchestrator:
         self.identity_auto_min = float(threshold_cfg.get("identity_auto_apply_min", 0.92))
         self.identity_review_min = float(threshold_cfg.get("identity_review_min", 0.70))
         self.payment_auto_min = float(threshold_cfg.get("payment_auto_apply_min", 0.90))
+        self.transport_auto_min = float(threshold_cfg.get("transport_auto_apply_min", 0.90))
+        self.transport_review_min = float(threshold_cfg.get("transport_review_min", 0.65))
+        self.autonomy_intent_order = [
+            "plan_deliveries",
+            "materialize_due",
+            "auto_progress",
+            "generate_pack",
+            "apply_payment",
+        ]
 
     def auto_run(self, payload: dict[str, Any], *, as_of_date: str, dry_run: bool = False, resume_from_run_id: str | None = None) -> dict[str, Any]:
         self.phase1.init_db()
+        self.phase1.refresh_contract_state(as_of_date=as_of_date)
         started = time.time()
         normalized = self._normalize_payload(payload)
         if resume_from_run_id:
@@ -154,6 +165,1279 @@ class AutomationOrchestrator:
 
     def resolve_exception(self, *, exception_id: str, value: str, note: str) -> dict[str, Any]:
         return self.repo.resolve_exception(exception_id=exception_id, value=value, note=note)
+
+    def run_autonomy(self, *, as_of_date: str, contract_id: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+        self.phase1.init_db()
+        self.phase1.refresh_contract_state(as_of_date=as_of_date)
+        autonomy_run_id = new_ulid()
+        started = time.time()
+        with self.repo.transaction() as conn:
+            self.repo.append_event(
+                conn,
+                entity_type="AUTONOMY_RUN",
+                entity_id=autonomy_run_id,
+                event_type="RUN_STARTED",
+                as_of_date=as_of_date,
+                payload={"contract_id": contract_id, "dry_run": dry_run},
+                source="run-autonomy",
+            )
+
+        contracts = self._contracts_for_autonomy(contract_id=contract_id)
+        per_contract: list[dict[str, Any]] = []
+        for contract in contracts:
+            per_contract.append(
+                self._run_contract_autonomy(
+                    autonomy_run_id=autonomy_run_id,
+                    contract=contract,
+                    as_of_date=as_of_date,
+                    dry_run=dry_run,
+                )
+            )
+
+        summary = {
+            "contracts_processed": len(per_contract),
+            "intents_executed": sum(int(item.get("intents_executed", 0)) for item in per_contract),
+            "intents_blocked": sum(int(item.get("intents_blocked", 0)) for item in per_contract),
+            "exceptions_open": sum(int(item.get("exceptions_open", 0)) for item in per_contract),
+            "duration_seconds": round(max(0.0, time.time() - started), 3),
+        }
+        with self.repo.transaction() as conn:
+            self.repo.append_event(
+                conn,
+                entity_type="AUTONOMY_RUN",
+                entity_id=autonomy_run_id,
+                event_type="RUN_COMPLETED",
+                as_of_date=as_of_date,
+                payload=summary,
+                source="run-autonomy",
+            )
+        return {
+            "ok": True,
+            "autonomy_run_id": autonomy_run_id,
+            "as_of_date": as_of_date,
+            "dry_run": dry_run,
+            "contract_id": contract_id,
+            "summary": summary,
+            "contracts": per_contract,
+        }
+
+    def list_cases(self, *, status: str = "OPEN") -> dict[str, Any]:
+        rows = self.repo.list_exception_cases(status=status)
+        for row in rows:
+            details_json = row.get("details_json")
+            row["details"] = json.loads(details_json) if details_json else {}
+        return {"cases": rows, "status": status, "count": len(rows)}
+
+    def decide_case(
+        self,
+        *,
+        case_id: str,
+        decision: str,
+        reason: str,
+        user_id: str | None = None,
+        resume: bool = True,
+        dry_run_resume: bool = False,
+    ) -> dict[str, Any]:
+        normalized_decision = str(decision).strip().upper()
+        if normalized_decision not in {"APPROVE", "REJECT", "OVERRIDE"}:
+            raise ValueError("decision must be APPROVE, REJECT, or OVERRIDE")
+        case = self.repo.get_exception_case(case_id)
+        if not case:
+            raise ValueError(f"Unknown case_id: {case_id}")
+        idempotency_key = f"{case_id}|{normalized_decision}|{reason.strip()}"
+        case_details = json.loads(case.get("details_json") or "{}")
+        suggestion_ids = case_details.get("suggestion_ids") if isinstance(case_details.get("suggestion_ids"), list) else []
+        with self.repo.transaction() as conn:
+            decision_row = self.repo.add_human_decision(
+                conn,
+                exception_case_id=case_id,
+                user_id=user_id,
+                decision=normalized_decision,
+                reason=reason,
+                payload={"resume": resume, "dry_run_resume": dry_run_resume},
+                idempotency_key=idempotency_key,
+            )
+            case_status = "RESOLVED" if normalized_decision in {"APPROVE", "OVERRIDE"} else "REJECTED"
+            case_row = self.repo.resolve_exception_case(conn, exception_case_id=case_id, status=case_status)
+            self.repo.append_event(
+                conn,
+                entity_type="EXCEPTION_CASE",
+                entity_id=case_id,
+                event_type="CASE_DECIDED",
+                as_of_date=None,
+                payload={
+                    "decision": normalized_decision,
+                    "reason": reason,
+                    "status": case_status,
+                    "decision_id": decision_row["human_decision_id"],
+                },
+                source="decide-case",
+            )
+            if suggestion_ids:
+                self.repo.mark_transport_suggestion_feedback(
+                    conn,
+                    suggestion_ids=[str(item) for item in suggestion_ids if str(item).strip()],
+                    accepted=normalized_decision in {"APPROVE", "OVERRIDE"},
+                )
+                self.repo.add_decision_feature(
+                    conn,
+                    exception_case_id=case_id,
+                    feature_key="transport_suggestion_ids",
+                    feature_payload={"suggestion_ids": suggestion_ids},
+                )
+            self.repo.add_decision_outcome(
+                conn,
+                exception_case_id=case_id,
+                human_decision_id=str(decision_row["human_decision_id"]),
+                outcome_label="APPROVED" if normalized_decision in {"APPROVE", "OVERRIDE"} else "REJECTED",
+                outcome_payload={
+                    "decision": normalized_decision,
+                    "reason": reason,
+                    "case_type": case.get("case_type"),
+                    "reason_code": case.get("reason_code"),
+                },
+            )
+        resume_result: dict[str, Any] | None = None
+        if resume and normalized_decision in {"APPROVE", "OVERRIDE"} and case.get("contract_id"):
+            details = json.loads(case.get("details_json") or "{}")
+            case_as_of = str(details.get("as_of_date") or utc_now_iso_z()[:10])
+            resume_result = self.run_autonomy(
+                as_of_date=case_as_of,
+                contract_id=str(case["contract_id"]),
+                dry_run=bool(dry_run_resume),
+            )
+        return {
+            "ok": True,
+            "case": case_row,
+            "decision": decision_row,
+            "resume_result": resume_result,
+        }
+
+    def autonomy_metrics(self, *, as_of_date: str, out_dir: Path) -> dict[str, Any]:
+        intent_rows = self.repo.fetch_all(
+            "SELECT action_intent_id, status FROM action_intents WHERE as_of_date = ?",
+            (as_of_date,),
+        )
+        exec_rows = self.repo.fetch_all(
+            """
+            SELECT ae.status
+            FROM action_executions ae
+            JOIN action_intents ai ON ai.action_intent_id = ae.action_intent_id
+            WHERE ai.as_of_date = ?
+            """,
+            (as_of_date,),
+        )
+        cases_open = self.repo.fetch_all(
+            """
+            SELECT exception_case_id FROM exception_cases
+            WHERE status = 'OPEN' AND json_extract(details_json, '$.as_of_date') = ?
+            """,
+            (as_of_date,),
+        )
+        decisions = self.repo.fetch_all(
+            "SELECT human_decision_id FROM human_decisions WHERE substr(decided_at, 1, 10) = ?",
+            (as_of_date,),
+        )
+        total_intents = len(intent_rows)
+        success_exec = sum(1 for row in exec_rows if str(row.get("status") or "").upper() in {"SUCCESS", "SKIPPED"})
+        open_count = len(cases_open)
+        touchless_rate = round((total_intents - open_count) / total_intents, 4) if total_intents else 0.0
+        auto_action_success_rate = round(success_exec / total_intents, 4) if total_intents else 0.0
+        metrics = {
+            "as_of_date": as_of_date,
+            "intents_total": total_intents,
+            "executions_success_or_skipped": success_exec,
+            "exceptions_open": open_count,
+            "manual_intervention_count": len(decisions),
+            "touchless_rate": touchless_rate,
+            "auto_action_success_rate": auto_action_success_rate,
+        }
+        out_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = out_dir / f"autonomy_metrics_{as_of_date}.json"
+        metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+        return {"ok": True, "metrics": metrics, "metrics_path": str(metrics_path)}
+
+    def _contracts_for_autonomy(self, *, contract_id: str | None) -> list[dict[str, Any]]:
+        if contract_id:
+            row = self.repo.fetch_one("SELECT * FROM contracts WHERE contract_id = ?", (contract_id,))
+            return [row] if row else []
+        return self.repo.fetch_all(
+            """
+            SELECT * FROM contracts
+            WHERE status IN ('OPEN', 'PARTIAL')
+            ORDER BY issue_date ASC, contract_id ASC
+            """
+        )
+
+    def _run_contract_autonomy(
+        self,
+        *,
+        autonomy_run_id: str,
+        contract: dict[str, Any],
+        as_of_date: str,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        contract_id = str(contract["contract_id"])
+        runtime_policy = self._resolve_runtime_policy(contract=contract, as_of_date=as_of_date)
+        gates = self._evaluate_contract_gates(
+            autonomy_run_id=autonomy_run_id,
+            contract=contract,
+            as_of_date=as_of_date,
+            runtime_policy=runtime_policy,
+        )
+        intents: list[dict[str, Any]] = []
+        blocked = 0
+        executed = 0
+        for intent_type in self.autonomy_intent_order:
+            intents.append(
+                self._execute_intent_with_gates(
+                    autonomy_run_id=autonomy_run_id,
+                    contract=contract,
+                    intent_type=intent_type,
+                    gates=gates,
+                    as_of_date=as_of_date,
+                    dry_run=dry_run,
+                    runtime_policy=runtime_policy,
+                )
+            )
+        for item in intents:
+            status = str(item.get("status") or "").upper()
+            if status in {"BLOCKED", "FAILED"}:
+                blocked += 1
+            elif status in {"SUCCESS", "SKIPPED"}:
+                executed += 1
+        open_cases = self.repo.fetch_one(
+            "SELECT COUNT(*) AS cnt FROM exception_cases WHERE contract_id = ? AND status = 'OPEN'",
+            (contract_id,),
+        )
+        return {
+            "contract_id": contract_id,
+            "lpo_no": contract.get("lpo_no"),
+            "gates": gates,
+            "intents": intents,
+            "intents_executed": executed,
+            "intents_blocked": blocked,
+            "exceptions_open": int((open_cases or {"cnt": 0})["cnt"] or 0),
+            "runtime_policy": {
+                "source": runtime_policy["source"],
+                "policy_source_key": runtime_policy["policy_source_key"],
+                "policy_version": runtime_policy["policy_version"],
+                "selected_policy_set_ids": runtime_policy["selected_policy_set_ids"],
+            },
+        }
+
+    def _resolve_runtime_policy(
+        self,
+        *,
+        contract: dict[str, Any],
+        as_of_date: str,
+    ) -> dict[str, Any]:
+        fallback_policy = self.config.automation_thresholds if isinstance(self.config.automation_thresholds, dict) else {}
+        fallback_version = str(fallback_policy.get("schema_version") or "phase2.v1")
+        resolved = self.repo.resolve_policy_runtime(
+            as_of_date=as_of_date,
+            contract_id=str(contract.get("contract_id") or "").strip() or None,
+            master_contract_id=str(contract.get("master_contract_id") or "").strip() or None,
+            buyer_id=str(contract.get("buyer_id") or "").strip() or None,
+            fallback_policy=fallback_policy,
+            fallback_version=fallback_version,
+        )
+        selected_sets = resolved.get("selected_sets", [])
+        selected_sets = selected_sets if isinstance(selected_sets, list) else []
+        return {
+            "source": str(resolved.get("source") or "config"),
+            "policy": resolved.get("policy", {}) if isinstance(resolved.get("policy"), dict) else {},
+            "selected_sets": selected_sets,
+            "selected_policy_set_ids": [str(row.get("policy_set_id")) for row in selected_sets if row.get("policy_set_id")],
+            "policy_source_key": str(resolved.get("policy_source_key") or f"config:{fallback_version}"),
+            "policy_version": str(resolved.get("policy_version") or fallback_version),
+        }
+
+    def _resolved_gate_overrides(self, *, contract_id: str) -> set[str]:
+        rows = self.repo.fetch_all(
+            """
+            SELECT details_json
+            FROM exception_cases
+            WHERE contract_id = ? AND status = 'RESOLVED' AND reason_code = 'gate_failed'
+            """,
+            (contract_id,),
+        )
+        overrides: set[str] = set()
+        for row in rows:
+            try:
+                details = json.loads(row.get("details_json") or "{}")
+            except Exception:
+                details = {}
+            gate_name = str(details.get("gate_name") or "").strip()
+            if gate_name:
+                overrides.add(gate_name)
+        return overrides
+
+    def _evaluate_contract_gates(
+        self,
+        *,
+        autonomy_run_id: str,
+        contract: dict[str, Any],
+        as_of_date: str,
+        runtime_policy: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        contract_id = str(contract["contract_id"])
+        overrides = self._resolved_gate_overrides(contract_id=contract_id)
+        gate_names = [
+            "contract_active_valid",
+            "quantity_tolerance",
+            "evidence_ready",
+            "coa_complete",
+            "payment_match_confidence",
+            "capacity_available",
+            "transport_assignment_valid",
+        ]
+        results: dict[str, dict[str, Any]] = {}
+        for gate_name in gate_names:
+            outcome = self._evaluate_gate(
+                gate_name=gate_name,
+                contract=contract,
+                as_of_date=as_of_date,
+                runtime_policy=runtime_policy,
+            )
+            if outcome["status"] == "FAIL" and gate_name in overrides:
+                outcome = {
+                    **outcome,
+                    "status": "PASS",
+                    "score": 1.0,
+                    "reason_code": "override_resolved_case",
+                    "details": {**outcome.get("details", {}), "override": True},
+                }
+            with self.repo.transaction() as conn:
+                self.repo.add_gate_evaluation(
+                    conn,
+                    autonomy_run_id=autonomy_run_id,
+                    contract_id=contract_id,
+                    delivery_id=None,
+                    planned_delivery_id=None,
+                    gate_name=gate_name,
+                    subject_type="CONTRACT",
+                    subject_id=contract_id,
+                    as_of_date=as_of_date,
+                    status=str(outcome["status"]),
+                    score=float(outcome["score"]) if outcome.get("score") is not None else None,
+                    reason_code=str(outcome["reason_code"]),
+                    details=dict(outcome.get("details", {})),
+                )
+                self.repo.append_event(
+                    conn,
+                    entity_type="CONTRACT",
+                    entity_id=contract_id,
+                    event_type="GATE_EVALUATED",
+                    as_of_date=as_of_date,
+                    payload={
+                        "gate_name": gate_name,
+                        "status": outcome["status"],
+                        "reason_code": outcome["reason_code"],
+                    },
+                    source="run-autonomy",
+                )
+            results[gate_name] = {
+                "status": str(outcome["status"]),
+                "score": float(outcome["score"]) if outcome.get("score") is not None else None,
+                "reason_code": str(outcome["reason_code"]),
+                "details": dict(outcome.get("details", {})),
+            }
+        return results
+
+    def _evaluate_gate(
+        self,
+        *,
+        gate_name: str,
+        contract: dict[str, Any],
+        as_of_date: str,
+        runtime_policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        contract_id = str(contract["contract_id"])
+        if gate_name == "contract_active_valid":
+            lpo_state = str(contract.get("lpo_state") or "ACTIVE").upper()
+            passed = lpo_state == "ACTIVE"
+            return {
+                "status": "PASS" if passed else "FAIL",
+                "score": 1.0 if passed else 0.0,
+                "reason_code": "active" if passed else f"lpo_state_{lpo_state.lower()}",
+                "details": {"lpo_state": lpo_state},
+            }
+        if gate_name == "quantity_tolerance":
+            expected_kg = int(contract.get("expected_total_qty_kg") or 0)
+            tolerance_pct = self._resolve_overdelivery_tolerance_policy(
+                contract=contract,
+                runtime_policy=runtime_policy,
+            )
+            delivered = self.repo.fetch_one(
+                """
+                SELECT COALESCE(SUM(delivered_qty_kg), 0) AS delivered_qty_kg
+                FROM deliveries
+                WHERE contract_id = ? AND status IN ('DELIVERED', 'INVOICED', 'PAID')
+                """,
+                (contract_id,),
+            )
+            delivered_kg = int((delivered or {"delivered_qty_kg": 0})["delivered_qty_kg"] or 0)
+            allowed_kg = int(expected_kg * (1.0 + tolerance_pct / 100.0))
+            passed = expected_kg <= 0 or delivered_kg <= allowed_kg
+            return {
+                "status": "PASS" if passed else "FAIL",
+                "score": 1.0 if passed else 0.0,
+                "reason_code": "within_tolerance" if passed else "over_tolerance",
+                "details": {
+                    "expected_qty_kg": expected_kg,
+                    "delivered_qty_kg": delivered_kg,
+                    "allowed_qty_kg": allowed_kg,
+                    "tolerance_pct": tolerance_pct,
+                },
+            }
+        if gate_name == "evidence_ready":
+            row = self.repo.fetch_one(
+                "SELECT COUNT(*) AS cnt FROM evidence_originals WHERE contract_id = ?",
+                (contract_id,),
+            )
+            count = int((row or {"cnt": 0})["cnt"] or 0)
+            passed = count > 0
+            return {
+                "status": "PASS" if passed else "FAIL",
+                "score": 1.0 if passed else 0.0,
+                "reason_code": "evidence_present" if passed else "missing_evidence",
+                "details": {"evidence_count": count},
+            }
+        if gate_name == "coa_complete":
+            delivered = self.repo.fetch_one(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM deliveries
+                WHERE contract_id = ? AND status IN ('DELIVERED', 'INVOICED', 'PAID')
+                """,
+                (contract_id,),
+            )
+            linked = self.repo.fetch_one(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM deliveries d
+                WHERE d.contract_id = ? AND d.status IN ('DELIVERED', 'INVOICED', 'PAID')
+                  AND EXISTS (
+                    SELECT 1 FROM delivery_coa_links l WHERE l.delivery_id = d.delivery_id
+                  )
+                """,
+                (contract_id,),
+            )
+            delivered_count = int((delivered or {"cnt": 0})["cnt"] or 0)
+            linked_count = int((linked or {"cnt": 0})["cnt"] or 0)
+            passed = linked_count >= delivered_count
+            return {
+                "status": "PASS" if passed else "FAIL",
+                "score": 1.0 if passed else 0.0,
+                "reason_code": "coa_complete" if passed else "coa_missing_rows",
+                "details": {"delivered_count": delivered_count, "coa_linked_count": linked_count},
+            }
+        if gate_name == "payment_match_confidence":
+            row = self.repo.fetch_one(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM drep_outstanding_payments
+                WHERE contract_id = ? AND outstanding_balance > 0
+                """,
+                (contract_id,),
+            )
+            outstanding_count = int((row or {"cnt": 0})["cnt"] or 0)
+            thresholds = self._resolve_payment_thresholds(runtime_policy)
+            review_min = thresholds["review_min"]
+            auto_min = thresholds["auto_min"]
+            score = 1.0 if outstanding_count == 0 else 0.8
+            if outstanding_count == 0:
+                return {
+                    "status": "PASS",
+                    "score": score,
+                    "reason_code": "no_outstanding",
+                    "details": {"outstanding_invoice_count": 0, "auto_min": auto_min, "review_min": review_min},
+                }
+            if score >= auto_min:
+                return {
+                    "status": "PASS",
+                    "score": score,
+                    "reason_code": "payment_confident",
+                    "details": {"outstanding_invoice_count": outstanding_count, "auto_min": auto_min, "review_min": review_min},
+                }
+            if score < review_min:
+                return {
+                    "status": "FAIL",
+                    "score": score,
+                    "reason_code": "payment_low_confidence",
+                    "details": {"outstanding_invoice_count": outstanding_count, "auto_min": auto_min, "review_min": review_min},
+                }
+            return {
+                "status": "WARN",
+                "score": score,
+                "reason_code": "awaiting_payment_feed",
+                "details": {"outstanding_invoice_count": outstanding_count, "auto_min": auto_min, "review_min": review_min},
+            }
+        if gate_name == "capacity_available":
+            rows = self.repo.fetch_all(
+                """
+                SELECT max_lots, reserved_lots, max_qty_kg, reserved_qty_kg
+                FROM capacity_calendar
+                WHERE as_of_date = ?
+                  AND (buyer_id IS NULL OR buyer_id = ?)
+                  AND (processor_id IS NULL OR processor_id = ?)
+                """,
+                (as_of_date, contract.get("buyer_id"), contract.get("processor_id")),
+            )
+            if not rows:
+                return {
+                    "status": "PASS",
+                    "score": 1.0,
+                    "reason_code": "no_capacity_limit",
+                    "details": {"rows": 0},
+                }
+            blocked = False
+            for row in rows:
+                if int(row.get("max_lots") or 0) and int(row.get("reserved_lots") or 0) > int(row.get("max_lots") or 0):
+                    blocked = True
+                if int(row.get("max_qty_kg") or 0) and int(row.get("reserved_qty_kg") or 0) > int(row.get("max_qty_kg") or 0):
+                    blocked = True
+            return {
+                "status": "FAIL" if blocked else "PASS",
+                "score": 0.0 if blocked else 1.0,
+                "reason_code": "capacity_exceeded" if blocked else "capacity_available",
+                "details": {"rows": len(rows)},
+            }
+        if gate_name == "transport_assignment_valid":
+            row = self.repo.fetch_one(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM deliveries
+                WHERE contract_id = ?
+                  AND status IN ('DISPATCHED', 'DELIVERED', 'INVOICED', 'PAID')
+                  AND (COALESCE(TRIM(truck_no), '') = '' OR COALESCE(TRIM(driver_name), '') = '')
+                """,
+                (contract_id,),
+            )
+            missing = int((row or {"cnt": 0})["cnt"] or 0)
+            status = "PASS" if missing == 0 else "WARN"
+            return {
+                "status": status,
+                "score": 1.0 if status == "PASS" else 0.75,
+                "reason_code": "transport_complete" if status == "PASS" else "transport_missing_details",
+                "details": {"missing_rows": missing},
+            }
+        return {
+            "status": "WARN",
+            "score": 0.5,
+            "reason_code": "unknown_gate",
+            "details": {"gate_name": gate_name},
+        }
+
+    def _resolve_overdelivery_tolerance_policy(
+        self,
+        *,
+        contract: dict[str, Any],
+        runtime_policy: dict[str, Any],
+    ) -> float:
+        policy = runtime_policy.get("policy", {}) if isinstance(runtime_policy.get("policy"), dict) else {}
+        over_cfg = policy.get("over_delivery", {}) if isinstance(policy.get("over_delivery"), dict) else {}
+        buyer_overrides = over_cfg.get("buyer_overrides", {}) if isinstance(over_cfg.get("buyer_overrides"), dict) else {}
+        buyer_id = str(contract.get("buyer_id") or "").strip()
+        if buyer_id and buyer_id in buyer_overrides:
+            return float(buyer_overrides[buyer_id])
+        if over_cfg.get("global_default_tolerance_pct") not in (None, ""):
+            return float(over_cfg["global_default_tolerance_pct"])
+        return float(contract.get("over_delivery_tolerance_pct") or 5.0)
+
+    def _resolve_payment_thresholds(self, runtime_policy: dict[str, Any]) -> dict[str, float]:
+        policy = runtime_policy.get("policy", {}) if isinstance(runtime_policy.get("policy"), dict) else {}
+        confidence_cfg = policy.get("confidence", {}) if isinstance(policy.get("confidence"), dict) else {}
+        auto_min = float(confidence_cfg.get("payment_auto_apply_min", self.payment_auto_min))
+        review_default = self.identity_review_min
+        review_min = float(confidence_cfg.get("payment_review_min", confidence_cfg.get("identity_review_min", review_default)))
+        return {"auto_min": auto_min, "review_min": review_min}
+
+    def _apply_transport_intelligence(
+        self,
+        *,
+        autonomy_run_id: str,
+        action_intent_id: str,
+        contract_id: str,
+        as_of_date: str,
+        processed_rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        applied = 0
+        review_cases = 0
+        blocker_cases = 0
+        details: list[dict[str, Any]] = []
+        for row in processed_rows:
+            materialize = row.get("materialize") if isinstance(row, dict) else None
+            delivery_id = str((materialize or {}).get("delivery_id") or "").strip()
+            planned_delivery_id = str(row.get("planned_delivery_id") or "").strip() or None
+            if not delivery_id:
+                continue
+            outcome = self._resolve_transport_for_delivery(
+                autonomy_run_id=autonomy_run_id,
+                action_intent_id=action_intent_id,
+                contract_id=contract_id,
+                delivery_id=delivery_id,
+                planned_delivery_id=planned_delivery_id,
+                as_of_date=as_of_date,
+            )
+            details.append(outcome)
+            if outcome.get("applied"):
+                applied += 1
+            if outcome.get("case_severity") == "REVIEW":
+                review_cases += 1
+            if outcome.get("case_severity") == "BLOCKER":
+                blocker_cases += 1
+        if blocker_cases > 0:
+            return {
+                "blocked": True,
+                "error": "Transport assignment blocked by conflict/compliance",
+                "applied": applied,
+                "review_cases": review_cases,
+                "blocker_cases": blocker_cases,
+                "details": details,
+            }
+        return {
+            "blocked": False,
+            "applied": applied,
+            "review_cases": review_cases,
+            "blocker_cases": blocker_cases,
+            "details": details,
+        }
+
+    def _resolve_transport_for_delivery(
+        self,
+        *,
+        autonomy_run_id: str,
+        action_intent_id: str | None,
+        contract_id: str,
+        delivery_id: str,
+        planned_delivery_id: str | None,
+        as_of_date: str,
+    ) -> dict[str, Any]:
+        delivery = self.repo.fetch_one("SELECT * FROM deliveries WHERE delivery_id = ?", (delivery_id,))
+        if not delivery:
+            return {"delivery_id": delivery_id, "applied": False, "reason": "delivery_not_found"}
+        truck_hint = str(delivery.get("truck_no") or "").strip()
+        driver_hint = str(delivery.get("driver_name") or "").strip()
+        candidates = self.repo.list_active_transport_assignments(as_of_date=as_of_date)
+        if not candidates:
+            return {"delivery_id": delivery_id, "applied": False, "reason": "no_active_transport_assignments"}
+
+        scored: list[dict[str, Any]] = []
+        for candidate in candidates:
+            score, reason_bits = self._score_transport_candidate(
+                candidate=candidate,
+                truck_hint=truck_hint,
+                driver_hint=driver_hint,
+            )
+            scored.append(
+                {
+                    "candidate": candidate,
+                    "score": score,
+                    "reason_bits": reason_bits,
+                }
+            )
+        scored.sort(key=lambda item: item["score"], reverse=True)
+        top = scored[0]
+        top_score = float(top["score"])
+        ambiguous_top = len(scored) > 1 and abs(float(scored[1]["score"]) - top_score) < 0.01
+
+        suggestion_ids: list[str] = []
+        with self.repo.transaction() as conn:
+            for item in scored[:3]:
+                candidate = item["candidate"]
+                explanation = {
+                    "score": item["score"],
+                    "reason_bits": item["reason_bits"],
+                    "as_of_date": as_of_date,
+                }
+                partner_suggestion = self.repo.upsert_delivery_transport_suggestion(
+                    conn,
+                    delivery_id=delivery_id,
+                    planned_delivery_id=planned_delivery_id,
+                    entity_type="PARTNER",
+                    candidate_entity_id=str(candidate.get("transport_partner_id") or ""),
+                    candidate_label=str(candidate.get("partner_name") or ""),
+                    confidence=float(item["score"]),
+                    explanation=explanation,
+                )
+                truck_suggestion = self.repo.upsert_delivery_transport_suggestion(
+                    conn,
+                    delivery_id=delivery_id,
+                    planned_delivery_id=planned_delivery_id,
+                    entity_type="TRUCK",
+                    candidate_entity_id=str(candidate["transport_truck_id"]),
+                    candidate_label=str(candidate.get("truck_no") or ""),
+                    confidence=float(item["score"]),
+                    explanation=explanation,
+                )
+                driver_suggestion = self.repo.upsert_delivery_transport_suggestion(
+                    conn,
+                    delivery_id=delivery_id,
+                    planned_delivery_id=planned_delivery_id,
+                    entity_type="DRIVER",
+                    candidate_entity_id=str(candidate["transport_driver_id"]),
+                    candidate_label=str(candidate.get("driver_name") or ""),
+                    confidence=float(item["score"]),
+                    explanation=explanation,
+                )
+                for sug in (partner_suggestion, truck_suggestion, driver_suggestion):
+                    suggestion_id = str(sug.get("suggestion_id") or "")
+                    if suggestion_id:
+                        suggestion_ids.append(suggestion_id)
+
+        selected = top["candidate"]
+        truck_ok, truck_reason = self.repo.transport_compliance_valid(
+            entity_type="TRUCK",
+            entity_id=str(selected["transport_truck_id"]),
+            as_of_date=as_of_date,
+        )
+        driver_ok, driver_reason = self.repo.transport_compliance_valid(
+            entity_type="DRIVER",
+            entity_id=str(selected["transport_driver_id"]),
+            as_of_date=as_of_date,
+        )
+        compliance_ok = truck_ok and driver_ok
+
+        if ambiguous_top:
+            return self._create_transport_case(
+                autonomy_run_id=autonomy_run_id,
+                action_intent_id=action_intent_id,
+                contract_id=contract_id,
+                delivery_id=delivery_id,
+                planned_delivery_id=planned_delivery_id,
+                as_of_date=as_of_date,
+                reason_code="transport_conflict",
+                severity="BLOCKER",
+                top_score=top_score,
+                suggestion_ids=suggestion_ids,
+                details={"reason": "multiple_top_candidates"},
+            )
+        if not compliance_ok:
+            return self._create_transport_case(
+                autonomy_run_id=autonomy_run_id,
+                action_intent_id=action_intent_id,
+                contract_id=contract_id,
+                delivery_id=delivery_id,
+                planned_delivery_id=planned_delivery_id,
+                as_of_date=as_of_date,
+                reason_code="transport_compliance_expired",
+                severity="BLOCKER",
+                top_score=top_score,
+                suggestion_ids=suggestion_ids,
+                details={"truck_reason": truck_reason, "driver_reason": driver_reason},
+            )
+
+        if top_score < self.transport_auto_min:
+            return self._create_transport_case(
+                autonomy_run_id=autonomy_run_id,
+                action_intent_id=action_intent_id,
+                contract_id=contract_id,
+                delivery_id=delivery_id,
+                planned_delivery_id=planned_delivery_id,
+                as_of_date=as_of_date,
+                reason_code="transport_low_confidence",
+                severity="REVIEW",
+                top_score=top_score,
+                suggestion_ids=suggestion_ids,
+                details={"threshold": self.transport_auto_min},
+            )
+
+        with self.repo.transaction() as conn:
+            self.repo.update_delivery_transport_fields(
+                conn,
+                delivery_id=delivery_id,
+                truck_no=str(selected.get("truck_no") or ""),
+                driver_name=str(selected.get("driver_name") or ""),
+                driver_phone=str(selected.get("driver_phone") or ""),
+            )
+            snapshot = self.repo.upsert_delivery_transport_snapshot(
+                conn,
+                delivery_id=delivery_id,
+                planned_delivery_id=planned_delivery_id,
+                transport_partner_id=str(selected.get("transport_partner_id") or "") or None,
+                transport_truck_id=str(selected.get("transport_truck_id") or "") or None,
+                transport_driver_id=str(selected.get("transport_driver_id") or "") or None,
+                partner_name=str(selected.get("partner_name") or ""),
+                truck_no=str(selected.get("truck_no") or ""),
+                driver_name=str(selected.get("driver_name") or ""),
+                driver_phone=str(selected.get("driver_phone") or ""),
+                source_type="autonomy_suggestion",
+                source_ref="assignment_history",
+                confidence=top_score,
+                reason_code="transport_auto_applied",
+                payload={
+                    "as_of_date": as_of_date,
+                    "reason_bits": top.get("reason_bits", []),
+                    "suggestion_ids": suggestion_ids,
+                },
+            )
+            self.repo.mark_transport_suggestion_feedback(conn, suggestion_ids=suggestion_ids, accepted=True)
+            self.repo.append_event(
+                conn,
+                entity_type="DELIVERY",
+                entity_id=delivery_id,
+                event_type="TRANSPORT_SNAPSHOT_APPLIED",
+                as_of_date=as_of_date,
+                payload={
+                    "snapshot_id": snapshot.get("snapshot_id"),
+                    "confidence": top_score,
+                    "suggestion_ids": suggestion_ids,
+                },
+                source="run-autonomy",
+            )
+        return {
+            "delivery_id": delivery_id,
+            "applied": True,
+            "case_severity": None,
+            "confidence": top_score,
+            "snapshot_reason": "transport_auto_applied",
+        }
+
+    def _create_transport_case(
+        self,
+        *,
+        autonomy_run_id: str,
+        action_intent_id: str | None,
+        contract_id: str,
+        delivery_id: str,
+        planned_delivery_id: str | None,
+        as_of_date: str,
+        reason_code: str,
+        severity: str,
+        top_score: float,
+        suggestion_ids: list[str],
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        case_key = f"{delivery_id}|{reason_code}|{as_of_date}"
+        payload = {
+            "delivery_id": delivery_id,
+            "planned_delivery_id": planned_delivery_id,
+            "as_of_date": as_of_date,
+            "top_score": top_score,
+            "suggestion_ids": suggestion_ids,
+            **(details or {}),
+        }
+        with self.repo.transaction() as conn:
+            case = self.repo.create_or_get_exception_case(
+                conn,
+                autonomy_run_id=autonomy_run_id,
+                action_intent_id=action_intent_id,
+                contract_id=contract_id,
+                delivery_id=delivery_id,
+                planned_delivery_id=planned_delivery_id,
+                case_type="transport_assignment",
+                severity=severity,
+                reason_code=reason_code,
+                details=payload,
+                idempotency_key=case_key,
+            )
+            self.repo.add_decision_feature(
+                conn,
+                exception_case_id=str(case["exception_case_id"]),
+                feature_key="transport_candidates",
+                feature_payload=payload,
+            )
+            self.repo.append_event(
+                conn,
+                entity_type="EXCEPTION_CASE",
+                entity_id=str(case["exception_case_id"]),
+                event_type="CASE_OPENED",
+                as_of_date=as_of_date,
+                payload={"reason_code": reason_code, "delivery_id": delivery_id},
+                source="run-autonomy",
+            )
+        return {
+            "delivery_id": delivery_id,
+            "applied": False,
+            "case_id": case["exception_case_id"],
+            "case_severity": severity,
+            "reason_code": reason_code,
+            "confidence": top_score,
+        }
+
+    def _score_transport_candidate(
+        self,
+        *,
+        candidate: dict[str, Any],
+        truck_hint: str,
+        driver_hint: str,
+    ) -> tuple[float, list[str]]:
+        reason_bits: list[str] = []
+        score = 0.0
+        normalized_truck_hint = _norm(truck_hint)
+        normalized_driver_hint = _norm(driver_hint)
+        truck_no = str(candidate.get("truck_no") or "")
+        driver_name = str(candidate.get("driver_name") or "")
+        if normalized_truck_hint:
+            if normalized_truck_hint == _norm(truck_no):
+                score += 0.95
+                reason_bits.append("truck_exact_match")
+            elif normalized_truck_hint in _norm(truck_no) or _norm(truck_no) in normalized_truck_hint:
+                score += 0.7
+                reason_bits.append("truck_partial_match")
+            aliases = self.repo.list_transport_aliases(entity_type="TRUCK", entity_id=str(candidate["transport_truck_id"]))
+            if any(_norm(str(alias.get("normalized_alias") or alias.get("alias_text") or "")) == normalized_truck_hint for alias in aliases):
+                score += 0.2
+                reason_bits.append("truck_alias_match")
+        if normalized_driver_hint:
+            if normalized_driver_hint == _norm(driver_name):
+                score += 0.95
+                reason_bits.append("driver_exact_match")
+            elif normalized_driver_hint in _norm(driver_name) or _norm(driver_name) in normalized_driver_hint:
+                score += 0.7
+                reason_bits.append("driver_partial_match")
+            aliases = self.repo.list_transport_aliases(entity_type="DRIVER", entity_id=str(candidate["transport_driver_id"]))
+            if any(_norm(str(alias.get("normalized_alias") or alias.get("alias_text") or "")) == normalized_driver_hint for alias in aliases):
+                score += 0.2
+                reason_bits.append("driver_alias_match")
+        if not normalized_truck_hint and not normalized_driver_hint:
+            if int(candidate.get("is_primary") or 0) == 1:
+                score += 0.95
+                reason_bits.append("single_or_primary_assignment")
+            else:
+                score += 0.75
+                reason_bits.append("historical_assignment")
+        if not reason_bits:
+            reason_bits.append("weak_match")
+            score = max(score, 0.4)
+        return min(1.0, round(score, 4)), reason_bits
+
+    def _intent_gate_requirements(self, intent_type: str) -> list[str]:
+        return {
+            "plan_deliveries": ["contract_active_valid", "quantity_tolerance", "capacity_available"],
+            "materialize_due": [
+                "contract_active_valid",
+                "quantity_tolerance",
+                "evidence_ready",
+                "capacity_available",
+                "transport_assignment_valid",
+            ],
+            "auto_progress": ["contract_active_valid"],
+            "generate_pack": ["contract_active_valid", "coa_complete"],
+            "apply_payment": ["payment_match_confidence"],
+        }.get(intent_type, [])
+
+    def _execute_intent_with_gates(
+        self,
+        *,
+        autonomy_run_id: str,
+        contract: dict[str, Any],
+        intent_type: str,
+        gates: dict[str, dict[str, Any]],
+        as_of_date: str,
+        dry_run: bool,
+        runtime_policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        contract_id = str(contract["contract_id"])
+        policy_version = str(runtime_policy.get("policy_version") or "phase2.v1")
+        policy_source_key = str(runtime_policy.get("policy_source_key") or "config")
+        selected_policy_set_ids = runtime_policy.get("selected_policy_set_ids", [])
+        selected_policy_set_ids = selected_policy_set_ids if isinstance(selected_policy_set_ids, list) else []
+        policy_ref = "|".join(selected_policy_set_ids) if selected_policy_set_ids else "-"
+        intent_key = f"{contract_id}|{intent_type}|{as_of_date}|{policy_version}|{policy_source_key}|{policy_ref}|dry={1 if dry_run else 0}"
+        policy_metadata = {
+            "policy_version": policy_version,
+            "policy_source_key": policy_source_key,
+            "policy_source": str(runtime_policy.get("source") or "config"),
+            "selected_policy_set_ids": selected_policy_set_ids,
+        }
+        with self.repo.transaction() as conn:
+            intent_row = self.repo.create_or_get_action_intent(
+                conn,
+                autonomy_run_id=autonomy_run_id,
+                intent_type=intent_type,
+                contract_id=contract_id,
+                delivery_id=None,
+                planned_delivery_id=None,
+                as_of_date=as_of_date,
+                scheduled_at=None,
+                policy_version=policy_version,
+                payload={"intent_type": intent_type, "policy": policy_metadata},
+                idempotency_key=intent_key,
+            )
+            self.repo.append_event(
+                conn,
+                entity_type="ACTION_INTENT",
+                entity_id=str(intent_row["action_intent_id"]),
+                event_type="INTENT_CREATED",
+                as_of_date=as_of_date,
+                payload={"intent_type": intent_type, "contract_id": contract_id, "policy": policy_metadata},
+                source="run-autonomy",
+            )
+
+        required_gates = self._intent_gate_requirements(intent_type)
+        blocking_gate = next((gate for gate in required_gates if gates.get(gate, {}).get("status") == "FAIL"), None)
+        if blocking_gate:
+            case_key = f"{contract_id}|{intent_type}|{blocking_gate}|{as_of_date}"
+            with self.repo.transaction() as conn:
+                self.repo.set_action_intent_status(
+                    conn,
+                    action_intent_id=str(intent_row["action_intent_id"]),
+                    status="BLOCKED",
+                )
+                case_row = self.repo.create_or_get_exception_case(
+                    conn,
+                    autonomy_run_id=autonomy_run_id,
+                    action_intent_id=str(intent_row["action_intent_id"]),
+                    contract_id=contract_id,
+                    delivery_id=None,
+                    planned_delivery_id=None,
+                    case_type="gate_block",
+                    severity="BLOCKER",
+                    reason_code="gate_failed",
+                    details={
+                        "gate_name": blocking_gate,
+                        "intent_type": intent_type,
+                        "as_of_date": as_of_date,
+                    },
+                    idempotency_key=case_key,
+                )
+                self.repo.append_event(
+                    conn,
+                    entity_type="EXCEPTION_CASE",
+                    entity_id=str(case_row["exception_case_id"]),
+                    event_type="CASE_OPENED",
+                    as_of_date=as_of_date,
+                    payload={"gate_name": blocking_gate, "intent_type": intent_type},
+                    source="run-autonomy",
+                )
+                self.repo.add_action_execution(
+                    conn,
+                    action_intent_id=str(intent_row["action_intent_id"]),
+                    status="BLOCKED",
+                    idempotency_key=f"{intent_row['action_intent_id']}|blocked|{as_of_date}",
+                    request_payload={"intent_type": intent_type, "contract_id": contract_id, "policy": policy_metadata},
+                    response_payload={"blocked_by_gate": blocking_gate, "policy": policy_metadata},
+                    error_payload={"reason": "Gate failed"},
+                )
+            return {
+                "intent_type": intent_type,
+                "status": "BLOCKED",
+                "blocked_by_gate": blocking_gate,
+                "action_intent_id": intent_row["action_intent_id"],
+            }
+
+        request_payload = {
+            "contract_id": contract_id,
+            "as_of_date": as_of_date,
+            "dry_run": dry_run,
+            "policy": policy_metadata,
+        }
+        status = "SUCCESS"
+        response_payload: dict[str, Any] = {}
+        error_payload: dict[str, Any] | None = None
+        try:
+            response_payload = self._execute_intent_logic(
+                intent_type=intent_type,
+                contract_id=contract_id,
+                as_of_date=as_of_date,
+                dry_run=dry_run,
+                autonomy_run_id=autonomy_run_id,
+                action_intent_id=str(intent_row["action_intent_id"]),
+                runtime_policy=runtime_policy,
+            )
+            if bool(response_payload.get("blocked")):
+                status = "BLOCKED"
+            elif str(response_payload.get("status") or "").upper() == "SKIPPED":
+                status = "SKIPPED"
+            elif response_payload.get("ok") is False:
+                status = "FAILED"
+        except Exception as error:
+            status = "FAILED"
+            error_payload = {"message": str(error)}
+            response_payload = {"ok": False, "error": str(error)}
+
+        with self.repo.transaction() as conn:
+            intent_status = {
+                "SUCCESS": "EXECUTED",
+                "SKIPPED": "SKIPPED",
+                "FAILED": "FAILED",
+                "BLOCKED": "BLOCKED",
+            }.get(status, "FAILED")
+            self.repo.set_action_intent_status(
+                conn,
+                action_intent_id=str(intent_row["action_intent_id"]),
+                status=intent_status,
+            )
+            self.repo.add_action_execution(
+                conn,
+                action_intent_id=str(intent_row["action_intent_id"]),
+                status=status,
+                idempotency_key=f"{intent_row['action_intent_id']}|{status.lower()}|{as_of_date}",
+                request_payload=request_payload,
+                response_payload=response_payload,
+                error_payload=error_payload,
+            )
+            event_type = "INTENT_EXECUTED" if status in {"SUCCESS", "SKIPPED"} else "INTENT_FAILED"
+            self.repo.append_event(
+                conn,
+                entity_type="ACTION_INTENT",
+                entity_id=str(intent_row["action_intent_id"]),
+                event_type=event_type,
+                as_of_date=as_of_date,
+                payload={"intent_type": intent_type, "status": status, "policy": policy_metadata},
+                source="run-autonomy",
+            )
+            if status in {"FAILED", "BLOCKED"}:
+                case_key = f"{contract_id}|{intent_type}|{status}|{as_of_date}"
+                case_row = self.repo.create_or_get_exception_case(
+                    conn,
+                    autonomy_run_id=autonomy_run_id,
+                    action_intent_id=str(intent_row["action_intent_id"]),
+                    contract_id=contract_id,
+                    delivery_id=None,
+                    planned_delivery_id=None,
+                    case_type="intent_failure",
+                    severity="BLOCKER" if status == "BLOCKED" else "REVIEW",
+                    reason_code="intent_failed",
+                    details={
+                        "intent_type": intent_type,
+                        "status": status,
+                        "response": response_payload,
+                        "as_of_date": as_of_date,
+                    },
+                    idempotency_key=case_key,
+                )
+                self.repo.append_event(
+                    conn,
+                    entity_type="EXCEPTION_CASE",
+                    entity_id=str(case_row["exception_case_id"]),
+                    event_type="CASE_OPENED",
+                    as_of_date=as_of_date,
+                    payload={"intent_type": intent_type, "status": status},
+                    source="run-autonomy",
+                )
+
+        return {
+            "intent_type": intent_type,
+            "status": status,
+            "response": response_payload,
+            "action_intent_id": intent_row["action_intent_id"],
+        }
+
+    def _execute_intent_logic(
+        self,
+        *,
+        intent_type: str,
+        contract_id: str,
+        as_of_date: str,
+        dry_run: bool,
+        autonomy_run_id: str,
+        action_intent_id: str,
+        runtime_policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        if intent_type == "plan_deliveries":
+            existing = self.repo.fetch_one(
+                "SELECT COUNT(*) AS cnt FROM planned_deliveries WHERE contract_id = ?",
+                (contract_id,),
+            )
+            if int((existing or {"cnt": 0})["cnt"] or 0) > 0:
+                return {"ok": True, "status": "SKIPPED", "reason": "already_planned"}
+            if dry_run:
+                return {"ok": True, "planned_count": 0, "status": "SUCCESS", "dry_run": True}
+            policy = runtime_policy.get("policy", {}) if isinstance(runtime_policy.get("policy"), dict) else {}
+            planning_cfg = policy.get("planning", {}) if isinstance(policy.get("planning"), dict) else {}
+            cadence = str(planning_cfg.get("default_cadence") or "daily").strip().lower()
+            if cadence not in {"daily", "manual"}:
+                cadence = "daily"
+            max_lots_per_day = int(planning_cfg.get("default_max_lots_per_day", 1))
+            if max_lots_per_day <= 0:
+                max_lots_per_day = 1
+            planned = self.phase1.plan_deliveries(
+                contract_id=contract_id,
+                start_date=as_of_date,
+                cadence=cadence,
+                max_lots_per_day=max_lots_per_day,
+            )
+            return {
+                "ok": True,
+                "planned_count": planned.get("planned_count", 0),
+                "status": "SUCCESS",
+                "policy": {
+                    "policy_version": runtime_policy.get("policy_version"),
+                    "policy_source_key": runtime_policy.get("policy_source_key"),
+                },
+            }
+        if intent_type == "materialize_due":
+            if dry_run:
+                return {"ok": True, "status": "SUCCESS", "processed_count": 0, "dry_run": True}
+            result = self.phase1.materialize_due_deliveries(
+                contract_id=contract_id,
+                as_of_date=as_of_date,
+                auto_progress=True,
+                auto_record_coa=True,
+                auto_generate_pack=False,
+                allow_placeholder_tin=True,
+            )
+            if not result.get("ok", False):
+                return {"ok": False, "blocked": True, "status": "FAILED", "error": result.get("error")}
+            processed_rows = result.get("processed", [])
+            transport = self._apply_transport_intelligence(
+                autonomy_run_id=autonomy_run_id,
+                action_intent_id=action_intent_id,
+                contract_id=contract_id,
+                as_of_date=as_of_date,
+                processed_rows=processed_rows if isinstance(processed_rows, list) else [],
+            )
+            if transport.get("blocked"):
+                return {
+                    "ok": False,
+                    "blocked": True,
+                    "status": "FAILED",
+                    "error": transport.get("error"),
+                    "transport": transport,
+                }
+            return {
+                "ok": True,
+                "status": "SUCCESS",
+                "processed_count": len(processed_rows) if isinstance(processed_rows, list) else 0,
+                "transport": transport,
+                "policy": {
+                    "policy_version": runtime_policy.get("policy_version"),
+                    "policy_source_key": runtime_policy.get("policy_source_key"),
+                },
+            }
+        if intent_type == "auto_progress":
+            row = self.repo.fetch_one(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM deliveries
+                WHERE contract_id = ? AND status IN ('DISPATCHED', 'DELIVERED', 'INVOICED', 'PAID')
+                """,
+                (contract_id,),
+            )
+            return {"ok": True, "status": "SUCCESS", "deliveries_progressed": int((row or {"cnt": 0})["cnt"] or 0)}
+        if intent_type == "generate_pack":
+            delivery_rows = self.repo.fetch_all(
+                """
+                SELECT d.delivery_id
+                FROM deliveries d
+                LEFT JOIN documents inv
+                  ON inv.delivery_id = d.delivery_id AND inv.doc_type = 'INVOICE' AND inv.status = 'ACTIVE'
+                WHERE d.contract_id = ? AND d.status = 'DELIVERED' AND inv.doc_id IS NULL
+                ORDER BY d.delivery_date ASC, d.delivery_id ASC
+                """,
+                (contract_id,),
+            )
+            if not delivery_rows:
+                return {"ok": True, "status": "SKIPPED", "reason": "no_pending_delivered_items"}
+            if dry_run:
+                return {"ok": True, "status": "SUCCESS", "generated_count": len(delivery_rows), "dry_run": True}
+            generated = 0
+            for row in delivery_rows:
+                self.phase1.generate_pack(
+                    delivery_id=str(row["delivery_id"]),
+                    allow_placeholder_tin=True,
+                    skip_pdf=False,
+                    original_docs=[],
+                )
+                generated += 1
+            return {"ok": True, "status": "SUCCESS", "generated_count": generated}
+        if intent_type == "apply_payment":
+            return {"ok": True, "status": "SKIPPED", "reason": "no_payment_feed"}
+        return {"ok": True, "status": "SKIPPED", "reason": "unknown_intent"}
 
     def _stage_resolve_entities(self, context: dict[str, Any]) -> None:
         payload = context["normalized"]
@@ -554,6 +1838,7 @@ class AutomationOrchestrator:
                         planned_delivery_id=planned_delivery_id,
                         run_id=run_override,
                         batch_id=batch_override,
+                        as_of_date=as_of_date,
                     )
                     self.phase1.mark_dispatched(str(delivery["delivery_id"]))
                     self.phase1.mark_delivered(str(delivery["delivery_id"]))

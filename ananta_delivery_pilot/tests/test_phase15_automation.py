@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from adapters.sqlite_repo import SQLiteRepo
@@ -149,6 +150,13 @@ class Phase15AutomationTests(unittest.TestCase):
         self.assertEqual(2, len(deliveries))
         packs = result["results"].get("packs") or []
         self.assertEqual(2, len(packs))
+
+    def test_auto_run_refreshes_state_before_stages(self) -> None:
+        payload = self._base_payload("STP-REFRESH-001")
+        payload["coa_results"] = self._full_coa_rows("buyer_nycil", "RBDSO")
+        with patch.object(self.phase1, "refresh_contract_state", wraps=self.phase1.refresh_contract_state) as refresh_mock:
+            self.orchestrator.auto_run(payload, as_of_date="2026-03-31", dry_run=True)
+        refresh_mock.assert_called_once_with(as_of_date="2026-03-31")
 
 
 if __name__ == "__main__":

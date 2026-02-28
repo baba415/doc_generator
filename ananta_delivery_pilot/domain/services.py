@@ -48,14 +48,12 @@ class Phase1Service:
         cadence_norm = (cadence or "daily").strip().lower()
         if cadence_norm not in {"daily", "manual"}:
             raise ValueError("cadence must be daily or manual")
-        policy = self.config.delivery_policies or {}
-        planning_cfg = policy.get("planning", {}) if isinstance(policy.get("planning"), dict) else {}
-        include_weekends = bool(planning_cfg.get("include_weekends", True))
-        if max_lots_per_day is None:
-            max_lots_per_day = int(planning_cfg.get("default_max_lots_per_day", 1))
-        if max_lots_per_day <= 0:
-            raise ValueError("max_lots_per_day must be >= 1")
-        policy_version = str(policy.get("policy_version") or policy.get("schema_version") or "phase1_6.v1")
+        fallback_policy = self.config.delivery_policies or {}
+        fallback_version = str(
+            fallback_policy.get("policy_version")
+            or fallback_policy.get("schema_version")
+            or "phase1_6.v1"
+        )
         start_value = (start_date or "").strip()
         with self.repo.transaction() as conn:
             contract = conn.execute("SELECT * FROM contracts WHERE contract_id = ?", (contract_id,)).fetchone()
@@ -65,7 +63,25 @@ class Phase1Service:
             if str(contract.get("lpo_state") or "ACTIVE").upper() in {"CANCELLED", "EXPIRED"}:
                 raise ValueError("Cannot plan deliveries for CANCELLED/EXPIRED contract")
             start_iso = start_value or str(contract.get("lpo_valid_from") or contract.get("issue_date") or utc_today_iso())
-            idempotency_key = f"{contract_id}|{start_iso}|{cadence_norm}|{max_lots_per_day}|{policy_version}"
+            runtime_policy = self.repo.resolve_policy_runtime(
+                as_of_date=start_iso,
+                contract_id=contract_id,
+                master_contract_id=str(contract.get("master_contract_id") or "").strip() or None,
+                buyer_id=str(contract.get("buyer_id") or "").strip() or None,
+                fallback_policy=fallback_policy,
+                fallback_version=fallback_version,
+            )
+            policy = runtime_policy.get("policy", {})
+            policy = policy if isinstance(policy, dict) else {}
+            planning_cfg = policy.get("planning", {}) if isinstance(policy.get("planning"), dict) else {}
+            include_weekends = bool(planning_cfg.get("include_weekends", True))
+            if max_lots_per_day is None:
+                max_lots_per_day = int(planning_cfg.get("default_max_lots_per_day", 1))
+            if max_lots_per_day <= 0:
+                raise ValueError("max_lots_per_day must be >= 1")
+            policy_version = str(runtime_policy.get("policy_version") or fallback_version)
+            policy_source_key = str(runtime_policy.get("policy_source_key") or f"config:{fallback_version}")
+            idempotency_key = f"{contract_id}|{start_iso}|{cadence_norm}|{max_lots_per_day}|{policy_version}|{policy_source_key}"
             existing = self.repo.find_idempotent_response(conn, command_name="plan-deliveries", idempotency_key=idempotency_key)
             if existing:
                 return existing
@@ -164,7 +180,7 @@ class Phase1Service:
                     )
                     total_planned_kg += int(qty_kg)
                     lots_used_today += 1
-            tolerance_pct = float(contract.get("over_delivery_tolerance_pct") or 5.0)
+            tolerance_pct = self._resolve_planning_tolerance_pct(contract=contract, runtime_policy=policy)
             expected_contract_kg = 0
             for line in lines:
                 expected_contract_kg += int(line.get("expected_qty_kg") or 0)
@@ -177,6 +193,9 @@ class Phase1Service:
                 "ok": True,
                 "contract_id": contract_id,
                 "policy_version": policy_version,
+                "policy_source": str(runtime_policy.get("source") or "config"),
+                "policy_source_key": policy_source_key,
+                "policy_set_ids": [row.get("policy_set_id") for row in runtime_policy.get("selected_sets", []) if row.get("policy_set_id")],
                 "cadence": cadence_norm,
                 "start_date": start_iso,
                 "max_lots_per_day": max_lots_per_day,
@@ -193,6 +212,24 @@ class Phase1Service:
             )
             return response
 
+    def _resolve_planning_tolerance_pct(
+        self,
+        *,
+        contract: dict[str, Any],
+        runtime_policy: dict[str, Any],
+    ) -> float:
+        planning_cfg = runtime_policy.get("planning", {}) if isinstance(runtime_policy.get("planning"), dict) else {}
+        if planning_cfg.get("tolerance_pct") not in (None, ""):
+            return float(planning_cfg["tolerance_pct"])
+        over_cfg = runtime_policy.get("over_delivery", {}) if isinstance(runtime_policy.get("over_delivery"), dict) else {}
+        buyer_overrides = over_cfg.get("buyer_overrides", {}) if isinstance(over_cfg.get("buyer_overrides"), dict) else {}
+        buyer_id = str(contract.get("buyer_id") or "").strip()
+        if buyer_id and buyer_id in buyer_overrides:
+            return float(buyer_overrides[buyer_id])
+        if over_cfg.get("global_default_tolerance_pct") not in (None, ""):
+            return float(over_cfg["global_default_tolerance_pct"])
+        return float(contract.get("over_delivery_tolerance_pct") or 5.0)
+
     def materialize_delivery(
         self,
         *,
@@ -200,7 +237,10 @@ class Phase1Service:
         run_id: str | None = None,
         batch_id: str | None = None,
         qty_mt: float | None = None,
+        as_of_date: str | None = None,
     ) -> dict[str, Any]:
+        refresh_date = str(as_of_date or utc_today_iso()).strip()
+        self.refresh_contract_state(as_of_date=refresh_date)
         idempotency_key = str(planned_delivery_id)
         with self.repo.transaction() as conn:
             existing = self.repo.find_idempotent_response(
@@ -1003,6 +1043,259 @@ class Phase1Service:
             "exports": exports,
         }
 
+    def command_center_rows(self, *, as_of_date: str, limit: int = 200) -> list[dict[str, Any]]:
+        self.repo.set_as_of_date(as_of_date)
+        rows = self.repo.fetch_all(
+            """
+            WITH delivery_agg AS (
+              SELECT
+                contract_id,
+                COALESCE(SUM(delivered_qty_kg), 0) AS delivered_qty_kg,
+                SUM(CASE WHEN status = 'DELIVERED' THEN 1 ELSE 0 END) AS delivered_not_invoiced
+              FROM deliveries
+              GROUP BY contract_id
+            ),
+            plan_agg AS (
+              SELECT
+                contract_id,
+                SUM(CASE WHEN status IN ('PLANNED', 'SCHEDULED') THEN 1 ELSE 0 END) AS open_planned_lots,
+                SUM(
+                  CASE
+                    WHEN status IN ('PLANNED', 'SCHEDULED') AND planned_date <= ?
+                      THEN 1
+                    ELSE 0
+                  END
+                ) AS due_planned_lots
+              FROM planned_deliveries
+              GROUP BY contract_id
+            ),
+            outstanding_agg AS (
+              SELECT
+                contract_id,
+                COALESCE(SUM(outstanding_balance), 0) AS outstanding_total
+              FROM drep_outstanding_payments
+              GROUP BY contract_id
+            ),
+            exception_agg AS (
+              SELECT
+                contract_id,
+                COUNT(*) AS needs_decision_count
+              FROM exception_cases
+              WHERE status = 'OPEN'
+              GROUP BY contract_id
+            )
+            SELECT
+              c.contract_id,
+              c.contract_ref,
+              c.lpo_no,
+              c.lpo_state,
+              c.status,
+              c.issue_date,
+              c.buyer_id,
+              c.vendor_of_record_id,
+              c.expected_total_qty_kg,
+              COALESCE(d.delivered_qty_kg, 0) AS delivered_qty_kg,
+              COALESCE(p.open_planned_lots, 0) AS open_planned_lots,
+              COALESCE(p.due_planned_lots, 0) AS due_planned_lots,
+              COALESCE(d.delivered_not_invoiced, 0) AS delivered_not_invoiced,
+              COALESCE(o.outstanding_total, 0) AS outstanding_total,
+              COALESCE(e.needs_decision_count, 0) AS needs_decision_count
+            FROM contracts c
+            LEFT JOIN delivery_agg d ON d.contract_id = c.contract_id
+            LEFT JOIN plan_agg p ON p.contract_id = c.contract_id
+            LEFT JOIN outstanding_agg o ON o.contract_id = c.contract_id
+            LEFT JOIN exception_agg e ON e.contract_id = c.contract_id
+            WHERE c.status IN ('OPEN', 'PARTIAL')
+            ORDER BY c.issue_date DESC, c.created_at DESC
+            LIMIT ?
+            """,
+            (as_of_date, limit),
+        )
+        for row in rows:
+            next_action = "Run Recommended"
+            if int(row.get("needs_decision_count") or 0) > 0:
+                next_action = "Needs Decision"
+            elif str(row.get("lpo_state") or "").upper() != "ACTIVE":
+                next_action = "Review LPO State"
+            elif int(row.get("delivered_not_invoiced") or 0) > 0 or int(row.get("due_planned_lots") or 0) > 0:
+                next_action = "Run Recommended"
+            elif float(row.get("outstanding_total") or 0.0) > 0:
+                next_action = "Settle"
+            row["next_action"] = next_action
+        return rows
+
+    def run_recommended_cycle(
+        self,
+        *,
+        contract_id: str,
+        as_of_date: str,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        from domain.automation import AutomationOrchestrator
+
+        steps: list[dict[str, Any]] = []
+        refresh = self.refresh_contract_state(as_of_date=as_of_date)
+        steps.append(
+            {
+                "step": "refresh_contract_state",
+                "status": "SUCCESS",
+                "details": {"as_of_date": as_of_date, "updated": refresh.get("updated", 0)},
+            }
+        )
+        contract = self.repo.fetch_one("SELECT * FROM contracts WHERE contract_id = ?", (contract_id,))
+        if not contract:
+            raise ValueError(f"Unknown contract_id: {contract_id}")
+        lpo_state = str(contract.get("lpo_state") or "ACTIVE").upper()
+        if lpo_state != "ACTIVE":
+            steps.append(
+                {
+                    "step": "contract_state_gate",
+                    "status": "BLOCKED",
+                    "details": {"lpo_state": lpo_state},
+                }
+            )
+            return {
+                "ok": False,
+                "contract_id": contract_id,
+                "as_of_date": as_of_date,
+                "autonomy_run_id": None,
+                "steps": steps,
+                "case_ids": [
+                    str(row["exception_case_id"])
+                    for row in self.repo.list_exception_cases(status="OPEN")
+                    if str(row.get("contract_id") or "") == contract_id
+                ],
+            }
+
+        orchestrator = AutomationOrchestrator(self.config, self.repo, self)
+        autonomy = orchestrator.run_autonomy(
+            as_of_date=as_of_date,
+            contract_id=contract_id,
+            dry_run=dry_run,
+        )
+        steps.append(
+            {
+                "step": "run_autonomy",
+                "status": "SUCCESS" if autonomy.get("ok") else "FAILED",
+                "details": autonomy.get("summary", {}),
+            }
+        )
+
+        export_dir = (
+            self.config.state_dir
+            / "exports"
+            / "command_center"
+            / as_of_date
+            / contract_id
+        )
+        export = self.export_drep(as_of_date=as_of_date, out_dir=export_dir)
+        steps.append(
+            {
+                "step": "export_drep",
+                "status": "SUCCESS" if export.get("ok") else "FAILED",
+                "details": {"export_count": len(export.get("exports", [])), "out_dir": str(export_dir)},
+            }
+        )
+
+        open_cases = [
+            row
+            for row in self.repo.list_exception_cases(status="OPEN")
+            if str(row.get("contract_id") or "") == contract_id
+        ]
+        if open_cases:
+            steps.append(
+                {
+                    "step": "exceptions",
+                    "status": "BLOCKED",
+                    "details": {"open_cases": len(open_cases)},
+                }
+            )
+        return {
+            "ok": len(open_cases) == 0,
+            "contract_id": contract_id,
+            "as_of_date": as_of_date,
+            "autonomy_run_id": autonomy.get("autonomy_run_id"),
+            "steps": steps,
+            "case_ids": [str(row["exception_case_id"]) for row in open_cases],
+            "export_dir": str(export_dir),
+        }
+
+    def command_center_timeline(
+        self,
+        *,
+        autonomy_run_id: str,
+        contract_id: str,
+    ) -> list[dict[str, Any]]:
+        rows = self.repo.fetch_all(
+            """
+            SELECT
+              ai.action_intent_id,
+              ai.intent_type,
+              ai.status AS intent_status,
+              ai.created_at,
+              ai.policy_version,
+              ae.status AS execution_status,
+              ae.response_json,
+              ae.error_json
+            FROM action_intents ai
+            LEFT JOIN action_executions ae
+              ON ae.action_intent_id = ai.action_intent_id
+             AND ae.execution_no = (
+               SELECT MAX(ex2.execution_no)
+               FROM action_executions ex2
+               WHERE ex2.action_intent_id = ai.action_intent_id
+             )
+            WHERE ai.autonomy_run_id = ?
+              AND ai.contract_id = ?
+            ORDER BY ai.created_at ASC, ai.action_intent_id ASC
+            """,
+            (autonomy_run_id, contract_id),
+        )
+        timeline: list[dict[str, Any]] = []
+        for row in rows:
+            response_json = row.get("response_json")
+            error_json = row.get("error_json")
+            try:
+                response = json.loads(response_json or "{}")
+            except Exception:
+                response = {}
+            try:
+                error = json.loads(error_json or "{}") if error_json else {}
+            except Exception:
+                error = {"raw": str(error_json)}
+            timeline.append(
+                {
+                    "intent_type": str(row.get("intent_type") or ""),
+                    "intent_status": str(row.get("intent_status") or ""),
+                    "execution_status": str(row.get("execution_status") or ""),
+                    "policy_version": str(row.get("policy_version") or ""),
+                    "response": response,
+                    "error": error,
+                    "created_at": str(row.get("created_at") or ""),
+                }
+            )
+        return timeline
+
+    def decide_exception_case(
+        self,
+        *,
+        case_id: str,
+        decision: str,
+        reason: str,
+        resume: bool,
+        dry_run_resume: bool,
+    ) -> dict[str, Any]:
+        from domain.automation import AutomationOrchestrator
+
+        orchestrator = AutomationOrchestrator(self.config, self.repo, self)
+        return orchestrator.decide_case(
+            case_id=case_id,
+            decision=decision,
+            reason=reason,
+            resume=resume,
+            dry_run_resume=dry_run_resume,
+        )
+
     def dashboard_rows(self, *, limit: int = 100) -> dict[str, list[dict[str, Any]]]:
         contracts = self.repo.fetch_all(
             """
@@ -1247,6 +1540,8 @@ class Phase1Service:
         original_docs: list[str] | None = None,
     ) -> dict[str, Any]:
         original_docs = original_docs or []
+        refresh_date = str(as_of_date or utc_today_iso()).strip()
+        self.refresh_contract_state(as_of_date=refresh_date)
         contract = self.repo.fetch_one("SELECT * FROM contracts WHERE contract_id = ?", (contract_id,))
         if not contract:
             raise ValueError(f"Unknown contract_id: {contract_id}")
@@ -1261,7 +1556,7 @@ class Phase1Service:
               AND planned_date <= ?
             ORDER BY planned_date ASC, sequence_no ASC
             """,
-            (contract_id, as_of_date),
+            (contract_id, refresh_date),
         )
         if not due_rows:
             return {"ok": True, "contract_id": contract_id, "processed": [], "message": "No due planned deliveries"}
@@ -1275,6 +1570,7 @@ class Phase1Service:
                     run_id=run_id,
                     batch_id=batch_id,
                     qty_mt=None,
+                    as_of_date=refresh_date,
                 )
                 entry: dict[str, Any] = {"planned_delivery_id": planned_delivery_id, "materialize": materialized}
                 delivery_id = str(materialized["delivery_id"])

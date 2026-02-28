@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from adapters.sqlite_repo import SQLiteRepo
@@ -87,9 +88,8 @@ class Phase16PlanningTests(unittest.TestCase):
         contract_id = self._create_bulk_contract(qty_mt=30.0, lpo_valid_to="2026-02-23")
         plan = self.service.plan_deliveries(contract_id=contract_id, start_date="2026-02-23", cadence="daily", max_lots_per_day=1)
         planned_delivery_id = str(plan["planned_deliveries"][0]["planned_delivery_id"])
-        self.service.refresh_contract_state(as_of_date="2026-02-24")
         with self.assertRaises(ValueError):
-            self.service.materialize_delivery(planned_delivery_id=planned_delivery_id)
+            self.service.materialize_delivery(planned_delivery_id=planned_delivery_id, as_of_date="2026-02-24")
 
     def test_tolerance_hierarchy_contract_overrides_buyer_default(self) -> None:
         contract_default = self._create_bulk_contract(qty_mt=30.0, tolerance_pct=None)
@@ -123,6 +123,25 @@ class Phase16PlanningTests(unittest.TestCase):
         self.assertEqual(2, len(rows))
         self.assertEqual("DELIVERED", rows[0]["status"])
         self.assertEqual("DELIVERED", rows[1]["status"])
+
+    def test_materialize_due_propagates_as_of_to_per_row_materialization(self) -> None:
+        contract_id = self._create_bulk_contract(qty_mt=150.0)
+        self.service.plan_deliveries(contract_id=contract_id, start_date="2026-02-23", cadence="daily", max_lots_per_day=2)
+        target_as_of = "2026-02-23"
+        with patch.object(self.service, "refresh_contract_state", wraps=self.service.refresh_contract_state) as refresh_mock:
+            result = self.service.materialize_due_deliveries(
+                contract_id=contract_id,
+                as_of_date=target_as_of,
+                auto_progress=False,
+                auto_record_coa=False,
+                auto_generate_pack=False,
+            )
+        self.assertTrue(result["ok"])
+        due_count = len(result.get("processed") or [])
+        self.assertEqual(2, due_count)
+        self.assertGreaterEqual(len(refresh_mock.call_args_list), due_count + 1)
+        for call in refresh_mock.call_args_list:
+            self.assertEqual(target_as_of, call.kwargs.get("as_of_date"))
 
     def test_unit_price_basis_mt_computes_gross_deterministically(self) -> None:
         payload = {

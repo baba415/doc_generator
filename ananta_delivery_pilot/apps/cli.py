@@ -32,6 +32,10 @@ def phase1_commands() -> set[str]:
         "auto-run",
         "exceptions",
         "auto-resume",
+        "run-autonomy",
+        "list-cases",
+        "decide-case",
+        "autonomy-metrics",
     }
 
 
@@ -119,6 +123,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     auto_resume = subparsers.add_parser("auto-resume", help="Resume automation run after resolving exceptions")
     auto_resume.add_argument("--run-id", required=True)
+
+    run_autonomy = subparsers.add_parser("run-autonomy", help="Run Phase2 autonomy cycle")
+    run_autonomy.add_argument("--as-of", required=True)
+    run_autonomy.add_argument("--contract-id", default="")
+    run_autonomy.add_argument("--dry-run", action="store_true")
+
+    list_cases = subparsers.add_parser("list-cases", help="List Phase2 exception cases")
+    list_cases.add_argument("--status", default="OPEN")
+
+    decide_case = subparsers.add_parser("decide-case", help="Decide and optionally resume a Phase2 exception case")
+    decide_case.add_argument("--case-id", required=True)
+    decide_case.add_argument("--decision", required=True, choices=["APPROVE", "REJECT", "OVERRIDE"])
+    decide_case.add_argument("--reason", required=True)
+    decide_case.add_argument("--user-id", default="")
+    decide_case.add_argument("--no-resume", action="store_true")
+    decide_case.add_argument("--dry-run-resume", action="store_true")
+
+    autonomy_metrics = subparsers.add_parser("autonomy-metrics", help="Export Phase2 autonomy metrics snapshot")
+    autonomy_metrics.add_argument("--as-of", required=True)
+    autonomy_metrics.add_argument("--out-dir", default="")
 
     return parser
 
@@ -273,6 +297,45 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "auto-resume":
         orchestrator = _automation(root_dir)
         result = orchestrator.auto_resume(str(args.run_id))
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "run-autonomy":
+        orchestrator = _automation(root_dir)
+        result = orchestrator.run_autonomy(
+            as_of_date=str(args.as_of),
+            contract_id=str(args.contract_id or "").strip() or None,
+            dry_run=bool(args.dry_run),
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "list-cases":
+        orchestrator = _automation(root_dir)
+        result = orchestrator.list_cases(status=str(args.status))
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "decide-case":
+        orchestrator = _automation(root_dir)
+        result = orchestrator.decide_case(
+            case_id=str(args.case_id),
+            decision=str(args.decision),
+            reason=str(args.reason),
+            user_id=str(args.user_id or "").strip() or None,
+            resume=not bool(args.no_resume),
+            dry_run_resume=bool(args.dry_run_resume),
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "autonomy-metrics":
+        orchestrator = _automation(root_dir)
+        out_dir = Path(args.out_dir).expanduser() if args.out_dir else (root_dir / ".state" / "automation_metrics")
+        result = orchestrator.autonomy_metrics(
+            as_of_date=str(args.as_of),
+            out_dir=out_dir,
+        )
         print(json.dumps(result, indent=2))
         return
 

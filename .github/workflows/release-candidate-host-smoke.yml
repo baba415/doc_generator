@@ -1,0 +1,41 @@
+name: release-candidate-host-smoke
+
+on:
+  pull_request:
+    paths:
+      - "ananta_delivery_pilot/**"
+      - ".github/workflows/release-candidate-host-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  host-ui-smoke:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ananta_delivery_pilot
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run host UI smoke
+        run: |
+          OUT_DIR="$GITHUB_WORKSPACE/ananta_delivery_pilot/.state/phase2-proof/pr5/ci-host-smoke-${GITHUB_RUN_ID}"
+          ./scripts/host_ui_smoke.sh 8865 "$OUT_DIR"
+
+      - name: Upload host smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-ui-smoke-${{ github.run_id }}
+          path: |
+            ananta_delivery_pilot/.state/phase2-proof/pr5/ci-host-smoke-${{ github.run_id }}

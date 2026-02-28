@@ -72,7 +72,7 @@ echo "    With PDF: $WITH_PDF"
 echo "    Export as-of: $AS_OF_DATE"
 
 echo "==> 1) Tests"
-python3 -m unittest discover -s tests -p "test_*.py" | tee "$RUN_DIR/tests.log"
+./scripts/test_default.sh | tee "$RUN_DIR/tests.log"
 
 echo "==> 2) Legacy smoke (validate)"
 python3 run.py validate --transaction data/sample_transaction_contract_processing.json > "$RUN_DIR/legacy_validate.json"
