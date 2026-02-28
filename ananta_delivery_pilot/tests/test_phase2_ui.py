@@ -357,6 +357,9 @@ class Phase2UiRouteTests(unittest.TestCase):
         proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
         try:
             _wait_for_route(port, "/v2/exceptions")
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/v2/exceptions", timeout=3) as response:
+                inbox_html = response.read().decode("utf-8")
+            self.assertIn("Consequence Preview", inbox_html)
             body = _post_form(
                 port=port,
                 path="/v2/exceptions/decide",

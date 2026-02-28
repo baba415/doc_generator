@@ -241,19 +241,23 @@ class AutomationOrchestrator:
         normalized_decision = str(decision).strip().upper()
         if normalized_decision not in {"APPROVE", "REJECT", "OVERRIDE"}:
             raise ValueError("decision must be APPROVE, REJECT, or OVERRIDE")
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("reason is required")
         case = self.repo.get_exception_case(case_id)
         if not case:
             raise ValueError(f"Unknown case_id: {case_id}")
-        idempotency_key = f"{case_id}|{normalized_decision}|{reason.strip()}"
+        idempotency_key = f"{case_id}|{normalized_decision}|{normalized_reason}"
         case_details = json.loads(case.get("details_json") or "{}")
         suggestion_ids = case_details.get("suggestion_ids") if isinstance(case_details.get("suggestion_ids"), list) else []
+        case_as_of = str(case_details.get("as_of_date") or utc_now_iso_z()[:10])
         with self.repo.transaction() as conn:
             decision_row = self.repo.add_human_decision(
                 conn,
                 exception_case_id=case_id,
                 user_id=user_id,
                 decision=normalized_decision,
-                reason=reason,
+                reason=normalized_reason,
                 payload={"resume": resume, "dry_run_resume": dry_run_resume},
                 idempotency_key=idempotency_key,
             )
@@ -267,7 +271,7 @@ class AutomationOrchestrator:
                 as_of_date=None,
                 payload={
                     "decision": normalized_decision,
-                    "reason": reason,
+                    "reason": normalized_reason,
                     "status": case_status,
                     "decision_id": decision_row["human_decision_id"],
                 },
@@ -292,20 +296,66 @@ class AutomationOrchestrator:
                 outcome_label="APPROVED" if normalized_decision in {"APPROVE", "OVERRIDE"} else "REJECTED",
                 outcome_payload={
                     "decision": normalized_decision,
-                    "reason": reason,
+                    "reason": normalized_reason,
                     "case_type": case.get("case_type"),
                     "reason_code": case.get("reason_code"),
                 },
             )
+            if resume and normalized_decision in {"APPROVE", "OVERRIDE"} and case.get("contract_id"):
+                self.repo.append_event(
+                    conn,
+                    entity_type="EXCEPTION_CASE",
+                    entity_id=case_id,
+                    event_type="CASE_RESUME_REQUESTED",
+                    as_of_date=case_as_of,
+                    payload={
+                        "decision": normalized_decision,
+                        "dry_run_resume": bool(dry_run_resume),
+                        "contract_id": str(case.get("contract_id") or ""),
+                    },
+                    source="decide-case",
+                )
         resume_result: dict[str, Any] | None = None
         if resume and normalized_decision in {"APPROVE", "OVERRIDE"} and case.get("contract_id"):
-            details = json.loads(case.get("details_json") or "{}")
-            case_as_of = str(details.get("as_of_date") or utc_now_iso_z()[:10])
-            resume_result = self.run_autonomy(
-                as_of_date=case_as_of,
-                contract_id=str(case["contract_id"]),
-                dry_run=bool(dry_run_resume),
-            )
+            try:
+                resume_result = self.run_autonomy(
+                    as_of_date=case_as_of,
+                    contract_id=str(case["contract_id"]),
+                    dry_run=bool(dry_run_resume),
+                )
+                with self.repo.transaction() as conn:
+                    self.repo.append_event(
+                        conn,
+                        entity_type="EXCEPTION_CASE",
+                        entity_id=case_id,
+                        event_type="CASE_RESUME_COMPLETED",
+                        as_of_date=case_as_of,
+                        payload={
+                            "autonomy_run_id": str(resume_result.get("autonomy_run_id") or ""),
+                            "ok": bool(resume_result.get("ok")),
+                            "dry_run_resume": bool(dry_run_resume),
+                        },
+                        source="decide-case",
+                    )
+            except Exception as error:
+                resume_result = {
+                    "ok": False,
+                    "error": str(error),
+                    "autonomy_run_id": None,
+                }
+                with self.repo.transaction() as conn:
+                    self.repo.append_event(
+                        conn,
+                        entity_type="EXCEPTION_CASE",
+                        entity_id=case_id,
+                        event_type="CASE_RESUME_FAILED",
+                        as_of_date=case_as_of,
+                        payload={
+                            "error": str(error),
+                            "dry_run_resume": bool(dry_run_resume),
+                        },
+                        source="decide-case",
+                    )
         return {
             "ok": True,
             "case": case_row,

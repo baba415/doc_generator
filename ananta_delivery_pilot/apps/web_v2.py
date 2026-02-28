@@ -312,6 +312,35 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     table.append("</tbody></table>")
                 table.append("</details>")
 
+            timeline_run_id = str((query.get("run_id") or [""])[0] or "").strip()
+            timeline_contract_id = str((query.get("contract_id") or [""])[0] or "").strip()
+            if timeline_run_id and timeline_contract_id:
+                timeline_rows = service.command_center_timeline(
+                    autonomy_run_id=timeline_run_id,
+                    contract_id=timeline_contract_id,
+                )
+                table.append(
+                    f"<h3>Autopilot Console (run { _escape(timeline_run_id) })</h3>"
+                    f"<p class='muted'>Contract: {_escape(timeline_contract_id)}</p>"
+                    "<table><thead><tr><th>Intent</th><th>Intent Status</th><th>Execution Status</th><th>Policy</th><th>Details</th></tr></thead><tbody>"
+                )
+                for row in timeline_rows:
+                    response = row.get("response") if isinstance(row.get("response"), dict) else {}
+                    error = row.get("error") if isinstance(row.get("error"), dict) else {}
+                    details = response if response else error
+                    table.append(
+                        "<tr>"
+                        f"<td>{_escape(row.get('intent_type'))}</td>"
+                        f"<td>{_escape(row.get('intent_status'))}</td>"
+                        f"<td>{_escape(row.get('execution_status'))}</td>"
+                        f"<td>{_escape(row.get('policy_version'))}</td>"
+                        f"<td><code>{_escape(json.dumps(details, sort_keys=True))}</code></td>"
+                        "</tr>"
+                    )
+                if not timeline_rows:
+                    table.append("<tr><td colspan='5' class='muted'>No timeline rows found for this run.</td></tr>")
+                table.append("</tbody></table>")
+
             def _section_table(title: str, section_rows: list[dict[str, object]]) -> str:
                 chunks = [
                     f"<h3>{_escape(title)} ({len(section_rows)})</h3>",
@@ -569,17 +598,46 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
         def _render_exceptions(self, query: dict[str, list[str]]) -> None:
             msg, level = self._msg(query)
             contract_filter = str((query.get("contract_id") or [""])[0] or "").strip()
-            rows = repo.list_exception_cases(status="OPEN")
-            if contract_filter:
-                rows = [row for row in rows if str(row.get("contract_id") or "") == contract_filter]
+            as_of_date_utc = str((query.get("as_of_date") or [utc_today_iso()])[0] or utc_today_iso()).strip()
+            run_id = str((query.get("run_id") or [""])[0] or "").strip()
+            focus_case_id = str((query.get("case_id") or [""])[0] or "").strip()
+            cards = service.exception_case_cards(
+                status="OPEN",
+                as_of_date_utc=as_of_date_utc,
+                contract_id=contract_filter or None,
+            )
             grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
-            for row in rows:
-                key = (str(row.get("severity") or "REVIEW"), str(row.get("reason_code") or "unspecified"))
-                grouped.setdefault(key, []).append(row)
+            for card in cards:
+                key = (str(card.get("severity") or "REVIEW"), str(card.get("reason_code") or "unspecified"))
+                grouped.setdefault(key, []).append(card)
             parts = [
                 "<h2>Exceptions Queue</h2>",
-                "<p class='muted'>Decision inbox (approve/reject/override). Manual action is needed only for unresolved blockers.</p>",
+                "<p class='muted'>Decision inbox (approve/reject/override). This is the primary manual workspace.</p>",
             ]
+            if run_id and contract_filter:
+                timeline_rows = service.command_center_timeline(
+                    autonomy_run_id=run_id,
+                    contract_id=contract_filter,
+                )
+                parts.append(
+                    f"<h3>Autopilot Console (run {_escape(run_id)})</h3>"
+                    "<table><thead><tr><th>Intent</th><th>Intent Status</th><th>Execution Status</th><th>Details</th></tr></thead><tbody>"
+                )
+                for row in timeline_rows:
+                    response = row.get("response") if isinstance(row.get("response"), dict) else {}
+                    error = row.get("error") if isinstance(row.get("error"), dict) else {}
+                    details = response if response else error
+                    parts.append(
+                        "<tr>"
+                        f"<td>{_escape(row.get('intent_type'))}</td>"
+                        f"<td>{_escape(row.get('intent_status'))}</td>"
+                        f"<td>{_escape(row.get('execution_status'))}</td>"
+                        f"<td><code>{_escape(json.dumps(details, sort_keys=True))}</code></td>"
+                        "</tr>"
+                    )
+                if not timeline_rows:
+                    parts.append("<tr><td colspan='4' class='muted'>No run timeline rows found.</td></tr>")
+                parts.append("</tbody></table>")
             if grouped:
                 severity_order = {"BLOCKER": 0, "REVIEW": 1}
                 for (severity, reason_code), group_rows in sorted(
@@ -588,23 +646,35 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 ):
                     parts.append(
                         f"<h3>{_escape(severity)} · {_escape(reason_code)} ({len(group_rows)})</h3>"
-                        "<table><thead><tr><th>Created</th><th>Contract</th><th>Case Type</th><th>Details</th><th>Decision</th></tr></thead><tbody>"
+                        "<table><thead><tr><th>Created (UTC)</th><th>Contract</th><th>Case Type</th><th>SLA</th><th>Consequence Preview</th><th>Decision</th></tr></thead><tbody>"
                     )
                     for row in group_rows:
-                        details_json = row.get("details_json")
-                        try:
-                            details = json.loads(details_json or "{}")
-                        except Exception:
-                            details = {"raw": str(details_json)}
+                        details = row.get("details") if isinstance(row.get("details"), dict) else {}
+                        preview = row.get("consequence_preview") if isinstance(row.get("consequence_preview"), dict) else {}
+                        case_id = str(row.get("exception_case_id") or "")
+                        sla_text = (
+                            f"{_escape(row.get('sla_state'))} · age={_escape(row.get('age_hours'))}h / "
+                            f"target={_escape(row.get('sla_target_hours'))}h"
+                        )
+                        preview_text = (
+                            f"next={_escape(preview.get('expected_next_action'))}<br/>"
+                            f"recommended={_escape(preview.get('recommended_decision'))}; "
+                            f"open_cases={_escape(preview.get('open_cases_for_contract'))}; "
+                            f"lpo_state={_escape(preview.get('contract_lpo_state'))}"
+                        )
                         parts.append(
                             "<tr>"
                             f"<td>{_escape(row.get('created_at'))}</td>"
                             f"<td>{_escape(row.get('contract_id') or '-')}</td>"
                             f"<td>{_escape(row.get('case_type'))}</td>"
-                            f"<td><code>{_escape(json.dumps(details, sort_keys=True))}</code></td>"
+                            f"<td>{sla_text}</td>"
+                            f"<td><code>{preview_text}</code><br/><span class='muted'>reason={_escape(json.dumps(details, sort_keys=True))}</span></td>"
                             "<td>"
                             f"<form method='POST' action='/v2/exceptions/decide' class='inline-form'>"
-                            f"<input type='hidden' name='case_id' value='{_escape(str(row['exception_case_id']))}' />"
+                            f"<input type='hidden' name='case_id' value='{_escape(case_id)}' />"
+                            f"<input type='hidden' name='as_of_date' value='{_escape(as_of_date_utc)}' />"
+                            f"<input type='hidden' name='contract_id' value='{_escape(str(row.get('contract_id') or ''))}' />"
+                            f"<input type='hidden' name='run_id' value='{_escape(run_id)}' />"
                             "<select name='decision'>"
                             "<option value='APPROVE'>APPROVE</option>"
                             "<option value='REJECT'>REJECT</option>"
@@ -618,6 +688,25 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                             "</td>"
                             "</tr>"
                         )
+                        if focus_case_id and focus_case_id == case_id:
+                            activity_rows = service.exception_case_activity(case_id=case_id)
+                            parts.append(
+                                "<tr><td colspan='6'>"
+                                "<details open><summary>Case Activity</summary>"
+                                "<table><thead><tr><th>At (UTC)</th><th>Event</th><th>Source</th><th>Payload</th></tr></thead><tbody>"
+                            )
+                            for event in activity_rows:
+                                parts.append(
+                                    "<tr>"
+                                    f"<td>{_escape(event.get('created_at'))}</td>"
+                                    f"<td>{_escape(event.get('event_type'))}</td>"
+                                    f"<td>{_escape(event.get('source'))}</td>"
+                                    f"<td><code>{_escape(json.dumps(event.get('payload') or {}, sort_keys=True))}</code></td>"
+                                    "</tr>"
+                                )
+                            if not activity_rows:
+                                parts.append("<tr><td colspan='4' class='muted'>No case activity events.</td></tr>")
+                            parts.append("</tbody></table></details></td></tr>")
                     parts.append("</tbody></table>")
             else:
                 parts.append("<p class='muted'>No open exception cases.</p>")
@@ -1369,9 +1458,17 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             )
             message = f"Case {case_id} resolved via {decision}"
             resume_result = result.get("resume_result")
+            case_row = result.get("case") if isinstance(result.get("case"), dict) else {}
+            contract_id = str(fields.get("contract_id") or case_row.get("contract_id") or "").strip()
+            as_of_date = str(fields.get("as_of_date") or utc_today_iso()).strip()
+            redirect_path = f"/v2/exceptions?as_of_date={quote_plus(as_of_date)}"
+            if contract_id:
+                redirect_path += f"&contract_id={quote_plus(contract_id)}"
+            redirect_path += f"&case_id={quote_plus(case_id)}"
             if isinstance(resume_result, dict) and resume_result.get("autonomy_run_id"):
                 message += f" (resume run {resume_result['autonomy_run_id']})"
-            self._flash_redirect("/v2/exceptions", message)
+                redirect_path += f"&run_id={quote_plus(str(resume_result['autonomy_run_id']))}"
+            self._flash_redirect(redirect_path, message)
 
         def _handle_exception_resolve(self) -> None:
             fields = self._urlencoded_fields()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -1552,6 +1552,142 @@ class Phase1Service:
             )
         return timeline
 
+    def exception_case_cards(
+        self,
+        *,
+        status: str = "OPEN",
+        as_of_date_utc: str | None = None,
+        contract_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        as_of_date = str(as_of_date_utc or utc_today_iso()).strip()
+        as_of_dt = datetime.fromisoformat(f"{as_of_date}T23:59:59+00:00")
+        rows = self.repo.list_exception_cases(status=status)
+        if contract_id:
+            rows = [row for row in rows if str(row.get("contract_id") or "") == contract_id]
+        contract_ids = sorted({str(row.get("contract_id") or "") for row in rows if str(row.get("contract_id") or "")})
+        open_counts: dict[str, int] = {}
+        contract_states: dict[str, str] = {}
+        if contract_ids:
+            placeholders = ",".join(["?"] * len(contract_ids))
+            for count_row in self.repo.fetch_all(
+                f"""
+                SELECT contract_id, COUNT(*) AS open_count
+                FROM exception_cases
+                WHERE status = 'OPEN' AND contract_id IN ({placeholders})
+                GROUP BY contract_id
+                """,
+                tuple(contract_ids),
+            ):
+                open_counts[str(count_row.get("contract_id") or "")] = int(count_row.get("open_count") or 0)
+            for state_row in self.repo.fetch_all(
+                f"""
+                SELECT contract_id, lpo_state
+                FROM contracts
+                WHERE contract_id IN ({placeholders})
+                """,
+                tuple(contract_ids),
+            ):
+                contract_states[str(state_row.get("contract_id") or "")] = str(state_row.get("lpo_state") or "")
+
+        cards: list[dict[str, Any]] = []
+        for row in rows:
+            details_json = row.get("details_json")
+            try:
+                details = json.loads(details_json or "{}")
+            except Exception:
+                details = {"raw": str(details_json)}
+            created_at = str(row.get("created_at") or "")
+            created_dt = self._parse_utc_z(created_at)
+            age_hours = (
+                round(max((as_of_dt - created_dt).total_seconds(), 0.0) / 3600.0, 2)
+                if created_dt is not None
+                else 0.0
+            )
+            severity = str(row.get("severity") or "REVIEW").upper()
+            sla_target_hours = {"BLOCKER": 4, "REVIEW": 24, "INFO": 72}.get(severity, 24)
+            if age_hours >= float(sla_target_hours):
+                sla_state = "BREACHED"
+            elif age_hours >= float(sla_target_hours) * 0.75:
+                sla_state = "AT_RISK"
+            else:
+                sla_state = "WITHIN"
+            case_contract_id = str(row.get("contract_id") or "")
+            resume_as_of = str(details.get("as_of_date") or as_of_date)
+            consequence_preview = {
+                "resume_supported": bool(case_contract_id),
+                "resume_as_of_date": resume_as_of,
+                "recommended_decision": "APPROVE" if severity in {"REVIEW", "INFO"} else "OVERRIDE",
+                "expected_next_action": (
+                    f"run-autonomy --as-of {resume_as_of} --contract-id {case_contract_id}"
+                    if case_contract_id
+                    else "No contract-linked resume path"
+                ),
+                "open_cases_for_contract": int(open_counts.get(case_contract_id, 0)),
+                "contract_lpo_state": str(contract_states.get(case_contract_id, "")),
+            }
+            cards.append(
+                {
+                    "exception_case_id": str(row.get("exception_case_id") or ""),
+                    "contract_id": case_contract_id,
+                    "case_type": str(row.get("case_type") or ""),
+                    "severity": severity,
+                    "status": str(row.get("status") or ""),
+                    "reason_code": str(row.get("reason_code") or ""),
+                    "created_at": created_at,
+                    "updated_at": str(row.get("updated_at") or ""),
+                    "age_hours": age_hours,
+                    "sla_target_hours": sla_target_hours,
+                    "sla_state": sla_state,
+                    "details": details,
+                    "consequence_preview": consequence_preview,
+                }
+            )
+        cards.sort(key=lambda item: (item["severity"], item["reason_code"], item["created_at"]))
+        return cards
+
+    def exception_case_activity(self, *, case_id: str) -> list[dict[str, Any]]:
+        rows = self.repo.fetch_all(
+            """
+            SELECT event_id, event_type, payload_json, source, created_at
+            FROM event_log
+            WHERE entity_type = 'EXCEPTION_CASE'
+              AND entity_id = ?
+            ORDER BY created_at ASC, event_id ASC
+            """,
+            (case_id,),
+        )
+        activity: list[dict[str, Any]] = []
+        for row in rows:
+            payload_json = row.get("payload_json")
+            try:
+                payload = json.loads(payload_json or "{}")
+            except Exception:
+                payload = {"raw": str(payload_json)}
+            activity.append(
+                {
+                    "event_id": str(row.get("event_id") or ""),
+                    "event_type": str(row.get("event_type") or ""),
+                    "source": str(row.get("source") or ""),
+                    "created_at": str(row.get("created_at") or ""),
+                    "payload": payload,
+                }
+            )
+        return activity
+
+    def _parse_utc_z(self, value: str) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            if text.endswith("Z"):
+                return datetime.fromisoformat(text.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+
     def decide_exception_case(
         self,
         *,
@@ -1563,6 +1699,8 @@ class Phase1Service:
     ) -> dict[str, Any]:
         from domain.automation import AutomationOrchestrator
 
+        if not str(reason or "").strip():
+            raise ValueError("reason is required")
         orchestrator = AutomationOrchestrator(self.config, self.repo, self)
         return orchestrator.decide_case(
             case_id=case_id,

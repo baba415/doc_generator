@@ -84,7 +84,19 @@ Release-candidate CI now runs the same script in `.github/workflows/release-cand
 4. **Settle** (`/v2/contracts/<contract_id>/settle`)  
    Mark payment, generate receipt, run DREP export with deterministic `as_of_date`.
 5. **Exceptions** (`/v2/exceptions`)  
-   Resolve blockers/review exceptions and continue.
+   Resolve blockers/review exceptions and continue.  
+   Decision cards include SLA state, consequence preview, and `Approve + Resume` audit trail.
+
+### Exception-first operations (PR7)
+
+- `/v2/exceptions` is the primary manual workspace.
+- Every decision (`APPROVE|REJECT|OVERRIDE`) requires a reason.
+- Resume actions emit explicit case audit events:
+  - `CASE_RESUME_REQUESTED`
+  - `CASE_RESUME_COMPLETED` or `CASE_RESUME_FAILED`
+- For blocked runs, use query-scoped navigation:
+  - `/v2/exceptions?contract_id=<id>&run_id=<autonomy_run_id>`
+  - The page renders an autopilot console timeline plus grouped decision cards.
 
 Phase2 outputs persist to:
 - `.state/drep.sqlite`
