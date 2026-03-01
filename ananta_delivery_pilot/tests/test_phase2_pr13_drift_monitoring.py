@@ -105,6 +105,31 @@ class Phase2Pr13DriftMonitoringTests(unittest.TestCase):
         self.assertEqual("INSUFFICIENT_DATA", by_gate["pr9"]["drift_state"])
         self.assertEqual("INSUFFICIENT_DATA", result["drift_report"]["aggregate"]["drift_state"])
 
+    def test_drift_report_insufficient_live_data_reason(self) -> None:
+        benchmark_ref = self._write_metrics_ref(
+            file_name="benchmark-live-missing.json",
+            benchmark_version="phase2.pr12.v1",
+            manual_transport_fields_per_delivery=0.6,
+        )
+        live_ref = self._write_metrics_ref(
+            file_name="live-missing.json",
+            benchmark_version="phase2.pr12.v1",
+            manual_transport_fields_per_delivery=None,
+        )
+        result = self.orchestrator.phase2_drift_report(
+            as_of_date="2026-02-28",
+            lookback_window_days=30,
+            benchmark_version="phase2.pr12.v1",
+            out_dir=self.temp_dir / "drift-live-missing",
+            benchmark_metrics_ref=benchmark_ref,
+            live_metrics_ref=live_ref,
+            persist=False,
+        )
+        by_gate = {row["gate_name"]: row for row in result["drift_report"]["gates"]}
+        self.assertEqual("insufficient_live_data", by_gate["pr9"]["reason_code"])
+        self.assertEqual("INSUFFICIENT_DATA", by_gate["pr9"]["drift_state"])
+        self.assertEqual("INSUFFICIENT_DATA", result["drift_report"]["aggregate"]["drift_state"])
+
     def test_drift_watch_and_alert_states_are_deterministic(self) -> None:
         benchmark_ref = self._write_metrics_ref(
             file_name="benchmark-watch-alert.json",
