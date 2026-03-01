@@ -1564,6 +1564,22 @@ class Phase1Service:
             benchmark_version=benchmark_version,
         )
 
+    def portfolio_drift_root_cause_strip(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int = 30,
+        benchmark_version: str = "phase2.pr12.v1",
+    ) -> dict[str, Any]:
+        from domain.automation import AutomationOrchestrator
+
+        orchestrator = AutomationOrchestrator(self.config, self.repo, self)
+        return orchestrator.phase2_drift_root_cause_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+        )
+
     def portfolio_sla_trends(
         self,
         *,

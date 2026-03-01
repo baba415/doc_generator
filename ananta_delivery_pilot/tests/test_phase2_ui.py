@@ -820,6 +820,64 @@ class Phase2UiRouteTests(unittest.TestCase):
         finally:
             _stop_process(proc)
 
+    def test_portfolio_drift_root_cause_summary_is_read_only(self) -> None:
+        as_of_date = "2026-02-28"
+        benchmark_version = "phase2.pr12.v1"
+        benchmark_ref = self._write_drift_metrics_ref(
+            file_name="ui-benchmark-root-cause.json",
+            benchmark_version=benchmark_version,
+            autoplan_zero_edit_common_case_rate=0.95,
+        )
+        live_ref = self._write_drift_metrics_ref(
+            file_name="ui-live-root-cause.json",
+            benchmark_version=benchmark_version,
+            autoplan_zero_edit_common_case_rate=0.82,
+        )
+        drift_report = self.orchestrator.phase2_drift_report(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+            out_dir=self.temp_dir / "root-cause-report",
+            benchmark_metrics_ref=benchmark_ref,
+            live_metrics_ref=live_ref,
+            persist=False,
+        )
+        triage_status = self.orchestrator.phase2_drift_operations_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+        )
+        triage_ref = self.temp_dir / "root-cause-triage-status.json"
+        triage_ref.write_text(json.dumps(triage_status, indent=2, sort_keys=True), encoding="utf-8")
+        self.orchestrator.phase2_drift_root_cause(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+            out_dir=self.temp_dir / "root-cause-export",
+            drift_report_ref=Path(str(drift_report["report_json_path"])),
+            triage_status_ref=triage_ref,
+            persist=True,
+        )
+        try:
+            port = _pick_free_port()
+        except PermissionError:
+            self.skipTest("socket bind not permitted in current sandbox")
+        proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
+        try:
+            _wait_for_route(port, "/v2/portfolio")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v2/portfolio?as_of={as_of_date}&lookback_window_days=30&benchmark_version={benchmark_version}",
+                timeout=3,
+            ) as response:
+                body = response.read().decode("utf-8")
+            self.assertIn("Drift Root Cause Summary", body)
+            self.assertIn("Open Drift Monitoring Exceptions", body)
+            self.assertIn("aggregate_reason_code", body)
+            self.assertNotIn("name='policy_set_id'", body)
+            self.assertNotIn("Resolve Root Cause", body)
+        finally:
+            _stop_process(proc)
+
 
 def _pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

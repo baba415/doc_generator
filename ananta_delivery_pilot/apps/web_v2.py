@@ -363,6 +363,11 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 lookback_window_days=lookback_window_days,
                 benchmark_version=benchmark_version,
             )
+            drift_root_cause = service.portfolio_drift_root_cause_strip(
+                as_of_date=as_of_date_utc,
+                lookback_window_days=lookback_window_days,
+                benchmark_version=benchmark_version,
+            )
             preview_token = str((query.get("preview_token") or [""])[0] or "").strip()
             preview_result: dict[str, object] | None = None
             preview_stale = False
@@ -480,6 +485,38 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             )
             table.append(
                 f"<p><a class='btn' href='/v2/exceptions?case_type=DRIFT_MONITORING&status=OPEN&as_of_date={quote_plus(as_of_date_utc)}'>Open Drift Cases</a></p>"
+            )
+            table.append("<h3>Drift Root Cause Summary</h3>")
+            table.append("<p class='muted'>Read-only recurring drift diagnostics. Resolve through exceptions workflow only.</p>")
+            table.append("<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>")
+            table.append(f"<tr><td>aggregate_state</td><td>{_escape(drift_root_cause.get('aggregate_state') or 'N/A')}</td></tr>")
+            table.append(f"<tr><td>aggregate_reason_code</td><td>{_escape(drift_root_cause.get('aggregate_reason_code') or 'N/A')}</td></tr>")
+            table.append(f"<tr><td>latest_generated_at_utc</td><td>{_escape(drift_root_cause.get('latest_generated_at_utc') or 'N/A')}</td></tr>")
+            table.append(f"<tr><td>latest_report_md_path</td><td>{_escape(drift_root_cause.get('latest_report_md_path') or 'N/A')}</td></tr>")
+            table.append("</tbody></table>")
+            top_causes = drift_root_cause.get("top_recurring_causes")
+            top_causes = top_causes if isinstance(top_causes, list) else []
+            table.append(
+                "<table><thead><tr><th>Root Cause</th><th>Occurrences</th><th>Affected Contracts</th><th>Recurring</th><th>Gates</th></tr></thead><tbody>"
+            )
+            for item in top_causes[:3]:
+                if not isinstance(item, dict):
+                    continue
+                gates = item.get("gates") if isinstance(item.get("gates"), list) else []
+                table.append(
+                    "<tr>"
+                    f"<td>{_escape(item.get('root_cause_code'))}</td>"
+                    f"<td>{_escape(item.get('occurrence_count'))}</td>"
+                    f"<td>{_escape(item.get('affected_contracts'))}</td>"
+                    f"<td>{_escape(item.get('recurring'))}</td>"
+                    f"<td>{_escape(', '.join(str(gate) for gate in gates))}</td>"
+                    "</tr>"
+                )
+            if not top_causes:
+                table.append("<tr><td colspan='5' class='muted'>No recurring root-cause diagnostics exported yet.</td></tr>")
+            table.append("</tbody></table>")
+            table.append(
+                f"<p><a class='btn' href='/v2/exceptions?case_type=DRIFT_MONITORING&status=OPEN&as_of_date={quote_plus(as_of_date_utc)}'>Open Drift Monitoring Exceptions</a></p>"
             )
             if preview_result:
                 preview_rows = preview_result.get("skipped_contracts", [])

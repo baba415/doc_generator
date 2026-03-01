@@ -137,6 +137,7 @@ python3 run.py run-phase2-benchmark --as-of 2026-02-28 --lookback-window-days 30
 python3 run.py phase2-drift-report --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr13/manual
 python3 run.py phase2-drift-triage --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr14/manual
 python3 run.py phase2-drift-status --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1
+python3 run.py phase2-drift-root-cause --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr15/manual
 ```
 
 PR11 gate reliability adds:
@@ -154,6 +155,11 @@ PR14 drift operations adds:
 - `phase2-drift-triage` deterministic projection of drift states to `DRIFT_MONITORING` cases (idempotent, replay-safe),
 - `phase2-drift-status` read-only summary for drift case load and latest triage/report refs,
 - portfolio read-only Drift Ops Summary with explicit link to `/v2/exceptions?case_type=DRIFT_MONITORING&status=OPEN`.
+
+PR15 drift root-cause reduction adds:
+- `phase2-drift-root-cause` deterministic root-cause diagnostics artifacts (`phase2_drift_root_cause_<as_of>.json/.md`),
+- append-only audit event `PHASE2_DRIFT_ROOT_CAUSE_EXPORTED`,
+- portfolio read-only Drift Root Cause Summary panel (top recurring causes + report link + exceptions deep-link).
 
 Phase 1 state writes to:
 - `.state/drep.sqlite`

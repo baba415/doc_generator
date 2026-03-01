@@ -39,6 +39,30 @@ DRIFT_REASON_PRECEDENCE = [
     "pass",
 ]
 
+ROOT_CAUSE_ALLOWED_CODES = {
+    "insufficient_observability_data",
+    "benchmark_dataset_misalignment",
+    "input_quality_regression",
+    "planning_policy_mismatch",
+    "transport_assignment_instability",
+    "document_linkage_instability",
+    "settlement_matching_instability",
+    "manual_override_concentration",
+    "no_recurring_root_cause",
+}
+
+ROOT_CAUSE_REASON_PRECEDENCE = [
+    "insufficient_observability_data",
+    "benchmark_dataset_misalignment",
+    "manual_override_concentration",
+    "input_quality_regression",
+    "planning_policy_mismatch",
+    "transport_assignment_instability",
+    "document_linkage_instability",
+    "settlement_matching_instability",
+    "no_recurring_root_cause",
+]
+
 DEFAULT_DRIFT_THRESHOLDS: dict[str, Any] = {
     "version": "phase2.pr13.defaults.v1",
     "pr8": {
@@ -2095,6 +2119,311 @@ class AutomationOrchestrator:
             "latest_report_md_path": latest_report_md_path,
         }
 
+    def phase2_drift_root_cause(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+        out_dir: Path,
+        drift_report_ref: Path | None = None,
+        triage_status_ref: Path | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        if lookback_window_days <= 0:
+            raise ValueError("lookback_window_days must be > 0")
+        try:
+            as_of = date.fromisoformat(as_of_date)
+        except ValueError as error:
+            raise ValueError("as_of_date must be YYYY-MM-DD") from error
+        generated_at_utc = utc_now_iso_z()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        lookback_start = as_of - timedelta(days=int(lookback_window_days) - 1)
+        lookback_start_iso = lookback_start.isoformat()
+
+        drift_report_source = ""
+        if drift_report_ref is not None:
+            drift_payload = self._safe_json_object(json.loads(drift_report_ref.read_text(encoding="utf-8")))
+            drift_report_source = str(drift_report_ref)
+        else:
+            drift_result = self.phase2_drift_report(
+                as_of_date=as_of_date,
+                lookback_window_days=int(lookback_window_days),
+                benchmark_version=benchmark_version,
+                out_dir=out_dir,
+                persist=False,
+            )
+            drift_payload = self._safe_json_object(drift_result.get("drift_report"))
+            drift_report_source = str(drift_result.get("report_json_path") or "")
+
+        triage_status_source = ""
+        if triage_status_ref is not None:
+            triage_snapshot = self._safe_json_object(json.loads(triage_status_ref.read_text(encoding="utf-8")))
+            triage_status_source = str(triage_status_ref)
+        else:
+            triage_snapshot = self.phase2_drift_operations_snapshot(
+                as_of_date=as_of_date,
+                lookback_window_days=int(lookback_window_days),
+                benchmark_version=benchmark_version,
+            )
+            triage_status_source = str(triage_snapshot.get("latest_report_json_path") or "")
+
+        metrics = self.compute_metrics_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=int(lookback_window_days),
+            benchmark_version=benchmark_version,
+        )
+        gates = drift_payload.get("gates") if isinstance(drift_payload.get("gates"), list) else []
+        drift_inputs = drift_payload.get("inputs") if isinstance(drift_payload.get("inputs"), dict) else {}
+        aggregate_drift = drift_payload.get("aggregate") if isinstance(drift_payload.get("aggregate"), dict) else {}
+        required_inputs = {"as_of_date", "lookback_window_days", "benchmark_version", "generated_at_utc"}
+        missing_required_inputs = any(
+            str(drift_inputs.get(field) or "").strip() == ""
+            for field in required_inputs
+        )
+        has_gate_rows = any(isinstance(item, dict) for item in gates)
+        insufficient_observability = bool(missing_required_inputs or not has_gate_rows)
+        benchmark_misalignment = bool(
+            str(drift_inputs.get("benchmark_version") or "").strip() != benchmark_version
+            or str(metrics.get("benchmark_version") or "").strip() != benchmark_version
+            or str(aggregate_drift.get("drift_state") or "").upper() == "MISMATCH"
+        )
+
+        drift_cases = self.repo.fetch_all(
+            """
+            SELECT exception_case_id, contract_id, reason_code, details_json, created_at, resolved_at
+            FROM exception_cases
+            WHERE case_type = 'DRIFT_MONITORING'
+              AND COALESCE(NULLIF(json_extract(details_json, '$.as_of_date'), ''), substr(created_at, 1, 10)) BETWEEN ? AND ?
+            ORDER BY created_at ASC, exception_case_id ASC
+            """,
+            (lookback_start_iso, as_of_date),
+        )
+
+        group_stats: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in drift_cases:
+            details = self._safe_json_object(row.get("details_json"))
+            if str(details.get("benchmark_version") or "").strip() != benchmark_version:
+                continue
+            gate_name = str(details.get("gate_name") or "").strip().lower()
+            if gate_name not in {"pr8", "pr9", "pr10"}:
+                continue
+            derived_code = self._derive_root_cause_from_case_details(gate_name=gate_name, details=details)
+            if derived_code not in ROOT_CAUSE_ALLOWED_CODES:
+                continue
+            key = (gate_name, derived_code)
+            stats = group_stats.setdefault(
+                key,
+                {
+                    "occurrence_count": 0,
+                    "dates": set(),
+                    "contract_ids": set(),
+                    "case_ids": [],
+                    "resolution_durations": [],
+                },
+            )
+            stats["occurrence_count"] = int(stats["occurrence_count"]) + 1
+            as_of_marker = str(details.get("as_of_date") or "")[:10] or str(row.get("created_at") or "")[:10]
+            if as_of_marker:
+                stats["dates"].add(as_of_marker)
+            contract_id = str(row.get("contract_id") or "").strip()
+            if contract_id:
+                stats["contract_ids"].add(contract_id)
+            case_id = str(row.get("exception_case_id") or "").strip()
+            if case_id:
+                stats["case_ids"].append(case_id)
+            created_dt = self._parse_iso_dt(str(row.get("created_at") or ""))
+            resolved_dt = self._parse_iso_dt(str(row.get("resolved_at") or ""))
+            if created_dt and resolved_dt:
+                duration_hours = max((resolved_dt - created_dt).total_seconds(), 0.0) / 3600.0
+                stats["resolution_durations"].append(duration_hours)
+
+        diagnosed_gate_rows: list[dict[str, Any]] = []
+        causes_for_aggregate: list[str] = []
+        for gate in gates:
+            if not isinstance(gate, dict):
+                continue
+            gate_name = str(gate.get("gate_name") or "").strip().lower()
+            if gate_name not in {"pr8", "pr9", "pr10"}:
+                continue
+            drift_state = str(gate.get("drift_state") or "").upper()
+            drift_reason_code = str(gate.get("reason_code") or "pass")
+            comparisons = gate.get("comparisons") if isinstance(gate.get("comparisons"), list) else []
+            cause_code = self._diagnose_root_cause_for_gate(
+                gate_name=gate_name,
+                drift_state=drift_state,
+                drift_reason_code=drift_reason_code,
+                comparisons=comparisons,
+                metrics=metrics,
+                benchmark_misalignment=benchmark_misalignment,
+                insufficient_observability=insufficient_observability,
+            )
+            causes_for_aggregate.append(cause_code)
+            occurrence_stats = group_stats.get((gate_name, cause_code), {})
+            occurrence_count = int(occurrence_stats.get("occurrence_count") or 0)
+            date_count = len(occurrence_stats.get("dates", set()))
+            recurring = bool(occurrence_count >= 3 and date_count >= 2)
+            contract_ids = sorted(str(item) for item in occurrence_stats.get("contract_ids", set()) if str(item))
+            case_ids = [str(item) for item in occurrence_stats.get("case_ids", []) if str(item)]
+            manual_decision_count = 0
+            if case_ids:
+                placeholders = ",".join("?" for _ in case_ids)
+                manual_row = self.repo.fetch_one(
+                    f"""
+                    SELECT COUNT(*) AS cnt
+                    FROM human_decisions
+                    WHERE exception_case_id IN ({placeholders})
+                    """,
+                    tuple(case_ids),
+                ) or {"cnt": 0}
+                manual_decision_count = int(manual_row.get("cnt") or 0)
+            failed_or_blocked_actions = 0
+            if contract_ids:
+                placeholders = ",".join("?" for _ in contract_ids)
+                failed_row = self.repo.fetch_one(
+                    f"""
+                    SELECT COUNT(*) AS cnt
+                    FROM action_intents
+                    WHERE contract_id IN ({placeholders})
+                      AND as_of_date BETWEEN ? AND ?
+                      AND status IN ('FAILED', 'BLOCKED')
+                    """,
+                    tuple(contract_ids) + (lookback_start_iso, as_of_date),
+                ) or {"cnt": 0}
+                failed_or_blocked_actions = int(failed_row.get("cnt") or 0)
+            duration_values = [float(value) for value in occurrence_stats.get("resolution_durations", []) if value is not None]
+            avg_resolution_time_hours = round(sum(duration_values) / len(duration_values), 4) if duration_values else 0.0
+            diagnosed_gate_rows.append(
+                {
+                    "gate_name": gate_name,
+                    "drift_state": drift_state,
+                    "drift_reason_code": drift_reason_code,
+                    "diagnosed_causes": [
+                        {
+                            "root_cause_code": cause_code,
+                            "recurring": recurring,
+                            "occurrence_count": occurrence_count,
+                            "affected_contracts": len(contract_ids),
+                            "root_cause_confidence": self._root_cause_confidence(
+                                drift_state=drift_state,
+                                drift_reason_code=drift_reason_code,
+                                recurring=recurring,
+                            ),
+                            "impact_metrics": {
+                                "exception_count": occurrence_count,
+                                "manual_decision_count": manual_decision_count,
+                                "failed_or_blocked_actions": failed_or_blocked_actions,
+                                "avg_resolution_time_hours": avg_resolution_time_hours,
+                            },
+                            "evidence_refs": [drift_report_source, triage_status_source] + case_ids[:5],
+                        }
+                    ],
+                }
+            )
+
+        top_recurring_causes = self._rank_root_cause_summary(diagnosed_gate_rows)
+        aggregate_reason_code = self._resolve_root_cause_aggregate_reason(
+            diagnosed_codes=causes_for_aggregate,
+            insufficient_observability=insufficient_observability,
+            benchmark_misalignment=benchmark_misalignment,
+        )
+        aggregate_state = self._root_cause_aggregate_state(
+            aggregate_reason_code=aggregate_reason_code,
+            diagnosed_gate_rows=diagnosed_gate_rows,
+        )
+        recommended_manual_actions = self._root_cause_actions_for_reasons(
+            aggregate_reason_code=aggregate_reason_code,
+            top_recurring_causes=top_recurring_causes,
+        )
+
+        report_payload = {
+            "inputs": {
+                "as_of_date": as_of_date,
+                "lookback_window_days": int(lookback_window_days),
+                "benchmark_version": benchmark_version,
+                "generated_at_utc": generated_at_utc,
+                "drift_report_ref": drift_report_source,
+                "triage_status_ref": triage_status_source,
+            },
+            "gates": diagnosed_gate_rows,
+            "aggregate": {
+                "state": aggregate_state,
+                "reason_code": aggregate_reason_code,
+                "top_recurring_causes": top_recurring_causes,
+                "recommended_manual_actions": recommended_manual_actions,
+            },
+        }
+
+        report_json_path = out_dir / f"phase2_drift_root_cause_{as_of_date}.json"
+        report_md_path = out_dir / f"phase2_drift_root_cause_{as_of_date}.md"
+        report_json_path.write_text(json.dumps(report_payload, indent=2, sort_keys=True), encoding="utf-8")
+        report_md_path.write_text(self._phase2_drift_root_cause_markdown(report_payload), encoding="utf-8")
+
+        if persist:
+            with self.repo.transaction() as conn:
+                self.repo.append_event(
+                    conn,
+                    entity_type="METRICS",
+                    entity_id=f"PHASE2_DRIFT_ROOT_CAUSE::{as_of_date}::{benchmark_version}",
+                    event_type="PHASE2_DRIFT_ROOT_CAUSE_EXPORTED",
+                    as_of_date=as_of_date,
+                    payload={
+                        "as_of_date": as_of_date,
+                        "lookback_window_days": int(lookback_window_days),
+                        "benchmark_version": benchmark_version,
+                        "generated_at_utc": generated_at_utc,
+                        "aggregate_state": aggregate_state,
+                        "aggregate_reason_code": aggregate_reason_code,
+                        "top_recurring_causes": top_recurring_causes,
+                        "report_json_path": str(report_json_path),
+                        "report_md_path": str(report_md_path),
+                    },
+                    source="phase2-drift-root-cause",
+                )
+
+        return {
+            "ok": True,
+            "aggregate_state": aggregate_state,
+            "aggregate_reason_code": aggregate_reason_code,
+            "top_recurring_causes": top_recurring_causes,
+            "report_json_path": str(report_json_path),
+            "report_md_path": str(report_md_path),
+            "root_cause_report": report_payload,
+        }
+
+    def phase2_drift_root_cause_snapshot(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+    ) -> dict[str, Any]:
+        latest_row = self.repo.fetch_one(
+            """
+            SELECT payload_json, created_at
+            FROM event_log
+            WHERE event_type = 'PHASE2_DRIFT_ROOT_CAUSE_EXPORTED'
+              AND as_of_date = ?
+              AND json_extract(payload_json, '$.benchmark_version') = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (as_of_date, benchmark_version),
+        )
+        payload = self._safe_json_object((latest_row or {}).get("payload_json"))
+        top_causes = payload.get("top_recurring_causes") if isinstance(payload.get("top_recurring_causes"), list) else []
+        return {
+            "as_of_date": as_of_date,
+            "lookback_window_days": int(lookback_window_days),
+            "benchmark_version": benchmark_version,
+            "latest_generated_at_utc": str(payload.get("generated_at_utc") or ""),
+            "aggregate_state": str(payload.get("aggregate_state") or "PASS"),
+            "aggregate_reason_code": str(payload.get("aggregate_reason_code") or "no_recurring_root_cause"),
+            "top_recurring_causes": top_causes[:3],
+            "latest_report_json_path": str(payload.get("report_json_path") or ""),
+            "latest_report_md_path": str(payload.get("report_md_path") or ""),
+        }
+
     def phase2_gate_report(
         self,
         *,
@@ -2415,6 +2744,295 @@ class AutomationOrchestrator:
             ]
         )
         return "\n".join(lines)
+
+    def _phase2_drift_root_cause_markdown(self, report: dict[str, Any]) -> str:
+        inputs = report.get("inputs") if isinstance(report.get("inputs"), dict) else {}
+        gates = report.get("gates") if isinstance(report.get("gates"), list) else []
+        aggregate = report.get("aggregate") if isinstance(report.get("aggregate"), dict) else {}
+        lines = [
+            "# Phase 2 Drift Root Cause Report",
+            "",
+            "## Inputs",
+            f"- as_of_date: {inputs.get('as_of_date')}",
+            f"- lookback_window_days: {inputs.get('lookback_window_days')}",
+            f"- benchmark_version: {inputs.get('benchmark_version')}",
+            f"- generated_at_utc: {inputs.get('generated_at_utc')}",
+            f"- drift_report_ref: {inputs.get('drift_report_ref')}",
+            f"- triage_status_ref: {inputs.get('triage_status_ref')}",
+            "",
+            "## Aggregate",
+            f"- state: {aggregate.get('state')}",
+            f"- reason_code: {aggregate.get('reason_code')}",
+            f"- top_recurring_causes: {json.dumps(aggregate.get('top_recurring_causes', []), sort_keys=True)}",
+            "",
+            "## Per-Gate Diagnosis",
+        ]
+        for gate in gates:
+            lines.extend(
+                [
+                    f"### {gate.get('gate_name')}",
+                    f"- drift_state: {gate.get('drift_state')}",
+                    f"- drift_reason_code: {gate.get('drift_reason_code')}",
+                    "| Root Cause | Recurring | Occurrence Count | Affected Contracts | Confidence | Impact Metrics |",
+                    "|---|---:|---:|---:|---:|---|",
+                ]
+            )
+            diagnosed = gate.get("diagnosed_causes") if isinstance(gate.get("diagnosed_causes"), list) else []
+            for item in diagnosed:
+                if not isinstance(item, dict):
+                    continue
+                lines.append(
+                    "| {code} | {recurring} | {count} | {contracts} | {confidence} | {impact} |".format(
+                        code=item.get("root_cause_code"),
+                        recurring=item.get("recurring"),
+                        count=item.get("occurrence_count"),
+                        contracts=item.get("affected_contracts"),
+                        confidence=item.get("root_cause_confidence"),
+                        impact=json.dumps(item.get("impact_metrics") or {}, sort_keys=True),
+                    )
+                )
+            if not diagnosed:
+                lines.append("| _none_ | | | | | |")
+            lines.append("")
+        lines.extend(
+            [
+                "## Recommended Manual Actions",
+                *[f"- {line}" for line in aggregate.get("recommended_manual_actions", []) if isinstance(line, str)],
+                "",
+                "## Raw JSON",
+                "```json",
+                json.dumps(report, indent=2, sort_keys=True),
+                "```",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _diagnose_root_cause_for_gate(
+        self,
+        *,
+        gate_name: str,
+        drift_state: str,
+        drift_reason_code: str,
+        comparisons: list[dict[str, Any]],
+        metrics: dict[str, Any],
+        benchmark_misalignment: bool,
+        insufficient_observability: bool,
+    ) -> str:
+        reason = str(drift_reason_code or "pass")
+        if insufficient_observability or reason in {"insufficient_benchmark_data", "insufficient_live_data"}:
+            return "insufficient_observability_data"
+        if benchmark_misalignment or reason == "benchmark_version_mismatch":
+            return "benchmark_dataset_misalignment"
+        if str(drift_state or "").upper() == "PASS" and reason == "pass":
+            return "no_recurring_root_cause"
+
+        manual_total = int(metrics.get("manual_interactions_total") or 0)
+        manual_overrides = int(metrics.get("manual_interactions_user_overrides") or 0)
+        override_ratio = (manual_overrides / manual_total) if manual_total > 0 else 0.0
+        if gate_name == "pr8" and str(drift_state or "").upper() != "PASS" and manual_total >= 3 and override_ratio >= 0.70:
+            return "manual_override_concentration"
+
+        dominant_metric = ""
+        dominant_score = -1.0
+        for item in comparisons:
+            if not isinstance(item, dict):
+                continue
+            metric_name = str(item.get("metric_name") or "")
+            comparison_state = str(item.get("comparison_state") or "")
+            if comparison_state == "alert":
+                score = 2.0
+            elif comparison_state == "watch":
+                score = 1.0
+            else:
+                score = 0.0
+            delta_value = item.get("delta")
+            try:
+                score += abs(float(delta_value or 0.0))
+            except Exception:
+                score += 0.0
+            if score > dominant_score:
+                dominant_score = score
+                dominant_metric = metric_name
+
+        if gate_name == "pr8":
+            if dominant_metric == "autoplan_zero_edit_common_case_rate":
+                return "planning_policy_mismatch"
+            if dominant_metric == "median_manual_fields_per_intake":
+                return "input_quality_regression"
+            return "no_recurring_root_cause"
+        if gate_name == "pr9":
+            if dominant_metric == "manual_transport_fields_per_delivery":
+                return "transport_assignment_instability"
+            if dominant_metric == "doc_autolink_precision":
+                return "document_linkage_instability"
+            return "no_recurring_root_cause"
+        if gate_name == "pr10":
+            if dominant_metric in {"payment_suggestion_acceptance_rate", "auto_action_success_rate"}:
+                return "settlement_matching_instability"
+            return "no_recurring_root_cause"
+        return "no_recurring_root_cause"
+
+    def _derive_root_cause_from_case_details(self, *, gate_name: str, details: dict[str, Any]) -> str:
+        reason_code = str(details.get("reason_code") or "")
+        comparisons = details.get("comparisons") if isinstance(details.get("comparisons"), list) else []
+        return self._diagnose_root_cause_for_gate(
+            gate_name=gate_name,
+            drift_state=str(details.get("drift_state") or ""),
+            drift_reason_code=reason_code,
+            comparisons=comparisons,
+            metrics={},
+            benchmark_misalignment=(reason_code == "benchmark_version_mismatch"),
+            insufficient_observability=(reason_code in {"insufficient_benchmark_data", "insufficient_live_data"}),
+        )
+
+    def _root_cause_confidence(
+        self,
+        *,
+        drift_state: str,
+        drift_reason_code: str,
+        recurring: bool,
+    ) -> float:
+        reason = str(drift_reason_code or "")
+        state = str(drift_state or "").upper()
+        if reason in {"benchmark_version_mismatch", "insufficient_benchmark_data", "insufficient_live_data"}:
+            base = 0.99
+        elif state == "ALERT":
+            base = 0.90
+        elif state == "WATCH":
+            base = 0.82
+        else:
+            base = 0.70
+        if recurring:
+            base += 0.05
+        return round(min(base, 1.0), 4)
+
+    def _rank_root_cause_summary(self, diagnosed_gate_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        aggregated: dict[str, dict[str, Any]] = {}
+        for gate_row in diagnosed_gate_rows:
+            if not isinstance(gate_row, dict):
+                continue
+            gate_name = str(gate_row.get("gate_name") or "")
+            state = str(gate_row.get("drift_state") or "").upper()
+            diagnosed = gate_row.get("diagnosed_causes") if isinstance(gate_row.get("diagnosed_causes"), list) else []
+            for item in diagnosed:
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("root_cause_code") or "")
+                if code not in ROOT_CAUSE_ALLOWED_CODES:
+                    continue
+                bucket = aggregated.setdefault(
+                    code,
+                    {
+                        "root_cause_code": code,
+                        "occurrence_count": 0,
+                        "affected_contracts": 0,
+                        "recurring": False,
+                        "gates": set(),
+                        "max_severity_weight": 0,
+                    },
+                )
+                bucket["occurrence_count"] = int(bucket["occurrence_count"]) + int(item.get("occurrence_count") or 0)
+                bucket["affected_contracts"] = int(bucket["affected_contracts"]) + int(item.get("affected_contracts") or 0)
+                bucket["recurring"] = bool(bucket["recurring"] or bool(item.get("recurring")))
+                if gate_name:
+                    bucket["gates"].add(gate_name)
+                bucket["max_severity_weight"] = max(
+                    int(bucket["max_severity_weight"]),
+                    self._drift_state_weight(state),
+                )
+        ranked = sorted(
+            aggregated.values(),
+            key=lambda item: (
+                -int(item.get("occurrence_count") or 0),
+                -int(item.get("affected_contracts") or 0),
+                -int(item.get("max_severity_weight") or 0),
+                str(item.get("root_cause_code") or ""),
+            ),
+        )
+        output: list[dict[str, Any]] = []
+        for row in ranked:
+            output.append(
+                {
+                    "root_cause_code": str(row.get("root_cause_code") or ""),
+                    "occurrence_count": int(row.get("occurrence_count") or 0),
+                    "affected_contracts": int(row.get("affected_contracts") or 0),
+                    "recurring": bool(row.get("recurring")),
+                    "gates": sorted(str(item) for item in row.get("gates", set()) if str(item)),
+                }
+            )
+        return output[:3]
+
+    def _resolve_root_cause_aggregate_reason(
+        self,
+        *,
+        diagnosed_codes: list[str],
+        insufficient_observability: bool,
+        benchmark_misalignment: bool,
+    ) -> str:
+        candidates: list[str] = []
+        if insufficient_observability:
+            candidates.append("insufficient_observability_data")
+        if benchmark_misalignment:
+            candidates.append("benchmark_dataset_misalignment")
+        for code in diagnosed_codes:
+            if code in ROOT_CAUSE_ALLOWED_CODES:
+                candidates.append(code)
+        if not candidates:
+            candidates.append("no_recurring_root_cause")
+        for code in ROOT_CAUSE_REASON_PRECEDENCE:
+            if code in candidates:
+                return code
+        return "no_recurring_root_cause"
+
+    def _root_cause_aggregate_state(
+        self,
+        *,
+        aggregate_reason_code: str,
+        diagnosed_gate_rows: list[dict[str, Any]],
+    ) -> str:
+        if aggregate_reason_code == "no_recurring_root_cause":
+            return "PASS"
+        if aggregate_reason_code == "insufficient_observability_data":
+            return "INSUFFICIENT_DATA"
+        state_weights = [self._drift_state_weight(str(row.get("drift_state") or "")) for row in diagnosed_gate_rows]
+        max_weight = max(state_weights) if state_weights else 0
+        if max_weight >= self._drift_state_weight("ALERT"):
+            return "ALERT"
+        if max_weight >= self._drift_state_weight("WATCH"):
+            return "WATCH"
+        return "WATCH"
+
+    def _root_cause_actions_for_reasons(
+        self,
+        *,
+        aggregate_reason_code: str,
+        top_recurring_causes: list[dict[str, Any]],
+    ) -> list[str]:
+        actions: list[str] = []
+        if aggregate_reason_code == "insufficient_observability_data":
+            actions.append("Capture missing telemetry snapshots for the lookback window before triage review.")
+        if aggregate_reason_code == "benchmark_dataset_misalignment":
+            actions.append("Align benchmark_version across benchmark run, drift report, and live metrics references.")
+        if aggregate_reason_code == "manual_override_concentration":
+            actions.append("Review repeated override reasons and tighten decision-card prompts for the affected gate.")
+        cause_to_action = {
+            "input_quality_regression": "Audit intake parsing quality and correction memory hit rate for affected buyers/products.",
+            "planning_policy_mismatch": "Review lot policy/cadence assumptions against recent common-case delivery planning outcomes.",
+            "transport_assignment_instability": "Review transport suggestion confidence and assignment history freshness for affected routes.",
+            "document_linkage_instability": "Review document fingerprint hints and linkage confidence thresholds for recurring document types.",
+            "settlement_matching_instability": "Review payment reference quality and ambiguous allocation patterns for affected counterparties.",
+        }
+        for row in top_recurring_causes:
+            if not isinstance(row, dict):
+                continue
+            code = str(row.get("root_cause_code") or "")
+            action = cause_to_action.get(code)
+            if action and action not in actions:
+                actions.append(action)
+        if not actions:
+            actions.append("No recurring root cause detected; continue monitoring drift trend windows.")
+        return actions
 
     def _drift_metric_specs(self) -> dict[str, list[str]]:
         return {
@@ -3174,6 +3792,16 @@ class AutomationOrchestrator:
         if state == "WATCH":
             return "INFO"
         return "INFO"
+
+    def _drift_state_weight(self, drift_state: str) -> int:
+        state = str(drift_state or "").upper()
+        if state in {"MISMATCH", "ALERT"}:
+            return 4
+        if state == "WATCH":
+            return 3
+        if state == "INSUFFICIENT_DATA":
+            return 2
+        return 1
 
     def _percentile(self, values: list[float], pct: float) -> float | None:
         if not values:

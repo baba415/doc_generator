@@ -42,6 +42,7 @@ def phase1_commands() -> set[str]:
         "phase2-drift-report",
         "phase2-drift-triage",
         "phase2-drift-status",
+        "phase2-drift-root-cause",
     }
 
 
@@ -210,6 +211,17 @@ def build_parser() -> argparse.ArgumentParser:
     phase2_drift_status.add_argument("--as-of", required=True)
     phase2_drift_status.add_argument("--lookback-window-days", type=int, default=30)
     phase2_drift_status.add_argument("--benchmark-version", required=True)
+
+    phase2_drift_root_cause = subparsers.add_parser(
+        "phase2-drift-root-cause",
+        help="Generate deterministic drift root-cause diagnostics report",
+    )
+    phase2_drift_root_cause.add_argument("--as-of", required=True)
+    phase2_drift_root_cause.add_argument("--lookback-window-days", type=int, default=30)
+    phase2_drift_root_cause.add_argument("--benchmark-version", required=True)
+    phase2_drift_root_cause.add_argument("--out-dir", required=True)
+    phase2_drift_root_cause.add_argument("--drift-report", default="")
+    phase2_drift_root_cause.add_argument("--triage-status", default="")
 
     return parser
 
@@ -485,6 +497,22 @@ def main(argv: list[str] | None = None) -> None:
             as_of_date=str(args.as_of),
             lookback_window_days=int(args.lookback_window_days),
             benchmark_version=str(args.benchmark_version),
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "phase2-drift-root-cause":
+        orchestrator = _automation(root_dir)
+        out_dir = Path(args.out_dir).expanduser()
+        drift_report_ref = Path(args.drift_report).expanduser() if str(args.drift_report or "").strip() else None
+        triage_status_ref = Path(args.triage_status).expanduser() if str(args.triage_status or "").strip() else None
+        result = orchestrator.phase2_drift_root_cause(
+            as_of_date=str(args.as_of),
+            lookback_window_days=int(args.lookback_window_days),
+            benchmark_version=str(args.benchmark_version),
+            out_dir=out_dir,
+            drift_report_ref=drift_report_ref,
+            triage_status_ref=triage_status_ref,
         )
         print(json.dumps(result, indent=2))
         return
