@@ -131,7 +131,16 @@ python3 run.py run-autonomy --as-of 2026-03-31 --dry-run
 python3 run.py list-cases --status OPEN
 python3 run.py decide-case --case-id <case_id> --decision APPROVE --reason "override"
 python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --benchmark-version phase2.pr10.v1 --out-dir .state/automation_metrics
+python3 run.py seed-phase2-benchmark --as-of 2026-02-28 --benchmark-version phase2.pr11.v1
+python3 run.py phase2-gate-report --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr11.v1 --out-dir .state/release-readiness/pr11
+python3 run.py run-phase2-benchmark --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr11.v1 --out-dir .state/phase2-proof/pr11/manual
 ```
+
+PR11 gate reliability adds:
+- deterministic benchmark seeding keyed by `(as_of_date, benchmark_version)`,
+- promotion-ready gate report artifacts (`phase2_gate_report_<as_of>.json/.md`),
+- waiver validation from `.state/release-readiness/phase2_gate_waivers.json`,
+- read-only gate-health strip on `/v2/portfolio`.
 
 Phase 1 state writes to:
 - `.state/drep.sqlite`

@@ -334,16 +334,21 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             lookback_window_days = int(str((query.get("lookback_window_days") or ["30"])[0] or "30"))
             max_contracts_per_run = int(str((query.get("max_contracts_per_run") or ["20"])[0] or "20"))
             max_actions_per_run = int(str((query.get("max_actions_per_run") or ["200"])[0] or "200"))
-            benchmark_version = str((query.get("benchmark_version") or ["phase2.pr10.v1"])[0] or "phase2.pr10.v1").strip()
+            benchmark_version = str((query.get("benchmark_version") or ["phase2.pr11.v1"])[0] or "phase2.pr11.v1").strip()
             queue_data = service.command_center_sections(as_of_date=as_of_date_utc, limit=300)
             sections = queue_data["sections"]
             rows = queue_data["rows"]
             kpi_strip = service.portfolio_kpi_strip(
                 as_of_date=as_of_date_utc,
                 lookback_window_days=lookback_window_days,
-                benchmark_version=benchmark_version,
+                benchmark_version="phase2.pr10.v1",
             )
             trend_strip = service.portfolio_sla_trends(
+                as_of_date=as_of_date_utc,
+                lookback_window_days=lookback_window_days,
+                benchmark_version="phase2.pr10.v1",
+            )
+            gate_health = service.portfolio_gate_health_strip(
                 as_of_date=as_of_date_utc,
                 lookback_window_days=lookback_window_days,
                 benchmark_version=benchmark_version,
@@ -393,6 +398,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 f"<tr><td>exception_resolution_p95_hours</td><td>{_escape(str(trend_strip.get('exception_resolution_trend_state') or ''))}</td><td>{_escape(str(trend_strip.get('exception_resolution_trend_reason_code') or ''))}</td><td>{_escape(_fmt_metric(trend_strip.get('exception_resolution_current_p95_hours')))}</td><td>{_escape(_fmt_metric(trend_strip.get('exception_resolution_previous_p95_hours')))}</td></tr>"
                 f"<tr><td>settlement_aging_90+</td><td>{_escape(str(trend_strip.get('settlement_aging_trend_state') or ''))}</td><td>{_escape(str(trend_strip.get('settlement_aging_trend_reason_code') or ''))}</td><td>{_escape(_fmt_metric((trend_strip.get('settlement_aging_current') or {}).get('90+') if isinstance(trend_strip.get('settlement_aging_current'), dict) else None))}</td><td>{_escape(_fmt_metric((trend_strip.get('settlement_aging_previous') or {}).get('90+') if isinstance(trend_strip.get('settlement_aging_previous'), dict) else None))}</td></tr>"
                 "</tbody></table>",
+                "<h3>Gate Health (PR8/PR9/PR10)</h3>",
+                "<p class='muted'>Read-only gate status with waiver state. Edit controls remain outside primary workspace.</p>",
                 "<form method='POST' action='/v2/run-all-eligible' class='inline-grid'>"
                 f"<label>As-of (UTC) <input type='date' name='as_of_date' value='{_escape(as_of_date_utc)}' /></label>"
                 f"<label>Benchmark Version <input type='text' name='benchmark_version' value='{_escape(benchmark_version)}' /></label>"
@@ -401,6 +408,26 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 "<button type='submit'>Run All Eligible (Preview)</button>"
                 "</form>",
             ]
+            gates = gate_health.get("gates", []) if isinstance(gate_health.get("gates"), list) else []
+            latest_report_path = str(gate_health.get("latest_report_path") or "").strip()
+            if latest_report_path:
+                table.append(
+                    f"<p class='muted'>Latest gate report: "
+                    f"<a href='file://{_escape(latest_report_path)}' target='_blank'>{_escape(latest_report_path)}</a></p>"
+                )
+            table.append("<table><thead><tr><th>Gate</th><th>Pass</th><th>Reason</th><th>Waiver</th></tr></thead><tbody>")
+            for gate in gates:
+                table.append(
+                    "<tr>"
+                    f"<td>{_escape(gate.get('gate_name'))}</td>"
+                    f"<td>{_escape(str(gate.get('pass')))}</td>"
+                    f"<td>{_escape(gate.get('reason_code'))}</td>"
+                    f"<td>{_escape(gate.get('waiver_state'))}</td>"
+                    "</tr>"
+                )
+            if not gates:
+                table.append("<tr><td colspan='4' class='muted'>No gate report data for current inputs.</td></tr>")
+            table.append("</tbody></table>")
             if preview_result:
                 preview_rows = preview_result.get("skipped_contracts", [])
                 preview_rows = preview_rows if isinstance(preview_rows, list) else []
@@ -1901,7 +1928,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
         def _handle_run_all_preview(self) -> None:
             fields = self._urlencoded_fields()
             as_of = str(fields.get("as_of_date") or utc_today_iso()).strip()
-            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr6.v1").strip()
+            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr11.v1").strip()
             max_contracts = int(str(fields.get("max_contracts_per_run") or "20"))
             max_actions = int(str(fields.get("max_actions_per_run") or "200"))
             preview = service.run_all_eligible(
@@ -1924,7 +1951,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
         def _handle_run_all_execute(self) -> None:
             fields = self._urlencoded_fields()
             as_of = str(fields.get("as_of_date") or utc_today_iso()).strip()
-            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr6.v1").strip()
+            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr11.v1").strip()
             max_contracts = int(str(fields.get("max_contracts_per_run") or "20"))
             max_actions = int(str(fields.get("max_actions_per_run") or "200"))
             preview_token = str(fields.get("preview_token") or "").strip()

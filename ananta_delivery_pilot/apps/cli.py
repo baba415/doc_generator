@@ -36,6 +36,9 @@ def phase1_commands() -> set[str]:
         "list-cases",
         "decide-case",
         "autonomy-metrics",
+        "seed-phase2-benchmark",
+        "run-phase2-benchmark",
+        "phase2-gate-report",
     }
 
 
@@ -145,6 +148,35 @@ def build_parser() -> argparse.ArgumentParser:
     autonomy_metrics.add_argument("--out-dir", default="")
     autonomy_metrics.add_argument("--lookback-window-days", type=int, default=30)
     autonomy_metrics.add_argument("--benchmark-version", default="phase2.pr10.v1")
+
+    seed_phase2_benchmark = subparsers.add_parser(
+        "seed-phase2-benchmark",
+        help="Seed deterministic Phase2 benchmark fixtures",
+    )
+    seed_phase2_benchmark.add_argument("--as-of", required=True)
+    seed_phase2_benchmark.add_argument("--benchmark-version", required=True)
+    seed_phase2_benchmark.add_argument("--lookback-window-days", type=int, default=30)
+    seed_phase2_benchmark.add_argument("--reset", action="store_true")
+
+    run_phase2_benchmark = subparsers.add_parser(
+        "run-phase2-benchmark",
+        help="Run deterministic benchmark and write gate reports",
+    )
+    run_phase2_benchmark.add_argument("--as-of", required=True)
+    run_phase2_benchmark.add_argument("--lookback-window-days", type=int, default=30)
+    run_phase2_benchmark.add_argument("--benchmark-version", required=True)
+    run_phase2_benchmark.add_argument("--out-dir", required=True)
+    run_phase2_benchmark.add_argument("--waivers", default="")
+
+    phase2_gate_report = subparsers.add_parser(
+        "phase2-gate-report",
+        help="Generate PR8/PR9/PR10 promotion gate report",
+    )
+    phase2_gate_report.add_argument("--as-of", required=True)
+    phase2_gate_report.add_argument("--lookback-window-days", type=int, default=30)
+    phase2_gate_report.add_argument("--benchmark-version", required=True)
+    phase2_gate_report.add_argument("--waivers", default="")
+    phase2_gate_report.add_argument("--out-dir", required=True)
 
     return parser
 
@@ -339,6 +371,45 @@ def main(argv: list[str] | None = None) -> None:
             out_dir=out_dir,
             lookback_window_days=int(args.lookback_window_days),
             benchmark_version=str(args.benchmark_version),
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "seed-phase2-benchmark":
+        orchestrator = _automation(root_dir)
+        result = orchestrator.seed_phase2_benchmark(
+            as_of_date=str(args.as_of),
+            benchmark_version=str(args.benchmark_version),
+            reset=bool(args.reset),
+            lookback_window_days=int(args.lookback_window_days),
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "run-phase2-benchmark":
+        orchestrator = _automation(root_dir)
+        out_dir = Path(args.out_dir).expanduser()
+        waivers_path = Path(args.waivers).expanduser() if str(args.waivers or "").strip() else None
+        result = orchestrator.run_phase2_benchmark(
+            as_of_date=str(args.as_of),
+            lookback_window_days=int(args.lookback_window_days),
+            benchmark_version=str(args.benchmark_version),
+            out_dir=out_dir,
+            waivers_path=waivers_path,
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "phase2-gate-report":
+        orchestrator = _automation(root_dir)
+        out_dir = Path(args.out_dir).expanduser()
+        waivers_path = Path(args.waivers).expanduser() if str(args.waivers or "").strip() else None
+        result = orchestrator.phase2_gate_report(
+            as_of_date=str(args.as_of),
+            lookback_window_days=int(args.lookback_window_days),
+            benchmark_version=str(args.benchmark_version),
+            waivers_path=waivers_path,
+            out_dir=out_dir,
         )
         print(json.dumps(result, indent=2))
         return

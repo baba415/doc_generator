@@ -17,6 +17,10 @@ from core.time import utc_now_iso_z
 from core.units import mt_to_kg_int
 from domain.services import Phase1Service
 
+PR8_BENCHMARK_VERSION = "phase2.pr8.v1"
+PR9_BENCHMARK_VERSION = "phase2.pr9.v1"
+PR10_BENCHMARK_VERSION = "phase2.pr10.v1"
+
 
 @dataclass
 class ResolutionResult:
@@ -490,6 +494,1175 @@ class AutomationOrchestrator:
             )
         return {"ok": True, "metrics": metrics, "metrics_path": str(metrics_path)}
 
+    def seed_phase2_benchmark(
+        self,
+        *,
+        as_of_date: str,
+        benchmark_version: str,
+        reset: bool = False,
+        lookback_window_days: int = 30,
+    ) -> dict[str, Any]:
+        self.phase1.init_db()
+        if lookback_window_days <= 0:
+            raise ValueError("lookback_window_days must be > 0")
+        try:
+            as_of = date.fromisoformat(as_of_date)
+        except ValueError as error:
+            raise ValueError("as_of_date must be YYYY-MM-DD") from error
+
+        existing = self.repo.get_benchmark_run(as_of_date=as_of_date, benchmark_version=benchmark_version)
+        if existing and not reset:
+            return {
+                "ok": True,
+                "reused": True,
+                "as_of_date": as_of_date,
+                "benchmark_version": benchmark_version,
+                "benchmark_run_id": str(existing.get("benchmark_run_id") or ""),
+                "lookback_window_days": int(existing.get("lookback_window_days") or lookback_window_days),
+                "seeded_at_utc": str(existing.get("seeded_at_utc") or ""),
+                "fixture_counts": json.loads(existing.get("fixture_counts_json") or "{}"),
+                "fixture_metadata": json.loads(existing.get("fixture_metadata_json") or "{}"),
+            }
+
+        fixture_key = f"{as_of_date}|{benchmark_version}"
+        benchmark_run_id = f"BRUN-{canonical_json_sha256({'fixture_key': fixture_key})[:20]}"
+        seeded_at_utc = utc_now_iso_z()
+        issue_date = (as_of - timedelta(days=14)).isoformat()
+        due_date_open = (as_of - timedelta(days=20)).isoformat()
+        due_date_paid = (as_of - timedelta(days=10)).isoformat()
+        invoice_date = (as_of - timedelta(days=7)).isoformat()
+        current_case_created = (as_of - timedelta(days=3)).isoformat()
+        previous_case_created = (as_of - timedelta(days=11)).isoformat()
+
+        contract_id = f"CTR-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'contract'})[:20]}"
+        contract_line_id = f"CLN-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'line'})[:20]}"
+        planned_ids = [
+            f"PLN-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'plan', 'idx': idx})[:20]}"
+            for idx in range(1, 6)
+        ]
+        delivery_paid_id = f"DLV-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'delivery', 'idx': 1})[:20]}"
+        delivery_open_id = f"DLV-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'delivery', 'idx': 2})[:20]}"
+        snapshot_id = f"SNAP-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'snapshot'})[:20]}"
+        sales_paid_id = f"SAL-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'sales', 'idx': 1})[:20]}"
+        sales_open_id = f"SAL-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'sales', 'idx': 2})[:20]}"
+        sales_line_paid_id = f"SLL-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'sales-line', 'idx': 1})[:20]}"
+        sales_line_open_id = f"SLL-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'sales-line', 'idx': 2})[:20]}"
+        payment_id = f"PAY-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'payment'})[:20]}"
+        allocation_id = f"PAL-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'allocation'})[:20]}"
+        intake_run_id = f"ARUN-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'intake-run'})[:20]}"
+        case_current_id = f"CASE-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'case', 'idx': 1})[:20]}"
+        case_previous_id = f"CASE-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'case', 'idx': 2})[:20]}"
+        decision_current_id = f"HDEC-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'decision', 'idx': 1})[:20]}"
+        decision_previous_id = f"HDEC-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'decision', 'idx': 2})[:20]}"
+
+        now = utc_now_iso_z()
+        with self.repo.transaction() as conn:
+            buyer = conn.execute("SELECT * FROM parties WHERE party_id = 'buyer_nycil'").fetchone()
+            vendor = conn.execute("SELECT * FROM parties WHERE party_id = 'ananta_flows'").fetchone()
+            operator = conn.execute("SELECT * FROM parties WHERE party_id = 'guildgate'").fetchone()
+            if not buyer or not vendor or not operator:
+                raise ValueError("Required seeded parties are missing; run init-db first")
+            snapshot_payload = {
+                "buyer": {"party_id": "buyer_nycil", "name": str(buyer["legal_name"])},
+                "vendor_of_record": {"party_id": "ananta_flows", "name": str(vendor["legal_name"])},
+                "operator": {"party_id": "guildgate", "name": str(operator["legal_name"])},
+                "fixture_key": fixture_key,
+            }
+            conn.execute(
+                """
+                INSERT INTO parties_snapshot(
+                  snapshot_id, buyer_id, buyer_name, buyer_tin, buyer_rc_number,
+                  vendor_of_record_id, vendor_of_record_name, vendor_of_record_tin, vendor_of_record_rc_number,
+                  operator_id, operator_name, operator_tin, operator_rc_number, payload_json, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(snapshot_id) DO UPDATE SET
+                  payload_json = excluded.payload_json,
+                  created_at = excluded.created_at
+                """,
+                (
+                    snapshot_id,
+                    "buyer_nycil",
+                    str(buyer["legal_name"]),
+                    buyer["tin"],
+                    buyer["rc_number"],
+                    "ananta_flows",
+                    str(vendor["legal_name"]),
+                    vendor["tin"],
+                    vendor["rc_number"],
+                    "guildgate",
+                    str(operator["legal_name"]),
+                    operator["tin"],
+                    operator["rc_number"],
+                    json.dumps(snapshot_payload, sort_keys=True),
+                    f"{issue_date}T08:00:00Z",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO contracts(
+                  contract_id, contract_ref, lpo_no, lpo_date, buyer_id, vendor_of_record_id, operator_id,
+                  source_id, processor_id, lane, currency, issue_date, lpo_valid_from, lpo_valid_to, lpo_state,
+                  due_date, due_terms, expected_total_qty, expected_total_qty_kg, expected_total_value,
+                  over_delivery_tolerance_pct, status, notes, created_at, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, 5.0, 'OPEN', ?, ?, ?)
+                ON CONFLICT(contract_id) DO UPDATE SET
+                  issue_date = excluded.issue_date,
+                  lpo_valid_from = excluded.lpo_valid_from,
+                  lpo_valid_to = excluded.lpo_valid_to,
+                  expected_total_qty = excluded.expected_total_qty,
+                  expected_total_qty_kg = excluded.expected_total_qty_kg,
+                  expected_total_value = excluded.expected_total_value,
+                  over_delivery_tolerance_pct = excluded.over_delivery_tolerance_pct,
+                  status = excluded.status,
+                  notes = excluded.notes,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    contract_id,
+                    f"BENCH-{benchmark_version}-{as_of_date}",
+                    f"LPO-BENCH-{benchmark_version}-{as_of_date}",
+                    issue_date,
+                    "buyer_nycil",
+                    "ananta_flows",
+                    "guildgate",
+                    "ananta_flows",
+                    "processor_partner_refinery",
+                    "B",
+                    "NGN",
+                    issue_date,
+                    issue_date,
+                    as_of_date,
+                    due_date_open,
+                    "14 days",
+                    150.0,
+                    150000,
+                    340500000.0,
+                    f"phase2_benchmark fixture={fixture_key}",
+                    f"{issue_date}T07:30:00Z",
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO contract_line_items(
+                  contract_line_id, contract_id, line_no, product_code, description, expected_qty, delivered_qty,
+                  expected_qty_kg, delivered_qty_kg, unit, unit_price, unit_price_basis, expected_value, created_at, updated_at
+                )
+                VALUES(?, ?, 1, 'RBDPO', 'Phase2 benchmark lot policy line', 150.0, 60.0, 150000, 60000, 'mt', 2270.0, 'KG', 340500000.0, ?, ?)
+                ON CONFLICT(contract_line_id) DO UPDATE SET
+                  expected_qty = excluded.expected_qty,
+                  expected_qty_kg = excluded.expected_qty_kg,
+                  delivered_qty = excluded.delivered_qty,
+                  delivered_qty_kg = excluded.delivered_qty_kg,
+                  updated_at = excluded.updated_at
+                """,
+                (contract_line_id, contract_id, f"{issue_date}T07:31:00Z", now),
+            )
+
+            for idx, planned_id in enumerate(planned_ids, start=1):
+                planned_date = (as_of - timedelta(days=6 - idx)).isoformat()
+                conn.execute(
+                    """
+                    INSERT INTO planned_deliveries(
+                      planned_delivery_id, contract_id, contract_line_id, sequence_no, planned_qty_kg, lot_size_kg,
+                      planned_date, run_id, batch_id, status, delivery_id, notes, materialized_qty_kg, delivered_qty_kg, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, 30000, 30000, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(planned_delivery_id) DO UPDATE SET
+                      planned_date = excluded.planned_date,
+                      run_id = excluded.run_id,
+                      batch_id = excluded.batch_id,
+                      status = excluded.status,
+                      delivery_id = excluded.delivery_id,
+                      notes = excluded.notes,
+                      materialized_qty_kg = excluded.materialized_qty_kg,
+                      delivered_qty_kg = excluded.delivered_qty_kg,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        planned_id,
+                        contract_id,
+                        contract_line_id,
+                        idx,
+                        planned_date,
+                        f"RUN-BENCH-{idx:02d}",
+                        f"AFL-RBDPO-BENCH-{idx:02d}",
+                        "PAID" if idx == 1 else ("INVOICED" if idx == 2 else "PLANNED"),
+                        None,
+                        f"auto_plan fixture={fixture_key}",
+                        30000 if idx in {1, 2} else 0,
+                        30000 if idx in {1, 2} else 0,
+                        f"{planned_date}T07:00:00Z",
+                        now,
+                    ),
+                )
+
+            deliveries = [
+                (
+                    delivery_paid_id,
+                    "RUN-BENCH-01",
+                    "AFL-RBDPO-BENCH-01",
+                    "PAID",
+                    (as_of - timedelta(days=6)).isoformat(),
+                    f"{(as_of - timedelta(days=6)).isoformat()}T09:00:00Z",
+                    f"{(as_of - timedelta(days=5)).isoformat()}T12:00:00Z",
+                    f"{(as_of - timedelta(days=4)).isoformat()}T14:00:00Z",
+                    f"{(as_of - timedelta(days=3)).isoformat()}T11:00:00Z",
+                ),
+                (
+                    delivery_open_id,
+                    "RUN-BENCH-02",
+                    "AFL-RBDPO-BENCH-02",
+                    "INVOICED",
+                    (as_of - timedelta(days=5)).isoformat(),
+                    f"{(as_of - timedelta(days=5)).isoformat()}T09:15:00Z",
+                    f"{(as_of - timedelta(days=4)).isoformat()}T13:00:00Z",
+                    f"{(as_of - timedelta(days=3)).isoformat()}T15:00:00Z",
+                    None,
+                ),
+            ]
+            for delivery_id, run_id, batch_id, status, delivery_date, dispatched_at, delivered_at, invoiced_at, paid_at in deliveries:
+                conn.execute(
+                    """
+                    INSERT INTO deliveries(
+                      delivery_id, contract_id, contract_line_id, delivery_ref, run_id, batch_id, delivery_date,
+                      delivered_qty, delivered_qty_kg, unit, unit_price, unit_price_basis, gross_amount,
+                      truck_no, driver_name, driver_phone, notes, status, dispatched_at, delivered_at, invoiced_at, paid_at, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, ?, 30000, 30000, 'kgs', 2270.0, 'KG', 68100000.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(delivery_id) DO UPDATE SET
+                      status = excluded.status,
+                      dispatched_at = excluded.dispatched_at,
+                      delivered_at = excluded.delivered_at,
+                      invoiced_at = excluded.invoiced_at,
+                      paid_at = excluded.paid_at,
+                      notes = excluded.notes,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        delivery_id,
+                        contract_id,
+                        contract_line_id,
+                        f"DLV-BENCH-{delivery_id[-4:]}",
+                        run_id,
+                        batch_id,
+                        delivery_date,
+                        f"T{delivery_id[-4:]}",
+                        "Idowu Atanda",
+                        "08052803019",
+                        f"benchmark fixture={fixture_key}",
+                        status,
+                        dispatched_at,
+                        delivered_at,
+                        invoiced_at,
+                        paid_at,
+                        f"{delivery_date}T08:00:00Z",
+                        now,
+                    ),
+                )
+            conn.execute(
+                "UPDATE planned_deliveries SET delivery_id = ? WHERE planned_delivery_id = ?",
+                (delivery_paid_id, planned_ids[0]),
+            )
+            conn.execute(
+                "UPDATE planned_deliveries SET delivery_id = ? WHERE planned_delivery_id = ?",
+                (delivery_open_id, planned_ids[1]),
+            )
+
+            sales_rows = [
+                (
+                    sales_paid_id,
+                    delivery_paid_id,
+                    sales_line_paid_id,
+                    "INV-BENCH-PAID-001",
+                    due_date_paid,
+                    68100000.0,
+                    68100000.0,
+                    0.0,
+                ),
+                (
+                    sales_open_id,
+                    delivery_open_id,
+                    sales_line_open_id,
+                    "INV-BENCH-OPEN-001",
+                    due_date_open,
+                    68100000.0,
+                    68100000.0,
+                    0.0,
+                ),
+            ]
+            for sales_id, delivery_id, sales_line_id, invoice_no, due_date, gross_amount, amount_due, expected_wht in sales_rows:
+                conn.execute(
+                    """
+                    INSERT INTO sales_transactions(
+                      sales_transaction_id, contract_id, delivery_id, snapshot_id, vendor_of_record_id, buyer_id, operator_id,
+                      lane, invoice_no, invoice_date, due_date, currency, gross_amount, amount_due, expected_wht_amount, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, 'ananta_flows', 'buyer_nycil', 'guildgate', 'B', ?, ?, ?, 'NGN', ?, ?, ?, ?, ?)
+                    ON CONFLICT(sales_transaction_id) DO UPDATE SET
+                      due_date = excluded.due_date,
+                      gross_amount = excluded.gross_amount,
+                      amount_due = excluded.amount_due,
+                      expected_wht_amount = excluded.expected_wht_amount,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        sales_id,
+                        contract_id,
+                        delivery_id,
+                        snapshot_id,
+                        invoice_no,
+                        invoice_date,
+                        due_date,
+                        gross_amount,
+                        amount_due,
+                        expected_wht,
+                        f"{invoice_date}T16:00:00Z",
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO sales_lines(
+                      sales_line_id, sales_transaction_id, delivery_id, contract_line_id, line_no, product_code, description,
+                      quantity, quantity_kg, unit, unit_price, unit_price_basis, gross_amount, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, 1, 'RBDPO', 'Benchmark sales line', 30000.0, 30000, 'kgs', 2270.0, 'KG', 68100000.0, ?, ?)
+                    ON CONFLICT(sales_line_id) DO UPDATE SET
+                      quantity = excluded.quantity,
+                      quantity_kg = excluded.quantity_kg,
+                      gross_amount = excluded.gross_amount,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        sales_line_id,
+                        sales_id,
+                        delivery_id,
+                        contract_line_id,
+                        f"{invoice_date}T16:05:00Z",
+                        now,
+                    ),
+                )
+
+            conn.execute(
+                """
+                INSERT INTO payments(
+                  payment_id, vendor_of_record_id, buyer_id, payment_date, amount_received, currency, payment_method,
+                  external_reference, idempotency_key, receipt_no, created_at, updated_at
+                )
+                VALUES(?, 'ananta_flows', 'buyer_nycil', ?, 68100000.0, 'NGN', 'Bank Transfer', ?, ?, ?, ?, ?)
+                ON CONFLICT(payment_id) DO UPDATE SET
+                  amount_received = excluded.amount_received,
+                  payment_date = excluded.payment_date,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    payment_id,
+                    (as_of - timedelta(days=3)).isoformat(),
+                    f"BANK-BENCH-{benchmark_version}-{as_of_date}",
+                    f"bench-payment::{fixture_key}",
+                    f"RCPT-BENCH-{as_of_date}",
+                    f"{(as_of - timedelta(days=3)).isoformat()}T12:30:00Z",
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO payment_allocations(
+                  allocation_id, payment_id, sales_transaction_id, allocated_amount, allocation_date, notes, created_at
+                )
+                VALUES(?, ?, ?, 68100000.0, ?, ?, ?)
+                ON CONFLICT(allocation_id) DO UPDATE SET
+                  allocated_amount = excluded.allocated_amount,
+                  allocation_date = excluded.allocation_date,
+                  notes = excluded.notes
+                """,
+                (
+                    allocation_id,
+                    payment_id,
+                    sales_paid_id,
+                    (as_of - timedelta(days=3)).isoformat(),
+                    f"benchmark fixture={fixture_key}",
+                    f"{(as_of - timedelta(days=3)).isoformat()}T12:31:00Z",
+                ),
+            )
+
+            conn.execute(
+                """
+                INSERT INTO automation_runs(
+                  run_id, idempotency_key, status, dry_run, as_of_date, input_json, normalized_input_json,
+                  metrics_json, started_at, completed_at, duration_seconds, created_at, updated_at
+                )
+                VALUES(?, ?, 'COMPLETED', 1, ?, '{}', '{}', '{}', ?, ?, 1.0, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                  status = excluded.status,
+                  as_of_date = excluded.as_of_date,
+                  completed_at = excluded.completed_at,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    intake_run_id,
+                    f"benchmark-intake::{fixture_key}",
+                    (as_of - timedelta(days=2)).isoformat(),
+                    f"{(as_of - timedelta(days=2)).isoformat()}T08:00:00Z",
+                    f"{(as_of - timedelta(days=2)).isoformat()}T08:01:00Z",
+                    f"{(as_of - timedelta(days=2)).isoformat()}T08:00:00Z",
+                    now,
+                ),
+            )
+            parser_decisions = [
+                ("buyer_id", "auto_applied", 0.98),
+                ("vendor_of_record_id", "auto_applied", 0.97),
+                ("product_code", "auto_applied", 0.96),
+                ("expected_qty_kg", "auto_applied", 0.96),
+                ("unit_price", "needs_review", 0.82),
+            ]
+            confirm_decisions = [
+                ("unit_price", "user_corrected", 1.0),
+                ("description", "user_corrected", 1.0),
+                ("issue_date", "user_confirmed", 1.0),
+                ("lpo_valid_to", "user_confirmed", 1.0),
+            ]
+            for idx, (field_name, decision, confidence) in enumerate(parser_decisions, start=1):
+                decision_id = f"ADEC-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'parser-decision', 'idx': idx})[:20]}"
+                conn.execute(
+                    """
+                    INSERT INTO automation_decisions(
+                      decision_id, run_id, stage, field_name, required_flag, proposed_value,
+                      source_type, source_ref, confidence, decision, reason_code, rule_path, created_at
+                    )
+                    VALUES(?, ?, 'intake_parser', ?, 1, 'fixture', 'parser', 'benchmark', ?, ?, ?, 'benchmark.intake_parser', ?)
+                    ON CONFLICT(decision_id) DO UPDATE SET
+                      confidence = excluded.confidence,
+                      decision = excluded.decision,
+                      reason_code = excluded.reason_code,
+                      created_at = excluded.created_at
+                    """,
+                    (
+                        decision_id,
+                        intake_run_id,
+                        field_name,
+                        confidence,
+                        decision,
+                        "auto_threshold_met" if decision == "auto_applied" else "review_threshold",
+                        f"{(as_of - timedelta(days=2)).isoformat()}T08:00:{idx:02d}Z",
+                    ),
+                )
+            for idx, (field_name, decision, confidence) in enumerate(confirm_decisions, start=1):
+                decision_id = f"ADEC-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'confirm-decision', 'idx': idx})[:20]}"
+                conn.execute(
+                    """
+                    INSERT INTO automation_decisions(
+                      decision_id, run_id, stage, field_name, required_flag, proposed_value,
+                      source_type, source_ref, confidence, decision, reason_code, rule_path, created_at
+                    )
+                    VALUES(?, ?, 'intake_confirm', ?, 1, 'fixture', 'user_input', '/v2/intake/confirm', ?, ?, ?, 'benchmark.intake_confirm', ?)
+                    ON CONFLICT(decision_id) DO UPDATE SET
+                      confidence = excluded.confidence,
+                      decision = excluded.decision,
+                      reason_code = excluded.reason_code,
+                      created_at = excluded.created_at
+                    """,
+                    (
+                        decision_id,
+                        intake_run_id,
+                        field_name,
+                        confidence,
+                        decision,
+                        decision,
+                        f"{(as_of - timedelta(days=2)).isoformat()}T08:01:{idx:02d}Z",
+                    ),
+                )
+
+            for idx in range(1, 3):
+                intent_id = f"INT-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'intent', 'idx': idx})[:20]}"
+                exec_id = f"EXE-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'execution', 'idx': idx})[:20]}"
+                created_at = f"{(as_of - timedelta(days=2)).isoformat()}T10:{idx:02d}:00Z"
+                conn.execute(
+                    """
+                    INSERT INTO action_intents(
+                      action_intent_id, autonomy_run_id, intent_type, contract_id, delivery_id, planned_delivery_id,
+                      as_of_date, scheduled_at, status, policy_version, payload_json, idempotency_key, created_at, updated_at
+                    )
+                    VALUES(?, ?, 'materialize_due', ?, ?, ?, ?, ?, 'SUCCESS', ?, '{}', ?, ?, ?)
+                    ON CONFLICT(action_intent_id) DO UPDATE SET
+                      status = excluded.status,
+                      as_of_date = excluded.as_of_date,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        intent_id,
+                        f"AUTO-{fixture_key}",
+                        contract_id,
+                        delivery_paid_id if idx == 1 else delivery_open_id,
+                        planned_ids[idx - 1],
+                        as_of_date,
+                        created_at,
+                        benchmark_version,
+                        f"bench-intent::{fixture_key}::{idx}",
+                        created_at,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO action_executions(
+                      action_execution_id, action_intent_id, execution_no, status, idempotency_key,
+                      request_json, response_json, error_json, executed_at, created_at
+                    )
+                    VALUES(?, ?, 1, ?, ?, '{}', '{}', NULL, ?, ?)
+                    ON CONFLICT(action_execution_id) DO UPDATE SET
+                      status = excluded.status,
+                      executed_at = excluded.executed_at
+                    """,
+                    (
+                        exec_id,
+                        intent_id,
+                        "SUCCESS",
+                        f"bench-execution::{fixture_key}::{idx}",
+                        created_at,
+                        created_at,
+                    ),
+                )
+
+            exception_cases = [
+                (
+                    case_previous_id,
+                    previous_case_created,
+                    f"{previous_case_created}T09:00:00Z",
+                    f"{(as_of - timedelta(days=9)).isoformat()}T09:00:00Z",
+                    decision_previous_id,
+                    "previous_window",
+                ),
+                (
+                    case_current_id,
+                    current_case_created,
+                    f"{current_case_created}T09:00:00Z",
+                    f"{current_case_created}T12:00:00Z",
+                    decision_current_id,
+                    "current_window",
+                ),
+            ]
+            for case_id, case_date, created_at, resolved_at, decision_id, label in exception_cases:
+                conn.execute(
+                    """
+                    INSERT INTO exception_cases(
+                      exception_case_id, autonomy_run_id, action_intent_id, contract_id, delivery_id, planned_delivery_id,
+                      case_type, severity, status, reason_code, details_json, idempotency_key, created_at, updated_at, resolved_at
+                    )
+                    VALUES(?, ?, NULL, ?, NULL, NULL, 'benchmark_case', 'REVIEW', 'RESOLVED', ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(exception_case_id) DO UPDATE SET
+                      status = excluded.status,
+                      reason_code = excluded.reason_code,
+                      details_json = excluded.details_json,
+                      resolved_at = excluded.resolved_at,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        case_id,
+                        f"AUTO-{fixture_key}",
+                        contract_id,
+                        f"benchmark_{label}",
+                        json.dumps({"as_of_date": case_date, "fixture_key": fixture_key}, sort_keys=True),
+                        f"bench-case::{fixture_key}::{label}",
+                        created_at,
+                        now,
+                        resolved_at,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO human_decisions(
+                      human_decision_id, exception_case_id, decided_by_user_id, decision, reason,
+                      decision_payload_json, idempotency_key, decided_at, created_at
+                    )
+                    VALUES(?, ?, NULL, 'APPROVE', 'benchmark decision', '{}', ?, ?, ?)
+                    ON CONFLICT(human_decision_id) DO UPDATE SET
+                      decision = excluded.decision,
+                      reason = excluded.reason,
+                      decided_at = excluded.decided_at
+                    """,
+                    (
+                        decision_id,
+                        case_id,
+                        f"bench-decision::{fixture_key}::{label}",
+                        resolved_at,
+                        resolved_at,
+                    ),
+                )
+
+            for idx in range(1, 3):
+                outcome_id = f"DOUT-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'transport-feedback', 'idx': idx})[:20]}"
+                created_at = f"{(as_of - timedelta(days=2)).isoformat()}T11:{idx:02d}:00Z"
+                conn.execute(
+                    """
+                    INSERT INTO decision_outcomes(
+                      decision_outcome_id, exception_case_id, human_decision_id, outcome_label, outcome_json, created_at
+                    )
+                    VALUES(?, ?, ?, 'transport_suggestion_feedback', ?, ?)
+                    ON CONFLICT(decision_outcome_id) DO UPDATE SET
+                      created_at = excluded.created_at
+                    """,
+                    (
+                        outcome_id,
+                        case_current_id,
+                        decision_current_id,
+                        json.dumps({"accepted": True, "fixture_key": fixture_key}, sort_keys=True),
+                        created_at,
+                    ),
+                )
+
+            for idx, delivery_id in enumerate((delivery_paid_id, delivery_open_id), start=1):
+                transport_snapshot_id = f"TSNAP-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'transport-snapshot', 'idx': idx})[:20]}"
+                created_at = f"{(as_of - timedelta(days=2)).isoformat()}T10:{20 + idx:02d}:00Z"
+                conn.execute(
+                    """
+                    INSERT INTO delivery_transport_snapshot(
+                      snapshot_id, delivery_id, planned_delivery_id, transport_partner_id, transport_truck_id, transport_driver_id,
+                      partner_name, truck_no, driver_name, driver_phone, source_type, source_ref, confidence, reason_code, payload_json, created_at
+                    )
+                    VALUES(?, ?, ?, NULL, NULL, NULL, 'Benchmark Transport', ?, 'Idowu Atanda', '08052803019', 'history',
+                           'benchmark', 0.96, 'auto_threshold_met', ?, ?)
+                    ON CONFLICT(snapshot_id) DO UPDATE SET
+                      confidence = excluded.confidence,
+                      reason_code = excluded.reason_code,
+                      created_at = excluded.created_at
+                    """,
+                    (
+                        transport_snapshot_id,
+                        delivery_id,
+                        planned_ids[idx - 1],
+                        f"T{delivery_id[-4:]}",
+                        json.dumps({"fixture_key": fixture_key, "delivery_id": delivery_id}, sort_keys=True),
+                        created_at,
+                    ),
+                )
+
+            for idx in range(1, 11):
+                evidence_id = f"EVD-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'evidence', 'idx': idx})[:20]}"
+                link_status = "AUTO_LINKED" if idx <= 9 else "AUTO_LINK_REJECTED"
+                linked_at = f"{(as_of - timedelta(days=2)).isoformat()}T12:{idx:02d}:00Z"
+                conn.execute(
+                    """
+                    INSERT INTO evidence_originals(
+                      evidence_id, contract_id, delivery_id, sales_transaction_id, sales_line_id, file_name, doc_type,
+                      link_status, link_confidence, link_reason_code, link_source, linked_at, source_path, stored_path,
+                      sha256, captured_at, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, ?, ?, 'WAYBILL', ?, 0.95, ?, 'benchmark', ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(evidence_id) DO UPDATE SET
+                      link_status = excluded.link_status,
+                      link_reason_code = excluded.link_reason_code,
+                      linked_at = excluded.linked_at,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        evidence_id,
+                        contract_id,
+                        delivery_paid_id if idx % 2 else delivery_open_id,
+                        sales_paid_id if idx % 2 else sales_open_id,
+                        sales_line_paid_id if idx % 2 else sales_line_open_id,
+                        f"bench-evidence-{idx}.pdf",
+                        link_status,
+                        "auto_linked" if link_status == "AUTO_LINKED" else "manual_link_rejected",
+                        linked_at,
+                        f"/tmp/bench/{fixture_key}/{idx}.pdf",
+                        f"/tmp/bench-store/{fixture_key}/{idx}.pdf",
+                        canonical_json_sha256({"fixture_key": fixture_key, "evidence": idx}),
+                        linked_at,
+                        linked_at,
+                        now,
+                    ),
+                )
+
+            for idx in range(1, 11):
+                event_id = f"EVT-{canonical_json_sha256({'fixture_key': fixture_key, 'kind': 'settlement-event', 'idx': idx})[:20]}"
+                event_type = "SETTLEMENT_SUGGESTION_ACCEPTED" if idx <= 8 else "SETTLEMENT_SUGGESTION_ROUTED_EXCEPTION"
+                created_at = f"{(as_of - timedelta(days=1)).isoformat()}T14:{idx:02d}:00Z"
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO event_log(
+                      event_id, entity_type, entity_id, event_type, as_of_date, payload_json, source, created_at
+                    )
+                    VALUES(?, 'CONTRACT', ?, ?, ?, ?, 'phase2-benchmark', ?)
+                    """,
+                    (
+                        event_id,
+                        contract_id,
+                        event_type,
+                        as_of_date,
+                        json.dumps({"fixture_key": fixture_key, "idx": idx}, sort_keys=True),
+                        created_at,
+                    ),
+                )
+
+            fixture_counts = {
+                "contracts": 1,
+                "deliveries": 2,
+                "planned_deliveries": 5,
+                "sales_transactions": 2,
+                "suggestion_events": 10,
+                "decisions": len(parser_decisions) + len(confirm_decisions) + len(exception_cases),
+            }
+            fixture_metadata = {
+                "fixture_key": fixture_key,
+                "as_of_date": as_of_date,
+                "benchmark_version": benchmark_version,
+                "contract_ids": [contract_id],
+                "delivery_ids": [delivery_paid_id, delivery_open_id],
+                "sales_transaction_ids": [sales_paid_id, sales_open_id],
+                "intake_run_id": intake_run_id,
+                "case_ids": [case_previous_id, case_current_id],
+                "seed_reset_requested": bool(reset),
+            }
+            self.repo.upsert_benchmark_run(
+                conn,
+                benchmark_run_id=benchmark_run_id,
+                as_of_date=as_of_date,
+                benchmark_version=benchmark_version,
+                lookback_window_days=int(lookback_window_days),
+                fixture_counts=fixture_counts,
+                fixture_metadata=fixture_metadata,
+                seeded_at_utc=seeded_at_utc,
+            )
+
+        return {
+            "ok": True,
+            "reused": False,
+            "as_of_date": as_of_date,
+            "benchmark_version": benchmark_version,
+            "benchmark_run_id": benchmark_run_id,
+            "lookback_window_days": int(lookback_window_days),
+            "seeded_at_utc": seeded_at_utc,
+            "fixture_counts": fixture_counts,
+            "fixture_metadata": fixture_metadata,
+        }
+
+    def run_phase2_benchmark(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+        out_dir: Path,
+        waivers_path: Path | None = None,
+    ) -> dict[str, Any]:
+        seed_result = self.seed_phase2_benchmark(
+            as_of_date=as_of_date,
+            benchmark_version=benchmark_version,
+            reset=False,
+            lookback_window_days=lookback_window_days,
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        seed_path = out_dir / f"phase2_benchmark_seed_{as_of_date}.json"
+        seed_path.write_text(json.dumps(seed_result, indent=2, sort_keys=True), encoding="utf-8")
+        report = self.phase2_gate_report(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+            waivers_path=waivers_path,
+            out_dir=out_dir,
+        )
+        return {
+            "ok": True,
+            "seed": seed_result,
+            "seed_path": str(seed_path),
+            "report_json_path": report["report_json_path"],
+            "report_md_path": report["report_md_path"],
+            "promotion_recommendation": report["promotion_recommendation"],
+            "gate_report": report["gate_report"],
+        }
+
+    def phase2_gate_health_snapshot(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+        waivers_path: Path | None = None,
+    ) -> dict[str, Any]:
+        report = self.phase2_gate_report(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+            waivers_path=waivers_path,
+            out_dir=None,
+            persist=False,
+        )
+        latest_row = self.repo.fetch_one(
+            """
+            SELECT report_json_path, report_md_path
+            FROM benchmark_runs
+            WHERE report_md_path IS NOT NULL AND report_md_path <> ''
+            ORDER BY generated_at_utc DESC, updated_at DESC
+            LIMIT 1
+            """
+        )
+        latest_report_path = ""
+        if latest_row:
+            latest_report_path = str(latest_row.get("report_md_path") or latest_row.get("report_json_path") or "")
+        return {
+            "as_of_date": report["gate_report"]["inputs"]["as_of_date"],
+            "lookback_window_days": report["gate_report"]["inputs"]["lookback_window_days"],
+            "benchmark_version": report["gate_report"]["inputs"]["benchmark_version"],
+            "generated_at_utc": report["gate_report"]["inputs"]["generated_at_utc"],
+            "promotion_recommendation": report["promotion_recommendation"],
+            "gates": report["gate_report"]["gates"],
+            "waiver_validation": report["gate_report"]["waiver_validation"],
+            "latest_report_path": latest_report_path,
+        }
+
+    def phase2_gate_report(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+        waivers_path: Path | None = None,
+        out_dir: Path | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        if lookback_window_days <= 0:
+            raise ValueError("lookback_window_days must be > 0")
+        try:
+            date.fromisoformat(as_of_date)
+        except ValueError as error:
+            raise ValueError("as_of_date must be YYYY-MM-DD") from error
+        generated_at_utc = utc_now_iso_z()
+        run_row = self.repo.get_benchmark_run(as_of_date=as_of_date, benchmark_version=benchmark_version)
+        available_versions = self.repo.fetch_all(
+            "SELECT benchmark_version FROM benchmark_runs WHERE as_of_date = ? ORDER BY benchmark_version ASC",
+            (as_of_date,),
+        )
+        available_version_values = [str(row.get("benchmark_version") or "") for row in available_versions]
+        benchmark_match = run_row is not None
+        if run_row is None and available_version_values:
+            benchmark_guard_reason = "benchmark_version_mismatch"
+        elif run_row is None:
+            benchmark_guard_reason = "benchmark_not_seeded"
+        else:
+            benchmark_guard_reason = "pass"
+
+        pr8_metrics = self.compute_metrics_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=PR8_BENCHMARK_VERSION,
+        )
+        pr9_metrics = self.compute_metrics_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=PR9_BENCHMARK_VERSION,
+        )
+        pr10_metrics = self.compute_metrics_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=PR10_BENCHMARK_VERSION,
+        )
+
+        gates: list[dict[str, Any]] = [
+            {
+                "gate_name": "pr8",
+                "pass": bool(pr8_metrics.get("pr8_gate_pass")),
+                "reason_code": str(pr8_metrics.get("pr8_gate_reason_code") or ""),
+                "metrics": {
+                    "median_manual_fields_per_intake": pr8_metrics.get("median_manual_fields_per_intake"),
+                    "autoplan_zero_edit_common_case_rate": pr8_metrics.get("autoplan_zero_edit_common_case_rate"),
+                    "intake_decision_distribution": pr8_metrics.get("intake_decision_distribution"),
+                },
+            },
+            {
+                "gate_name": "pr9",
+                "pass": bool(pr9_metrics.get("pr9_gate_pass")),
+                "reason_code": str(pr9_metrics.get("pr9_gate_reason_code") or ""),
+                "metrics": {
+                    "manual_transport_fields_per_delivery": pr9_metrics.get("manual_transport_fields_per_delivery"),
+                    "doc_autolink_precision": pr9_metrics.get("doc_autolink_precision"),
+                    "deliveries_with_transport_assignment": pr9_metrics.get("deliveries_with_transport_assignment"),
+                },
+            },
+            {
+                "gate_name": "pr10",
+                "pass": bool(pr10_metrics.get("pr10_gate_pass")),
+                "reason_code": str(pr10_metrics.get("pr10_gate_reason_code") or ""),
+                "metrics": {
+                    "payment_suggestion_acceptance_rate": pr10_metrics.get("payment_suggestion_acceptance_rate"),
+                    "exception_resolution_trend_state": pr10_metrics.get("exception_resolution_trend_state"),
+                    "touchless_rate": pr10_metrics.get("touchless_rate"),
+                    "auto_action_success_rate": pr10_metrics.get("auto_action_success_rate"),
+                },
+            },
+        ]
+        if not benchmark_match:
+            for gate in gates:
+                gate["pass"] = False
+                gate["reason_code"] = benchmark_guard_reason
+
+        waiver_file = waivers_path or (self.config.state_dir / "release-readiness" / "phase2_gate_waivers.json")
+        waiver_validation = self._validate_phase2_gate_waivers(
+            waivers_path=waiver_file,
+            generated_at_utc=generated_at_utc,
+        )
+        valid_waivers_by_gate: dict[str, list[dict[str, Any]]] = waiver_validation["valid_waivers_by_gate"]
+        invalid_waivers_by_gate: dict[str, list[dict[str, Any]]] = waiver_validation["invalid_waivers_by_gate"]
+
+        failed_gates: list[dict[str, Any]] = [gate for gate in gates if not bool(gate.get("pass"))]
+        blocking_reasons: list[str] = []
+        waiver_refs: list[str] = []
+        all_failed_waived = True
+        for gate in failed_gates:
+            gate_name = str(gate.get("gate_name") or "").lower()
+            valid_for_gate = valid_waivers_by_gate.get(gate_name, [])
+            invalid_for_gate = invalid_waivers_by_gate.get(gate_name, [])
+            if valid_for_gate:
+                gate["waiver_state"] = "active"
+                gate["waiver_refs"] = [str(item.get("waiver_id") or "") for item in valid_for_gate if item.get("waiver_id")]
+                waiver_refs.extend(gate["waiver_refs"])
+            elif invalid_for_gate:
+                gate["waiver_state"] = "invalid"
+                gate["waiver_refs"] = []
+                all_failed_waived = False
+                blocking_reasons.append(f"{gate_name}:{gate.get('reason_code')}:invalid_waiver")
+            else:
+                gate["waiver_state"] = "none"
+                gate["waiver_refs"] = []
+                all_failed_waived = False
+                blocking_reasons.append(f"{gate_name}:{gate.get('reason_code')}")
+        for gate in gates:
+            gate.setdefault("waiver_state", "none")
+            gate.setdefault("waiver_refs", [])
+
+        if not failed_gates:
+            promotion_recommendation = "PASS"
+        elif all_failed_waived:
+            promotion_recommendation = "WAIVED"
+        else:
+            promotion_recommendation = "FAIL"
+
+        gate_report = {
+            "inputs": {
+                "as_of_date": as_of_date,
+                "lookback_window_days": int(lookback_window_days),
+                "benchmark_version": benchmark_version,
+                "benchmark_version_match": bool(benchmark_match),
+                "benchmark_guard_reason_code": benchmark_guard_reason,
+                "available_benchmark_versions": available_version_values,
+                "generated_at_utc": generated_at_utc,
+            },
+            "gates": gates,
+            "aggregate": {
+                "promotion_recommendation": promotion_recommendation,
+                "blocking_reasons": blocking_reasons,
+                "waiver_refs": sorted({item for item in waiver_refs if item}),
+            },
+            "waiver_validation": waiver_validation["summary"],
+        }
+        report_json_path = ""
+        report_md_path = ""
+        if out_dir is not None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            report_json = out_dir / f"phase2_gate_report_{as_of_date}.json"
+            report_md = out_dir / f"phase2_gate_report_{as_of_date}.md"
+            report_json.write_text(json.dumps(gate_report, indent=2, sort_keys=True), encoding="utf-8")
+            report_md.write_text(self._phase2_gate_markdown(gate_report), encoding="utf-8")
+            report_json_path = str(report_json)
+            report_md_path = str(report_md)
+
+        fixture_counts = json.loads(run_row.get("fixture_counts_json") or "{}") if run_row else {}
+        fixture_metadata = json.loads(run_row.get("fixture_metadata_json") or "{}") if run_row else {}
+        if persist:
+            with self.repo.transaction() as conn:
+                benchmark_run_id = str(run_row.get("benchmark_run_id") or new_ulid()) if run_row else new_ulid()
+                self.repo.upsert_benchmark_run(
+                    conn,
+                    benchmark_run_id=benchmark_run_id,
+                    as_of_date=as_of_date,
+                    benchmark_version=benchmark_version,
+                    lookback_window_days=int(lookback_window_days if lookback_window_days > 0 else 30),
+                    fixture_counts=fixture_counts,
+                    fixture_metadata=fixture_metadata,
+                    seeded_at_utc=str(run_row.get("seeded_at_utc") or generated_at_utc) if run_row else generated_at_utc,
+                    generated_at_utc=generated_at_utc,
+                    report_json_path=report_json_path or None,
+                    report_md_path=report_md_path or None,
+                )
+                self.repo.append_event(
+                    conn,
+                    entity_type="METRICS",
+                    entity_id=f"PHASE2_GATE_REPORT::{as_of_date}::{benchmark_version}",
+                    event_type="PHASE2_GATE_REPORT_EXPORTED",
+                    as_of_date=as_of_date,
+                    payload={
+                        "promotion_recommendation": promotion_recommendation,
+                        "report_json_path": report_json_path,
+                        "report_md_path": report_md_path,
+                        "lookback_window_days": int(lookback_window_days),
+                    },
+                    source="phase2-gate-report",
+                )
+                report_idempotency_key = canonical_json_sha256(
+                    {
+                        "as_of_date": as_of_date,
+                        "lookback_window_days": int(lookback_window_days),
+                        "benchmark_version": benchmark_version,
+                    }
+                )
+                existing_report = self.repo.find_idempotent_response(
+                    conn,
+                    command_name="phase2-gate-report",
+                    idempotency_key=report_idempotency_key,
+                )
+                if not existing_report:
+                    self.repo.save_idempotent_response(
+                        conn,
+                        command_name="phase2-gate-report",
+                        idempotency_key=report_idempotency_key,
+                        response={
+                            "ok": True,
+                            "promotion_recommendation": promotion_recommendation,
+                            "report_json_path": report_json_path,
+                            "report_md_path": report_md_path,
+                            "gate_report": gate_report,
+                        },
+                    )
+
+        return {
+            "ok": True,
+            "promotion_recommendation": promotion_recommendation,
+            "report_json_path": report_json_path,
+            "report_md_path": report_md_path,
+            "gate_report": gate_report,
+        }
+
+    def _phase2_gate_markdown(self, report: dict[str, Any]) -> str:
+        inputs = report.get("inputs") if isinstance(report.get("inputs"), dict) else {}
+        gates = report.get("gates") if isinstance(report.get("gates"), list) else []
+        aggregate = report.get("aggregate") if isinstance(report.get("aggregate"), dict) else {}
+        lines = [
+            "# Phase 2 Gate Report",
+            "",
+            "## Inputs",
+            f"- as_of_date: {inputs.get('as_of_date')}",
+            f"- lookback_window_days: {inputs.get('lookback_window_days')}",
+            f"- benchmark_version: {inputs.get('benchmark_version')}",
+            f"- benchmark_version_match: {inputs.get('benchmark_version_match')}",
+            f"- benchmark_guard_reason_code: {inputs.get('benchmark_guard_reason_code')}",
+            f"- generated_at_utc: {inputs.get('generated_at_utc')}",
+            "",
+            "## Gate Snapshots",
+            "| Gate | Pass | Reason | Waiver State |",
+            "|---|---:|---|---|",
+        ]
+        for gate in gates:
+            lines.append(
+                f"| {gate.get('gate_name')} | {gate.get('pass')} | {gate.get('reason_code')} | {gate.get('waiver_state')} |"
+            )
+        lines.extend(
+            [
+                "",
+                "## Aggregate Recommendation",
+                f"- promotion_recommendation: {aggregate.get('promotion_recommendation')}",
+                f"- blocking_reasons: {json.dumps(aggregate.get('blocking_reasons', []), sort_keys=True)}",
+                f"- waiver_refs: {json.dumps(aggregate.get('waiver_refs', []), sort_keys=True)}",
+                "",
+                "## Raw JSON",
+                "```json",
+                json.dumps(report, indent=2, sort_keys=True),
+                "```",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _validate_phase2_gate_waivers(
+        self,
+        *,
+        waivers_path: Path,
+        generated_at_utc: str,
+    ) -> dict[str, Any]:
+        valid_by_gate: dict[str, list[dict[str, Any]]] = {"pr8": [], "pr9": [], "pr10": []}
+        invalid_by_gate: dict[str, list[dict[str, Any]]] = {"pr8": [], "pr9": [], "pr10": []}
+        if not waivers_path.exists():
+            return {
+                "valid_waivers_by_gate": valid_by_gate,
+                "invalid_waivers_by_gate": invalid_by_gate,
+                "summary": {
+                    "waivers_path": str(waivers_path),
+                    "exists": False,
+                    "valid_waiver_count": 0,
+                    "invalid_waiver_count": 0,
+                    "invalid_waiver_findings": [],
+                },
+            }
+        raw = json.loads(waivers_path.read_text(encoding="utf-8") or "[]")
+        waivers = raw.get("waivers") if isinstance(raw, dict) else raw
+        waivers = waivers if isinstance(waivers, list) else []
+        generated_dt = self._parse_iso_dt(generated_at_utc)
+        invalid_findings: list[dict[str, Any]] = []
+        for item in waivers:
+            if not isinstance(item, dict):
+                invalid_findings.append({"waiver_id": "", "gate_name": "", "reason_code": "waiver_not_object"})
+                continue
+            gate_name = str(item.get("gate_name") or "").strip().lower()
+            waiver_id = str(item.get("waiver_id") or "").strip()
+            record = {
+                "waiver_id": waiver_id,
+                "gate_name": gate_name,
+                "reason": str(item.get("reason") or "").strip(),
+                "owner_product": str(item.get("owner_product") or "").strip(),
+                "owner_ops": str(item.get("owner_ops") or "").strip(),
+                "owner_engineering": str(item.get("owner_engineering") or "").strip(),
+                "created_at_utc": str(item.get("created_at_utc") or "").strip(),
+                "expires_at_utc": str(item.get("expires_at_utc") or "").strip(),
+                "fallback_plan": str(item.get("fallback_plan") or "").strip(),
+                "active": bool(item.get("active")),
+            }
+            if gate_name not in {"pr8", "pr9", "pr10"}:
+                invalid_findings.append({"waiver_id": waiver_id, "gate_name": gate_name, "reason_code": "invalid_gate_name"})
+                continue
+            missing_fields = [
+                field
+                for field in ("waiver_id", "reason", "owner_product", "owner_ops", "owner_engineering", "created_at_utc", "expires_at_utc", "fallback_plan")
+                if not str(record.get(field) or "").strip()
+            ]
+            expires_dt = self._parse_iso_dt(record["expires_at_utc"])
+            created_dt = self._parse_iso_dt(record["created_at_utc"])
+            if missing_fields:
+                invalid_by_gate[gate_name].append(record)
+                invalid_findings.append(
+                    {
+                        "waiver_id": waiver_id,
+                        "gate_name": gate_name,
+                        "reason_code": f"missing_fields:{','.join(missing_fields)}",
+                    }
+                )
+                continue
+            if not record["active"]:
+                invalid_by_gate[gate_name].append(record)
+                invalid_findings.append({"waiver_id": waiver_id, "gate_name": gate_name, "reason_code": "inactive_waiver"})
+                continue
+            if created_dt is None or expires_dt is None or generated_dt is None:
+                invalid_by_gate[gate_name].append(record)
+                invalid_findings.append({"waiver_id": waiver_id, "gate_name": gate_name, "reason_code": "invalid_timestamp"})
+                continue
+            if expires_dt <= generated_dt:
+                invalid_by_gate[gate_name].append(record)
+                invalid_findings.append({"waiver_id": waiver_id, "gate_name": gate_name, "reason_code": "waiver_expired"})
+                continue
+            valid_by_gate[gate_name].append(record)
+        return {
+            "valid_waivers_by_gate": valid_by_gate,
+            "invalid_waivers_by_gate": invalid_by_gate,
+            "summary": {
+                "waivers_path": str(waivers_path),
+                "exists": True,
+                "valid_waiver_count": sum(len(items) for items in valid_by_gate.values()),
+                "invalid_waiver_count": sum(len(items) for items in invalid_by_gate.values()),
+                "invalid_waiver_findings": invalid_findings,
+            },
+        }
+
     def compute_metrics_snapshot(
         self,
         *,
@@ -642,7 +1815,7 @@ class AutomationOrchestrator:
         as_of_date: str,
         benchmark_version: str,
     ) -> dict[str, Any]:
-        expected_benchmark_version = "phase2.pr8.v1"
+        expected_benchmark_version = PR8_BENCHMARK_VERSION
         benchmark_match = benchmark_version == expected_benchmark_version
 
         distribution_rows = self.repo.fetch_all(
@@ -788,7 +1961,7 @@ class AutomationOrchestrator:
         as_of_date: str,
         benchmark_version: str,
     ) -> dict[str, Any]:
-        expected_benchmark_version = "phase2.pr9.v1"
+        expected_benchmark_version = PR9_BENCHMARK_VERSION
         benchmark_match = benchmark_version == expected_benchmark_version
 
         transport_rows = self.repo.fetch_one(
@@ -982,7 +2155,7 @@ class AutomationOrchestrator:
         manual_human_decisions: int,
         manual_user_overrides: int,
     ) -> dict[str, Any]:
-        expected_benchmark_version = "phase2.pr10.v1"
+        expected_benchmark_version = PR10_BENCHMARK_VERSION
         benchmark_match = benchmark_version == expected_benchmark_version
         completed_row = self.repo.fetch_one(
             """
@@ -1045,7 +2218,7 @@ class AutomationOrchestrator:
               SUM(CASE WHEN event_type IN ('SETTLEMENT_SUGGESTION_ACCEPTED', 'SETTLEMENT_SUGGESTION_ROUTED_EXCEPTION') THEN 1 ELSE 0 END) AS reviewed_count
             FROM event_log
             WHERE event_type IN ('SETTLEMENT_SUGGESTION_ACCEPTED', 'SETTLEMENT_SUGGESTION_ROUTED_EXCEPTION')
-              AND substr(created_at, 1, 10) BETWEEN ? AND ?
+              AND COALESCE(as_of_date, substr(created_at, 1, 10)) BETWEEN ? AND ?
             """,
             (lookback_start_iso, as_of_date),
         ) or {"accepted_count": 0, "reviewed_count": 0}

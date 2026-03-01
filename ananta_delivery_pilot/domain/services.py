@@ -1510,6 +1510,23 @@ class Phase1Service:
             "pr10_gate_reason_code": metrics.get("pr10_gate_reason_code"),
         }
 
+    def portfolio_gate_health_strip(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int = 30,
+        benchmark_version: str = "phase2.pr11.v1",
+    ) -> dict[str, Any]:
+        from domain.automation import AutomationOrchestrator
+
+        orchestrator = AutomationOrchestrator(self.config, self.repo, self)
+        return orchestrator.phase2_gate_health_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+            waivers_path=self.config.state_dir / "release-readiness" / "phase2_gate_waivers.json",
+        )
+
     def portfolio_sla_trends(
         self,
         *,

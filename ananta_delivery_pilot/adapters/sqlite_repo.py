@@ -366,6 +366,21 @@ CREATE TABLE IF NOT EXISTS command_idempotency (
   PRIMARY KEY(command_name, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS benchmark_runs (
+  benchmark_run_id TEXT PRIMARY KEY,
+  as_of_date TEXT NOT NULL,
+  benchmark_version TEXT NOT NULL,
+  lookback_window_days INTEGER NOT NULL DEFAULT 30 CHECK(lookback_window_days > 0),
+  fixture_counts_json TEXT NOT NULL,
+  fixture_metadata_json TEXT NOT NULL,
+  seeded_at_utc TEXT NOT NULL,
+  generated_at_utc TEXT,
+  report_json_path TEXT,
+  report_md_path TEXT,
+  updated_at TEXT NOT NULL,
+  UNIQUE(as_of_date, benchmark_version)
+);
+
 CREATE TABLE IF NOT EXISTS automation_runs (
   run_id TEXT PRIMARY KEY,
   idempotency_key TEXT NOT NULL UNIQUE,
@@ -778,6 +793,7 @@ CREATE INDEX IF NOT EXISTS idx_transport_alias_lookup ON transport_aliases(entit
 CREATE INDEX IF NOT EXISTS idx_delivery_transport_snapshot_plan ON delivery_transport_snapshot(planned_delivery_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_delivery_transport_suggestions_plan ON delivery_transport_suggestions(planned_delivery_id, entity_type, confidence);
 CREATE INDEX IF NOT EXISTS idx_user_roles_user ON user_roles(user_id, role_code);
+CREATE INDEX IF NOT EXISTS idx_benchmark_runs_lookup ON benchmark_runs(as_of_date, benchmark_version, updated_at);
 """
 
 
@@ -2003,6 +2019,81 @@ class SQLiteRepo:
         if not row:
             return None
         return json.loads(row["response_json"])
+
+    def latest_idempotent_response(self, *, command_name: str) -> dict[str, Any] | None:
+        row = self.fetch_one(
+            """
+            SELECT response_json
+            FROM command_idempotency
+            WHERE command_name = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (command_name,),
+        )
+        if not row:
+            return None
+        return json.loads(row["response_json"])
+
+    def get_benchmark_run(self, *, as_of_date: str, benchmark_version: str) -> dict[str, Any] | None:
+        return self.fetch_one(
+            """
+            SELECT *
+            FROM benchmark_runs
+            WHERE as_of_date = ? AND benchmark_version = ?
+            """,
+            (as_of_date, benchmark_version),
+        )
+
+    def upsert_benchmark_run(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        benchmark_run_id: str,
+        as_of_date: str,
+        benchmark_version: str,
+        lookback_window_days: int,
+        fixture_counts: dict[str, Any],
+        fixture_metadata: dict[str, Any],
+        seeded_at_utc: str,
+        generated_at_utc: str | None = None,
+        report_json_path: str | None = None,
+        report_md_path: str | None = None,
+    ) -> None:
+        now = utc_now_iso_z()
+        conn.execute(
+            """
+            INSERT INTO benchmark_runs(
+              benchmark_run_id, as_of_date, benchmark_version, lookback_window_days,
+              fixture_counts_json, fixture_metadata_json, seeded_at_utc, generated_at_utc,
+              report_json_path, report_md_path, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(as_of_date, benchmark_version) DO UPDATE SET
+              benchmark_run_id = excluded.benchmark_run_id,
+              lookback_window_days = excluded.lookback_window_days,
+              fixture_counts_json = excluded.fixture_counts_json,
+              fixture_metadata_json = excluded.fixture_metadata_json,
+              seeded_at_utc = excluded.seeded_at_utc,
+              generated_at_utc = COALESCE(excluded.generated_at_utc, benchmark_runs.generated_at_utc),
+              report_json_path = COALESCE(excluded.report_json_path, benchmark_runs.report_json_path),
+              report_md_path = COALESCE(excluded.report_md_path, benchmark_runs.report_md_path),
+              updated_at = excluded.updated_at
+            """,
+            (
+                benchmark_run_id,
+                as_of_date,
+                benchmark_version,
+                int(lookback_window_days),
+                json.dumps(fixture_counts, sort_keys=True),
+                json.dumps(fixture_metadata, sort_keys=True),
+                seeded_at_utc,
+                generated_at_utc,
+                report_json_path,
+                report_md_path,
+                now,
+            ),
+        )
 
     def set_as_of_date(self, as_of_date: str) -> None:
         with self.transaction() as conn:
