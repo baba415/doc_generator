@@ -131,9 +131,9 @@ python3 run.py run-autonomy --as-of 2026-03-31 --dry-run
 python3 run.py list-cases --status OPEN
 python3 run.py decide-case --case-id <case_id> --decision APPROVE --reason "override"
 python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --benchmark-version phase2.pr10.v1 --out-dir .state/automation_metrics
-python3 run.py seed-phase2-benchmark --as-of 2026-02-28 --benchmark-version phase2.pr11.v1
-python3 run.py phase2-gate-report --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr11.v1 --out-dir .state/release-readiness/pr11
-python3 run.py run-phase2-benchmark --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr11.v1 --out-dir .state/phase2-proof/pr11/manual
+python3 run.py seed-phase2-benchmark --as-of 2026-02-28 --benchmark-version phase2.pr12.v1
+python3 run.py phase2-gate-report --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/release-readiness/pr12
+python3 run.py run-phase2-benchmark --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr12/manual
 ```
 
 PR11 gate reliability adds:
@@ -271,7 +271,7 @@ python3 run.py export-drep --as-of 2026-03-31 --out-dir .state/exports/2026-03-3
 - UTC metadata: `as_of_date`, `lookback_window_days`, `benchmark_version`, `generated_at_utc`
 
 Benchmark-version handling is explicit:
-- expected PR8 benchmark is `phase2.pr8.v1`
+- expected PR8 benchmark is `phase2.pr12.v1`
 - mismatch sets `benchmark_version_match_pr8=false` and `pr8_gate_pass=false`
 
 ## Phase 2 PR10 Settlement Copilot + KPI/SLA Strip

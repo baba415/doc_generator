@@ -62,6 +62,8 @@ class Phase16PlanningTests(unittest.TestCase):
         contract_id = self._create_bulk_contract(qty_mt=150.0)
         result = self.service.plan_deliveries(contract_id=contract_id, start_date="2026-02-23", cadence="daily", max_lots_per_day=2)
         self.assertEqual(5, int(result["planned_count"]))
+        self.assertTrue(bool(result["common_case_eligible"]))
+        self.assertTrue(bool(result["zero_edit_common_case"]))
         planned = self.service.planned_rows(contract_id=contract_id)
         self.assertEqual(5, len(planned))
         for row in planned:

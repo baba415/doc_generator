@@ -334,7 +334,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             lookback_window_days = int(str((query.get("lookback_window_days") or ["30"])[0] or "30"))
             max_contracts_per_run = int(str((query.get("max_contracts_per_run") or ["20"])[0] or "20"))
             max_actions_per_run = int(str((query.get("max_actions_per_run") or ["200"])[0] or "200"))
-            benchmark_version = str((query.get("benchmark_version") or ["phase2.pr11.v1"])[0] or "phase2.pr11.v1").strip()
+            benchmark_version = str((query.get("benchmark_version") or ["phase2.pr12.v1"])[0] or "phase2.pr12.v1").strip()
             queue_data = service.command_center_sections(as_of_date=as_of_date_utc, limit=300)
             sections = queue_data["sections"]
             rows = queue_data["rows"]
@@ -1130,10 +1130,11 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             ]
             for row in field_rows:
                 field_name = str(row.get("field_name") or "")
+                extracted_value = row.get("extracted_value", row.get("proposed_value"))
                 body.append(
                     "<tr>"
                     f"<td>{_escape(field_name)}</td>"
-                    f"<td>{_escape(row.get('proposed_value'))}</td>"
+                    f"<td>{_escape(extracted_value)}</td>"
                     f"<td>{_escape(_registry_value(field_name))}</td>"
                     f"<td>{_escape(_value(field_name))}</td>"
                     f"<td>{_escape(row.get('confidence'))}</td>"
@@ -1193,6 +1194,18 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     pass
             critical_fields = self._intake_critical_fields()
             confidence_matrix = self._intake_confidence_matrix()
+            parsed_fields = [field.as_dict() for field in parsed.fields]
+            parsed_by_field: dict[str, dict[str, object]] = {
+                str(item.get("field_name") or "").strip(): item
+                for item in parsed_fields
+                if str(item.get("field_name") or "").strip()
+            }
+            memory_buyer_id = str((parsed_by_field.get("buyer_id") or {}).get("proposed_value") or "").strip()
+            memory_product_code = str((parsed_by_field.get("product_code") or {}).get("proposed_value") or "").strip().upper()
+            correction_memory = self._load_intake_correction_memory(
+                buyer_id=memory_buyer_id,
+                product_code=memory_product_code,
+            )
             now = utc_now_iso_z()
             field_rows: list[dict[str, object]] = []
             exception_count = 0
@@ -1212,17 +1225,38 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     },
                 )
                 for field in parsed.fields:
-                    confidence = float(field.confidence)
-                    decision, threshold_reason, field_class, auto_apply_min, review_min = intake_decision_for_confidence(
-                        field_name=field.field_name,
-                        confidence=confidence,
-                        matrix=confidence_matrix,
-                    )
+                    extracted_value = field.proposed_value
+                    memory_value = correction_memory.get(field.field_name)
+                    memory_applied = not self._is_missing_field_value(memory_value)
+                    if memory_applied:
+                        field_class = intake_field_class(field.field_name)
+                        class_thresholds = confidence_matrix.get(field_class) or confidence_matrix.get("identity") or {}
+                        auto_apply_min = float(class_thresholds.get("auto_apply_min", 0.93))
+                        review_min = float(class_thresholds.get("review_min", 0.75))
+                        proposed_value = str(memory_value).strip()
+                        confidence = 1.0
+                        decision = "auto_applied"
+                        threshold_reason = "correction_memory_applied"
+                        source_type = "correction_memory"
+                        source_ref = f"intake_memory:{memory_buyer_id}:{memory_product_code}"
+                    else:
+                        confidence = float(field.confidence)
+                        decision, threshold_reason, field_class, auto_apply_min, review_min = intake_decision_for_confidence(
+                            field_name=field.field_name,
+                            confidence=confidence,
+                            matrix=confidence_matrix,
+                        )
+                        proposed_value = field.proposed_value
+                        source_type = field.source_type
+                        source_ref = field.source_ref
                     row = field.as_dict()
+                    row["extracted_value"] = extracted_value
+                    row["proposed_value"] = proposed_value
                     row["decision"] = decision
                     row["field_class"] = field_class
                     row["auto_apply_min"] = auto_apply_min
                     row["review_min"] = review_min
+                    row["memory_applied"] = memory_applied
                     field_rows.append(row)
                     repo.add_automation_decision(
                         conn,
@@ -1230,9 +1264,9 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                         stage="intake_parser",
                         field_name=field.field_name,
                         required_flag=field.field_name in critical_fields,
-                        proposed_value=field.proposed_value,
-                        source_type=field.source_type,
-                        source_ref=field.source_ref,
+                        proposed_value=proposed_value,
+                        source_type=source_type,
+                        source_ref=source_ref,
                         confidence=confidence,
                         decision=decision,
                         reason_code=f"{field.reason_code}:{threshold_reason}",
@@ -1240,7 +1274,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     )
                     if decision == "auto_applied":
                         continue
-                    is_missing = self._is_missing_field_value(field.proposed_value)
+                    is_missing = self._is_missing_field_value(proposed_value)
                     is_critical = field.field_name in critical_fields
                     severity = "BLOCKER" if is_critical and (decision == "blocked" or is_missing) else "REVIEW"
                     repo.add_exception(
@@ -1250,7 +1284,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                         exception_type="low_confidence_field",
                         severity=severity,
                         field_name=field.field_name,
-                        proposed_value=field.proposed_value,
+                        proposed_value=proposed_value,
                         reason=(
                             f"{field.field_name} class={field_class} confidence={confidence:.2f} "
                             f"(auto>={auto_apply_min:.2f}, review>={review_min:.2f}, parser={field.reason_code})"
@@ -1266,6 +1300,8 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     normalized_payload={
                         "prefill": prefill,
                         "field_rows": field_rows,
+                        "correction_memory_applied": bool(correction_memory),
+                        "correction_memory_fields": sorted(correction_memory.keys()),
                         "evidence_paths": evidence_paths,
                         "parser_result": parsed.to_dict(),
                     },
@@ -1423,6 +1459,21 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     level="error",
                 )
                 return
+            with repo.transaction() as conn:
+                repo.append_event(
+                    conn,
+                    entity_type="CONTRACT",
+                    entity_id=contract_id,
+                    event_type="INTAKE_PLAN_FASTPATH_EVALUATED",
+                    as_of_date=str(issue_date),
+                    payload={
+                        "contract_id": contract_id,
+                        "zero_edit_common_case": bool(plan_result.get("zero_edit_common_case")),
+                        "common_case_eligible": bool(plan_result.get("common_case_eligible")),
+                        "planned_count": int(plan_result.get("planned_count") or 0),
+                    },
+                    source="web_v2",
+                )
             message = (
                 f"Created contract {contract_id} and planned {plan_result['planned_count']} deliveries"
                 + (f" ({evidence_count} evidence files captured)" if evidence_count else "")
@@ -1516,6 +1567,21 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     level="error",
                 )
                 return
+            with repo.transaction() as conn:
+                repo.append_event(
+                    conn,
+                    entity_type="CONTRACT",
+                    entity_id=contract_id,
+                    event_type="INTAKE_PLAN_FASTPATH_EVALUATED",
+                    as_of_date=str(issue_date),
+                    payload={
+                        "contract_id": contract_id,
+                        "zero_edit_common_case": bool(plan_result.get("zero_edit_common_case")),
+                        "common_case_eligible": bool(plan_result.get("common_case_eligible")),
+                        "planned_count": int(plan_result.get("planned_count") or 0),
+                    },
+                    source="web_v2",
+                )
             message = (
                 f"Created contract {contract_id} and planned {plan_result['planned_count']} deliveries"
                 + (f" ({evidence_count} evidence files captured)" if evidence_count else "")
@@ -1928,7 +1994,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
         def _handle_run_all_preview(self) -> None:
             fields = self._urlencoded_fields()
             as_of = str(fields.get("as_of_date") or utc_today_iso()).strip()
-            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr11.v1").strip()
+            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr12.v1").strip()
             max_contracts = int(str(fields.get("max_contracts_per_run") or "20"))
             max_actions = int(str(fields.get("max_actions_per_run") or "200"))
             preview = service.run_all_eligible(
@@ -1951,7 +2017,7 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
         def _handle_run_all_execute(self) -> None:
             fields = self._urlencoded_fields()
             as_of = str(fields.get("as_of_date") or utc_today_iso()).strip()
-            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr11.v1").strip()
+            benchmark_version = str(fields.get("benchmark_version") or "phase2.pr12.v1").strip()
             max_contracts = int(str(fields.get("max_contracts_per_run") or "20"))
             max_actions = int(str(fields.get("max_actions_per_run") or "200"))
             preview_token = str(fields.get("preview_token") or "").strip()
@@ -2128,6 +2194,42 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 prefill["tolerance_pct"] = 5.0
             return prefill
 
+        def _load_intake_correction_memory(self, *, buyer_id: str, product_code: str) -> dict[str, str]:
+            buyer_value = str(buyer_id or "").strip()
+            product_value = str(product_code or "").strip().upper()
+            if not buyer_value or not product_value:
+                return {}
+            row = repo.fetch_one(
+                """
+                SELECT payload_json
+                FROM event_log
+                WHERE event_type = 'INTAKE_CORRECTION_MEMORY'
+                  AND json_extract(payload_json, '$.buyer_id') = ?
+                  AND UPPER(COALESCE(json_extract(payload_json, '$.product_code'), '')) = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (buyer_value, product_value),
+            )
+            if not row:
+                return {}
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except json.JSONDecodeError:
+                return {}
+            approved = payload.get("approved_field_values") if isinstance(payload, dict) else None
+            if not isinstance(approved, dict):
+                return {}
+            memory: dict[str, str] = {}
+            for field_name, value in approved.items():
+                key = str(field_name or "").strip()
+                if not key:
+                    continue
+                text = str(value or "").strip()
+                if text:
+                    memory[key] = text
+            return memory
+
         def _persist_intake_uploads(self, uploaded: list[Path], *, run_id: str) -> list[Path]:
             if not uploaded:
                 return []
@@ -2177,12 +2279,20 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             tracked_fields = sorted(set(self._intake_critical_fields()) | set(proposed_map.keys()))
             now = utc_now_iso_z()
             with repo.transaction() as conn:
+                approved_field_values: dict[str, str] = {}
+                corrected_fields: list[str] = []
+                confirmed_fields: list[str] = []
                 for field_name in tracked_fields:
                     final_value = str(submitted.get(field_name) or "").strip()
                     proposed_value = str(proposed_map.get(field_name) or "").strip()
                     if not final_value:
                         continue
+                    approved_field_values[field_name] = final_value
                     decision = "user_confirmed" if final_value == proposed_value else "user_corrected"
+                    if decision == "user_corrected":
+                        corrected_fields.append(field_name)
+                    else:
+                        confirmed_fields.append(field_name)
                     repo.add_automation_decision(
                         conn,
                         run_id=run_id,
@@ -2224,6 +2334,25 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                     "UPDATE automation_runs SET status = ?, updated_at = ? WHERE run_id = ?",
                     (next_status, now, run_id),
                 )
+                buyer_id = str(submitted.get("buyer_id") or "").strip()
+                product_code = str(submitted.get("product_code") or "").strip().upper()
+                if buyer_id and product_code and approved_field_values:
+                    repo.append_event(
+                        conn,
+                        entity_type="INTAKE_MEMORY",
+                        entity_id=f"{buyer_id}:{product_code}",
+                        event_type="INTAKE_CORRECTION_MEMORY",
+                        as_of_date=str(submitted.get("issue_date") or utc_today_iso()),
+                        payload={
+                            "run_id": run_id,
+                            "buyer_id": buyer_id,
+                            "product_code": product_code,
+                            "approved_field_values": approved_field_values,
+                            "corrected_fields": corrected_fields,
+                            "confirmed_fields": confirmed_fields,
+                        },
+                        source="web_v2",
+                    )
 
         def _record_intake_confirmed_event(
             self,

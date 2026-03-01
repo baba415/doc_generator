@@ -289,6 +289,118 @@ class Phase2UiRouteTests(unittest.TestCase):
         finally:
             _stop_process(proc)
 
+    def test_intake_parse_applies_prior_correction_memory_for_same_buyer_product(self) -> None:
+        try:
+            port = _pick_free_port()
+        except PermissionError:
+            self.skipTest("socket bind not permitted in current sandbox")
+        proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
+        try:
+            _wait_for_route(port, "/v2/intake")
+            first_lpo = self.temp_dir / "memory_lpo_first.json"
+            first_lpo.write_text(
+                json.dumps(
+                    {
+                        "lpo_no": "LPO-MEM-001",
+                        "buyer_id": "buyer_nycil",
+                        "vendor_of_record_id": "ananta_flows",
+                        "source_id": "ananta_flows",
+                        "processor_id": "processor_partner_refinery",
+                        "product_code": "RBDPO",
+                        "expected_qty_mt": 150,
+                        "unit_price": 2270,
+                        "unit_price_basis": "KG",
+                        "issue_date": "2026-02-23",
+                        "lpo_valid_from": "2026-02-23",
+                        "lpo_valid_to": "2026-03-31",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            parse_html_1 = _post_multipart(
+                port=port,
+                path="/v2/intake/parse",
+                fields={"allow_placeholder_tin": "1"},
+                files={"lpo_originals": first_lpo},
+            )
+            run_id_1 = _hidden_value(parse_html_1, "intake_run_id")
+            run_1 = self.repo.get_automation_run(run_id_1)
+            assert run_1 is not None
+            evidence_paths_1 = json.loads(run_1["normalized_input_json"]).get("evidence_paths") or []
+            _post_form(
+                port=port,
+                path="/v2/intake/confirm",
+                fields={
+                    "intake_run_id": run_id_1,
+                    "intake_evidence_paths_json": json.dumps(evidence_paths_1),
+                    "lpo_no": "LPO-MEM-001",
+                    "issue_date": "2026-02-23",
+                    "lpo_valid_from": "2026-02-23",
+                    "lpo_valid_to": "2026-03-31",
+                    "buyer_id": "buyer_nycil",
+                    "vendor_of_record_id": "ananta_flows",
+                    "source_id": "ananta_flows",
+                    "processor_id": "processor_partner_refinery",
+                    "product_code": "RBDPO",
+                    "expected_qty_mt": "150.000",
+                    "expected_qty_kg": "150000",
+                    "unit_price": "2300",
+                    "unit_price_basis": "KG",
+                    "currency": "NGN",
+                    "start_date": "2026-02-23",
+                    "cadence": "daily",
+                    "max_lots_per_day": "1",
+                    "tolerance_pct": "5.0",
+                    "allow_placeholder_tin": "1",
+                },
+            )
+            second_lpo = self.temp_dir / "memory_lpo_second.json"
+            second_lpo.write_text(
+                json.dumps(
+                    {
+                        "lpo_no": "LPO-MEM-002",
+                        "buyer_id": "buyer_nycil",
+                        "vendor_of_record_id": "ananta_flows",
+                        "source_id": "ananta_flows",
+                        "processor_id": "processor_partner_refinery",
+                        "product_code": "RBDPO",
+                        "expected_qty_mt": 150,
+                        "unit_price": 2100,
+                        "unit_price_basis": "KG",
+                        "issue_date": "2026-02-24",
+                        "lpo_valid_from": "2026-02-24",
+                        "lpo_valid_to": "2026-03-31",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            parse_html_2 = _post_multipart(
+                port=port,
+                path="/v2/intake/parse",
+                fields={"allow_placeholder_tin": "1"},
+                files={"lpo_originals": second_lpo},
+            )
+            self.assertIn("2300", parse_html_2)
+            run_id_2 = _hidden_value(parse_html_2, "intake_run_id")
+            parser_rows = self.repo.fetch_all(
+                """
+                SELECT field_name, source_type, reason_code, decision, proposed_value
+                FROM automation_decisions
+                WHERE run_id = ? AND stage = 'intake_parser' AND field_name = 'unit_price'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (run_id_2,),
+            )
+            self.assertTrue(parser_rows)
+            latest = parser_rows[0]
+            self.assertEqual("correction_memory", str(latest["source_type"]))
+            self.assertIn("correction_memory_applied", str(latest["reason_code"]))
+            self.assertEqual("auto_applied", str(latest["decision"]))
+            self.assertEqual("2300", str(latest["proposed_value"]))
+        finally:
+            _stop_process(proc)
+
     def test_plan_rebuild_block_routes_to_exceptions(self) -> None:
         contract = self.service.create_contract(
             {

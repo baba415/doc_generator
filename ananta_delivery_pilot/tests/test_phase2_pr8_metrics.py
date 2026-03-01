@@ -9,7 +9,7 @@ from pathlib import Path
 from adapters.sqlite_repo import SQLiteRepo
 from core.config import RuntimeConfig
 from core.ids import new_ulid
-from domain.automation import AutomationOrchestrator
+from domain.automation import AutomationOrchestrator, PR8_BENCHMARK_VERSION
 from domain.services import Phase1Service
 
 
@@ -178,7 +178,7 @@ class Phase2Pr8MetricsTests(unittest.TestCase):
             as_of_date="2026-02-23",
             out_dir=out_dir,
             lookback_window_days=30,
-            benchmark_version="phase2.pr8.v1",
+            benchmark_version=PR8_BENCHMARK_VERSION,
         )
         self.assertTrue(result["ok"])
         metrics = result["metrics"]
@@ -193,7 +193,7 @@ class Phase2Pr8MetricsTests(unittest.TestCase):
         self.assertFalse(metrics["autoplan_zero_edit_common_case_gate_pass"])
         self.assertFalse(metrics["pr8_gate_pass"])
         self.assertEqual("autoplan_zero_edit_common_case_failed", metrics["pr8_gate_reason_code"])
-        self.assertEqual("phase2.pr8.v1", metrics["benchmark_version_expected_pr8"])
+        self.assertEqual(PR8_BENCHMARK_VERSION, metrics["benchmark_version_expected_pr8"])
         self.assertTrue(metrics["benchmark_version_match_pr8"])
         self.assertNotEqual(contract_auto, contract_edited)
         payload = json.loads(Path(result["metrics_path"]).read_text(encoding="utf-8"))
@@ -223,7 +223,7 @@ class Phase2Pr8MetricsTests(unittest.TestCase):
             as_of_date="2026-02-23",
             out_dir=self.temp_dir / "metrics-utc",
             lookback_window_days=30,
-            benchmark_version="phase2.pr8.v1",
+            benchmark_version=PR8_BENCHMARK_VERSION,
         )
         metrics = result["metrics"]
         generated = str(metrics["generated_at_utc"])

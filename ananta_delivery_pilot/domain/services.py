@@ -130,6 +130,7 @@ class Phase1Service:
             now = utc_now_iso_z()
             rows_out: list[dict[str, Any]] = []
             total_planned_kg = 0
+            common_case_line_count = 0
             for line in lines:
                 product_code = str(line.get("product_code") or "").upper()
                 product_policy = products_cfg.get(product_code) or {}
@@ -149,6 +150,8 @@ class Phase1Service:
                     lot_list.append(int(remainder_kg))
                 if not lot_list:
                     raise ValueError(f"No lots produced for contract_line_id={line['contract_line_id']}")
+                if remainder_kg == 0:
+                    common_case_line_count += 1
                 sequence_start = conn.execute(
                     "SELECT COALESCE(MAX(sequence_no), 0) AS max_seq FROM planned_deliveries WHERE contract_line_id = ?",
                     (line["contract_line_id"],),
@@ -231,6 +234,8 @@ class Phase1Service:
                 "planned_count": len(rows_out),
                 "planned_total_kg": total_planned_kg,
                 "planned_total_mt": format(kg_to_mt_decimal(total_planned_kg), "f"),
+                "common_case_eligible": bool(len(lines) > 0 and common_case_line_count == len(lines)),
+                "zero_edit_common_case": bool(len(lines) > 0 and common_case_line_count == len(lines)),
                 "planned_deliveries": rows_out,
             }
             self.repo.save_idempotent_response(
