@@ -1635,6 +1635,8 @@ class AutomationOrchestrator:
                     event_type="PHASE2_DRIFT_REPORT_EXPORTED",
                     as_of_date=as_of_date,
                     payload={
+                        "as_of_date": as_of_date,
+                        "benchmark_version": benchmark_version,
                         "report_json_path": report_json_path,
                         "report_md_path": report_md_path,
                         "benchmark_metrics_path": benchmark_snapshot_path,
@@ -1691,6 +1693,406 @@ class AutomationOrchestrator:
             "threshold_source": threshold_source,
             "threshold_config_version": threshold_config_version,
             "drift_report": drift_report,
+        }
+
+    def phase2_drift_triage(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+        out_dir: Path,
+        benchmark_metrics_ref: Path | None = None,
+        live_metrics_ref: Path | None = None,
+    ) -> dict[str, Any]:
+        report_result = self.phase2_drift_report(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+            out_dir=out_dir,
+            benchmark_metrics_ref=benchmark_metrics_ref,
+            live_metrics_ref=live_metrics_ref,
+            persist=True,
+        )
+        drift_report = report_result["drift_report"]
+        gates = drift_report.get("gates") if isinstance(drift_report.get("gates"), list) else []
+        aggregate = drift_report.get("aggregate") if isinstance(drift_report.get("aggregate"), dict) else {}
+        generated_at_utc = str(drift_report.get("inputs", {}).get("generated_at_utc") or utc_now_iso_z())
+
+        opened_count = 0
+        updated_count = 0
+        resolved_count = 0
+
+        with self.repo.transaction() as conn:
+            for gate in gates:
+                if not isinstance(gate, dict):
+                    continue
+                gate_name = str(gate.get("gate_name") or "").strip().lower()
+                if gate_name not in {"pr8", "pr9", "pr10"}:
+                    continue
+                drift_state = str(gate.get("drift_state") or "").upper()
+                reason_code = str(gate.get("reason_code") or "pass").strip()
+                comparisons = gate.get("comparisons") if isinstance(gate.get("comparisons"), list) else []
+                open_for_gate = conn.execute(
+                    """
+                    SELECT *
+                    FROM exception_cases
+                    WHERE case_type = 'DRIFT_MONITORING'
+                      AND status = 'OPEN'
+                      AND json_extract(details_json, '$.benchmark_version') = ?
+                      AND lower(json_extract(details_json, '$.gate_name')) = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (benchmark_version, gate_name),
+                ).fetchall()
+                open_rows = [dict(row) for row in open_for_gate]
+
+                if drift_state == "PASS":
+                    for row in open_rows:
+                        details = self._safe_json_object(row.get("details_json"))
+                        details["resolution_reason_code"] = "drift_cleared"
+                        details["resolved_by_as_of_date"] = as_of_date
+                        details["resolved_at_utc"] = generated_at_utc
+                        conn.execute(
+                            """
+                            UPDATE exception_cases
+                            SET status = 'RESOLVED',
+                                details_json = ?,
+                                updated_at = ?,
+                                resolved_at = ?
+                            WHERE exception_case_id = ?
+                            """,
+                            (
+                                json.dumps(details, sort_keys=True),
+                                generated_at_utc,
+                                generated_at_utc,
+                                str(row["exception_case_id"]),
+                            ),
+                        )
+                        self.repo.append_event(
+                            conn,
+                            entity_type="EXCEPTION_CASE",
+                            entity_id=str(row["exception_case_id"]),
+                            event_type="PHASE2_DRIFT_CASE_RESOLVED",
+                            as_of_date=as_of_date,
+                            payload={
+                                "gate_name": gate_name,
+                                "benchmark_version": benchmark_version,
+                                "reason_code": "drift_cleared",
+                                "drift_state": "PASS",
+                            },
+                            source="phase2-drift-triage",
+                        )
+                        resolved_count += 1
+                    continue
+
+                severity = self._drift_case_severity(drift_state)
+                drift_case_key = (
+                    f"drift_case::{as_of_date}::{int(lookback_window_days)}::"
+                    f"{benchmark_version}::{gate_name}::{reason_code}"
+                )
+                case_details = {
+                    "as_of_date": as_of_date,
+                    "lookback_window_days": int(lookback_window_days),
+                    "benchmark_version": benchmark_version,
+                    "generated_at_utc": generated_at_utc,
+                    "gate_name": gate_name,
+                    "drift_state": drift_state,
+                    "reason_code": reason_code,
+                    "comparisons": comparisons,
+                    "report_json_path": str(report_result.get("report_json_path") or ""),
+                    "report_md_path": str(report_result.get("report_md_path") or ""),
+                    "blocking_reasons": aggregate.get("blocking_reasons", []),
+                }
+
+                existing = self.repo.get_exception_case_by_idempotency(idempotency_key=drift_case_key)
+                target_case_id = ""
+                if existing:
+                    target_case_id = str(existing["exception_case_id"])
+                    previous_details = self._safe_json_object(existing.get("details_json"))
+                    if str(previous_details.get("generated_at_utc") or "").strip():
+                        case_details["generated_at_utc"] = str(previous_details.get("generated_at_utc") or "")
+                    previous_details_canonical = json.dumps(previous_details, sort_keys=True)
+                    next_details_canonical = json.dumps(case_details, sort_keys=True)
+                    current_status = str(existing.get("status") or "").upper()
+                    current_severity = str(existing.get("severity") or "").upper()
+                    current_reason = str(existing.get("reason_code") or "")
+                    needs_update = (
+                        current_status != "OPEN"
+                        or current_severity != severity
+                        or current_reason != reason_code
+                        or previous_details_canonical != next_details_canonical
+                    )
+                    if needs_update:
+                        conn.execute(
+                            """
+                            UPDATE exception_cases
+                            SET status = 'OPEN',
+                                severity = ?,
+                                reason_code = ?,
+                                details_json = ?,
+                                updated_at = ?,
+                                resolved_at = NULL
+                            WHERE exception_case_id = ?
+                            """,
+                            (
+                                severity,
+                                reason_code,
+                                next_details_canonical,
+                                generated_at_utc,
+                                target_case_id,
+                            ),
+                        )
+                        self.repo.append_event(
+                            conn,
+                            entity_type="EXCEPTION_CASE",
+                            entity_id=target_case_id,
+                            event_type="PHASE2_DRIFT_CASE_UPDATED",
+                            as_of_date=as_of_date,
+                            payload={
+                                "gate_name": gate_name,
+                                "benchmark_version": benchmark_version,
+                                "reason_code": reason_code,
+                                "drift_state": drift_state,
+                            },
+                            source="phase2-drift-triage",
+                        )
+                        updated_count += 1
+                else:
+                    case_row = self.repo.create_or_get_exception_case(
+                        conn,
+                        autonomy_run_id="",
+                        action_intent_id=None,
+                        contract_id=None,
+                        delivery_id=None,
+                        planned_delivery_id=None,
+                        case_type="DRIFT_MONITORING",
+                        severity=severity,
+                        reason_code=reason_code,
+                        details=case_details,
+                        idempotency_key=drift_case_key,
+                    )
+                    target_case_id = str(case_row["exception_case_id"])
+                    self.repo.append_event(
+                        conn,
+                        entity_type="EXCEPTION_CASE",
+                        entity_id=target_case_id,
+                        event_type="PHASE2_DRIFT_CASE_OPENED",
+                        as_of_date=as_of_date,
+                        payload={
+                            "gate_name": gate_name,
+                            "benchmark_version": benchmark_version,
+                            "reason_code": reason_code,
+                            "drift_state": drift_state,
+                        },
+                        source="phase2-drift-triage",
+                    )
+                    opened_count += 1
+
+                for row in open_rows:
+                    case_id = str(row.get("exception_case_id") or "")
+                    if not case_id or case_id == target_case_id:
+                        continue
+                    details = self._safe_json_object(row.get("details_json"))
+                    details["resolution_reason_code"] = "drift_reason_replaced"
+                    details["resolved_by_as_of_date"] = as_of_date
+                    details["resolved_at_utc"] = generated_at_utc
+                    conn.execute(
+                        """
+                        UPDATE exception_cases
+                        SET status = 'RESOLVED',
+                            details_json = ?,
+                            updated_at = ?,
+                            resolved_at = ?
+                        WHERE exception_case_id = ?
+                        """,
+                        (
+                            json.dumps(details, sort_keys=True),
+                            generated_at_utc,
+                            generated_at_utc,
+                            case_id,
+                        ),
+                    )
+                    self.repo.append_event(
+                        conn,
+                        entity_type="EXCEPTION_CASE",
+                        entity_id=case_id,
+                        event_type="PHASE2_DRIFT_CASE_RESOLVED",
+                        as_of_date=as_of_date,
+                        payload={
+                            "gate_name": gate_name,
+                            "benchmark_version": benchmark_version,
+                            "reason_code": "drift_reason_replaced",
+                            "drift_state": drift_state,
+                        },
+                        source="phase2-drift-triage",
+                    )
+                    resolved_count += 1
+
+            severity_rows = conn.execute(
+                """
+                SELECT severity, COUNT(*) AS cnt
+                FROM exception_cases
+                WHERE case_type = 'DRIFT_MONITORING'
+                  AND status = 'OPEN'
+                  AND json_extract(details_json, '$.as_of_date') = ?
+                  AND json_extract(details_json, '$.lookback_window_days') = ?
+                  AND json_extract(details_json, '$.benchmark_version') = ?
+                GROUP BY severity
+                """,
+                (as_of_date, int(lookback_window_days), benchmark_version),
+            ).fetchall()
+            open_cases_by_severity = {
+                str(row["severity"] or "").upper(): int(row["cnt"] or 0)
+                for row in severity_rows
+            }
+            self.repo.append_event(
+                conn,
+                entity_type="METRICS",
+                entity_id=f"PHASE2_DRIFT_TRIAGE::{as_of_date}::{benchmark_version}",
+                event_type="PHASE2_DRIFT_TRIAGE_COMPLETED",
+                as_of_date=as_of_date,
+                payload={
+                    "as_of_date": as_of_date,
+                    "lookback_window_days": int(lookback_window_days),
+                    "benchmark_version": benchmark_version,
+                    "generated_at_utc": generated_at_utc,
+                    "cases_opened": int(opened_count),
+                    "cases_updated": int(updated_count),
+                    "cases_resolved": int(resolved_count),
+                    "drift_state": str(report_result.get("drift_state") or ""),
+                    "recommendation": str(report_result.get("recommendation") or ""),
+                    "report_json_path": str(report_result.get("report_json_path") or ""),
+                    "report_md_path": str(report_result.get("report_md_path") or ""),
+                    "open_cases_by_severity": open_cases_by_severity,
+                },
+                source="phase2-drift-triage",
+            )
+
+        snapshot = self.phase2_drift_operations_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+        )
+        return {
+            "ok": True,
+            "as_of_date": as_of_date,
+            "lookback_window_days": int(lookback_window_days),
+            "benchmark_version": benchmark_version,
+            "drift_state": str(report_result.get("drift_state") or ""),
+            "recommendation": str(report_result.get("recommendation") or ""),
+            "report_json_path": str(report_result.get("report_json_path") or ""),
+            "report_md_path": str(report_result.get("report_md_path") or ""),
+            "cases_opened": int(opened_count),
+            "cases_updated": int(updated_count),
+            "cases_resolved": int(resolved_count),
+            "open_cases_by_severity": snapshot.get("open_cases_by_severity", {}),
+        }
+
+    def phase2_drift_operations_snapshot(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+    ) -> dict[str, Any]:
+        if lookback_window_days <= 0:
+            raise ValueError("lookback_window_days must be > 0")
+        try:
+            date.fromisoformat(as_of_date)
+        except ValueError as error:
+            raise ValueError("as_of_date must be YYYY-MM-DD") from error
+        open_rows = self.repo.fetch_all(
+            """
+            SELECT *
+            FROM exception_cases
+            WHERE case_type = 'DRIFT_MONITORING'
+              AND status = 'OPEN'
+              AND json_extract(details_json, '$.as_of_date') = ?
+              AND json_extract(details_json, '$.lookback_window_days') = ?
+              AND json_extract(details_json, '$.benchmark_version') = ?
+            ORDER BY created_at ASC
+            """,
+            (as_of_date, int(lookback_window_days), benchmark_version),
+        )
+        open_cases_by_severity: dict[str, int] = {}
+        open_cases_by_gate: dict[str, int] = {}
+        open_cases_by_reason: dict[str, int] = {}
+        open_cases: list[dict[str, Any]] = []
+        for row in open_rows:
+            details = self._safe_json_object(row.get("details_json"))
+            severity = str(row.get("severity") or "").upper()
+            gate_name = str(details.get("gate_name") or "")
+            reason_code = str(row.get("reason_code") or "")
+            open_cases_by_severity[severity] = int(open_cases_by_severity.get(severity, 0)) + 1
+            if gate_name:
+                open_cases_by_gate[gate_name] = int(open_cases_by_gate.get(gate_name, 0)) + 1
+            if reason_code:
+                open_cases_by_reason[reason_code] = int(open_cases_by_reason.get(reason_code, 0)) + 1
+            open_cases.append(
+                {
+                    "exception_case_id": str(row.get("exception_case_id") or ""),
+                    "severity": severity,
+                    "reason_code": reason_code,
+                    "case_type": str(row.get("case_type") or ""),
+                    "created_at": str(row.get("created_at") or ""),
+                    "gate_name": gate_name,
+                    "drift_state": str(details.get("drift_state") or ""),
+                }
+            )
+
+        latest_triage_row = self.repo.fetch_one(
+            """
+            SELECT created_at, payload_json
+            FROM event_log
+            WHERE event_type = 'PHASE2_DRIFT_TRIAGE_COMPLETED'
+              AND as_of_date = ?
+              AND json_extract(payload_json, '$.benchmark_version') = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (as_of_date, benchmark_version),
+        )
+        latest_report_row = self.repo.fetch_one(
+            """
+            SELECT payload_json
+            FROM event_log
+            WHERE event_type = 'PHASE2_DRIFT_REPORT_EXPORTED'
+              AND as_of_date = ?
+              AND json_extract(payload_json, '$.benchmark_version') = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (as_of_date, benchmark_version),
+        )
+        latest_triage_payload = self._safe_json_object((latest_triage_row or {}).get("payload_json"))
+        latest_report_payload = self._safe_json_object((latest_report_row or {}).get("payload_json"))
+        latest_report_json_path = str(
+            latest_triage_payload.get("report_json_path")
+            or latest_report_payload.get("report_json_path")
+            or ""
+        )
+        latest_report_md_path = str(
+            latest_triage_payload.get("report_md_path")
+            or latest_report_payload.get("report_md_path")
+            or ""
+        )
+        drift_state = str(latest_triage_payload.get("drift_state") or "")
+        recommendation = str(latest_triage_payload.get("recommendation") or "")
+        return {
+            "as_of_date": as_of_date,
+            "lookback_window_days": int(lookback_window_days),
+            "benchmark_version": benchmark_version,
+            "open_cases_total": int(len(open_cases)),
+            "open_cases_by_severity": open_cases_by_severity,
+            "open_cases_by_gate": open_cases_by_gate,
+            "open_cases_by_reason": open_cases_by_reason,
+            "open_cases": open_cases,
+            "latest_triage_at_utc": str((latest_triage_row or {}).get("created_at") or ""),
+            "drift_state": drift_state,
+            "recommendation": recommendation,
+            "latest_report_json_path": latest_report_json_path,
+            "latest_report_md_path": latest_report_md_path,
         }
 
     def phase2_gate_report(
@@ -2750,6 +3152,28 @@ class AutomationOrchestrator:
             return parsed.astimezone(timezone.utc)
         except Exception:
             return None
+
+    def _safe_json_object(self, value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        text = str(value or "").strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _drift_case_severity(self, drift_state: str) -> str:
+        state = str(drift_state or "").upper()
+        if state in {"MISMATCH", "ALERT"}:
+            return "BLOCKER"
+        if state == "INSUFFICIENT_DATA":
+            return "REVIEW"
+        if state == "WATCH":
+            return "INFO"
+        return "INFO"
 
     def _percentile(self, values: list[float], pct: float) -> float | None:
         if not values:

@@ -196,6 +196,28 @@ class Phase2PR2AutonomyTests(unittest.TestCase):
         )
         self.assertEqual("phase2-drift-report", parsed.command)
         self.assertEqual(30, parsed.lookback_window_days)
+        parsed = parser.parse_args(
+            [
+                "phase2-drift-triage",
+                "--as-of",
+                "2026-03-31",
+                "--benchmark-version",
+                "phase2.pr12.v1",
+                "--out-dir",
+                "/tmp/phase2-drift-triage",
+            ]
+        )
+        self.assertEqual("phase2-drift-triage", parsed.command)
+        parsed = parser.parse_args(
+            [
+                "phase2-drift-status",
+                "--as-of",
+                "2026-03-31",
+                "--benchmark-version",
+                "phase2.pr12.v1",
+            ]
+        )
+        self.assertEqual("phase2-drift-status", parsed.command)
 
     def test_non_dry_run_autonomy_executes_intents_with_evidence_present(self) -> None:
         contract_id = self._create_contract("PR2-LPO-NONDRY")

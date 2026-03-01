@@ -40,6 +40,8 @@ def phase1_commands() -> set[str]:
         "run-phase2-benchmark",
         "phase2-gate-report",
         "phase2-drift-report",
+        "phase2-drift-triage",
+        "phase2-drift-status",
     }
 
 
@@ -189,6 +191,25 @@ def build_parser() -> argparse.ArgumentParser:
     phase2_drift_report.add_argument("--out-dir", required=True)
     phase2_drift_report.add_argument("--benchmark-metrics", default="")
     phase2_drift_report.add_argument("--live-metrics", default="")
+
+    phase2_drift_triage = subparsers.add_parser(
+        "phase2-drift-triage",
+        help="Project PR13 drift report to DRIFT_MONITORING exception cases",
+    )
+    phase2_drift_triage.add_argument("--as-of", required=True)
+    phase2_drift_triage.add_argument("--lookback-window-days", type=int, default=30)
+    phase2_drift_triage.add_argument("--benchmark-version", required=True)
+    phase2_drift_triage.add_argument("--out-dir", required=True)
+    phase2_drift_triage.add_argument("--benchmark-metrics", default="")
+    phase2_drift_triage.add_argument("--live-metrics", default="")
+
+    phase2_drift_status = subparsers.add_parser(
+        "phase2-drift-status",
+        help="Read-only snapshot for drift operations state",
+    )
+    phase2_drift_status.add_argument("--as-of", required=True)
+    phase2_drift_status.add_argument("--lookback-window-days", type=int, default=30)
+    phase2_drift_status.add_argument("--benchmark-version", required=True)
 
     return parser
 
@@ -438,6 +459,32 @@ def main(argv: list[str] | None = None) -> None:
             out_dir=out_dir,
             benchmark_metrics_ref=benchmark_metrics_ref,
             live_metrics_ref=live_metrics_ref,
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "phase2-drift-triage":
+        orchestrator = _automation(root_dir)
+        out_dir = Path(args.out_dir).expanduser()
+        benchmark_metrics_ref = Path(args.benchmark_metrics).expanduser() if str(args.benchmark_metrics or "").strip() else None
+        live_metrics_ref = Path(args.live_metrics).expanduser() if str(args.live_metrics or "").strip() else None
+        result = orchestrator.phase2_drift_triage(
+            as_of_date=str(args.as_of),
+            lookback_window_days=int(args.lookback_window_days),
+            benchmark_version=str(args.benchmark_version),
+            out_dir=out_dir,
+            benchmark_metrics_ref=benchmark_metrics_ref,
+            live_metrics_ref=live_metrics_ref,
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "phase2-drift-status":
+        orchestrator = _automation(root_dir)
+        result = orchestrator.phase2_drift_operations_snapshot(
+            as_of_date=str(args.as_of),
+            lookback_window_days=int(args.lookback_window_days),
+            benchmark_version=str(args.benchmark_version),
         )
         print(json.dumps(result, indent=2))
         return

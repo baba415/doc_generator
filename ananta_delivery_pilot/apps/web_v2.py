@@ -358,6 +358,11 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 lookback_window_days=lookback_window_days,
                 benchmark_version=benchmark_version,
             )
+            drift_ops = service.portfolio_drift_operations_strip(
+                as_of_date=as_of_date_utc,
+                lookback_window_days=lookback_window_days,
+                benchmark_version=benchmark_version,
+            )
             preview_token = str((query.get("preview_token") or [""])[0] or "").strip()
             preview_result: dict[str, object] | None = None
             preview_stale = False
@@ -454,6 +459,28 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             if not drift_gates:
                 table.append("<tr><td colspan='3' class='muted'>No drift data for current inputs.</td></tr>")
             table.append("</tbody></table>")
+            table.append("<h3>Drift Ops Summary</h3>")
+            table.append("<p class='muted'>Read-only operational drift summary. Resolve only in Exceptions Inbox.</p>")
+            table.append("<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>")
+            table.append(f"<tr><td>drift_state</td><td>{_escape(drift_ops.get('drift_state') or 'N/A')}</td></tr>")
+            table.append(f"<tr><td>recommendation</td><td>{_escape(drift_ops.get('recommendation') or 'N/A')}</td></tr>")
+            table.append(f"<tr><td>open_drift_cases_total</td><td>{_escape(drift_ops.get('open_cases_total'))}</td></tr>")
+            table.append(f"<tr><td>latest_triage_at_utc</td><td>{_escape(drift_ops.get('latest_triage_at_utc') or 'N/A')}</td></tr>")
+            table.append(f"<tr><td>latest_report_md_path</td><td>{_escape(drift_ops.get('latest_report_md_path') or 'N/A')}</td></tr>")
+            table.append("</tbody></table>")
+            severity_counts = drift_ops.get("open_cases_by_severity") if isinstance(drift_ops.get("open_cases_by_severity"), dict) else {}
+            gate_counts = drift_ops.get("open_cases_by_gate") if isinstance(drift_ops.get("open_cases_by_gate"), dict) else {}
+            reason_counts = drift_ops.get("open_cases_by_reason") if isinstance(drift_ops.get("open_cases_by_reason"), dict) else {}
+            table.append(
+                "<p class='muted'>"
+                f"by_severity={_escape(json.dumps(severity_counts, sort_keys=True))}; "
+                f"by_gate={_escape(json.dumps(gate_counts, sort_keys=True))}; "
+                f"by_reason={_escape(json.dumps(reason_counts, sort_keys=True))}"
+                "</p>"
+            )
+            table.append(
+                f"<p><a class='btn' href='/v2/exceptions?case_type=DRIFT_MONITORING&status=OPEN&as_of_date={quote_plus(as_of_date_utc)}'>Open Drift Cases</a></p>"
+            )
             if preview_result:
                 preview_rows = preview_result.get("skipped_contracts", [])
                 preview_rows = preview_rows if isinstance(preview_rows, list) else []
@@ -883,12 +910,15 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
             msg, level = self._msg(query)
             contract_filter = str((query.get("contract_id") or [""])[0] or "").strip()
             as_of_date_utc = str((query.get("as_of_date") or [utc_today_iso()])[0] or utc_today_iso()).strip()
+            status_filter = str((query.get("status") or ["OPEN"])[0] or "OPEN").strip().upper()
+            case_type_filter = str((query.get("case_type") or [""])[0] or "").strip()
             run_id = str((query.get("run_id") or [""])[0] or "").strip()
             focus_case_id = str((query.get("case_id") or [""])[0] or "").strip()
             cards = service.exception_case_cards(
-                status="OPEN",
+                status=status_filter,
                 as_of_date_utc=as_of_date_utc,
                 contract_id=contract_filter or None,
+                case_type=case_type_filter or None,
             )
             grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
             for card in cards:
@@ -898,6 +928,10 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 "<h2>Exceptions Queue</h2>",
                 "<p class='muted'>Decision inbox (approve/reject/override). This is the primary manual workspace.</p>",
             ]
+            if case_type_filter:
+                parts.append(
+                    f"<p class='muted'>filter: case_type={_escape(case_type_filter)}; status={_escape(status_filter)}.</p>"
+                )
             if run_id and contract_filter:
                 timeline_rows = service.command_center_timeline(
                     autonomy_run_id=run_id,

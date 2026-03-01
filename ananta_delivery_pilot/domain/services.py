@@ -1548,6 +1548,22 @@ class Phase1Service:
             benchmark_version=benchmark_version,
         )
 
+    def portfolio_drift_operations_strip(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int = 30,
+        benchmark_version: str = "phase2.pr12.v1",
+    ) -> dict[str, Any]:
+        from domain.automation import AutomationOrchestrator
+
+        orchestrator = AutomationOrchestrator(self.config, self.repo, self)
+        return orchestrator.phase2_drift_operations_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+        )
+
     def portfolio_sla_trends(
         self,
         *,
@@ -2605,12 +2621,15 @@ class Phase1Service:
         status: str = "OPEN",
         as_of_date_utc: str | None = None,
         contract_id: str | None = None,
+        case_type: str | None = None,
     ) -> list[dict[str, Any]]:
         as_of_date = str(as_of_date_utc or utc_today_iso()).strip()
         as_of_dt = datetime.fromisoformat(f"{as_of_date}T23:59:59+00:00")
-        rows = self.repo.list_exception_cases(status=status)
-        if contract_id:
-            rows = [row for row in rows if str(row.get("contract_id") or "") == contract_id]
+        rows = self.repo.list_exception_cases(
+            status=status,
+            case_type=case_type,
+            contract_id=contract_id,
+        )
         contract_ids = sorted({str(row.get("contract_id") or "") for row in rows if str(row.get("contract_id") or "")})
         open_counts: dict[str, int] = {}
         contract_states: dict[str, str] = {}

@@ -102,6 +102,34 @@ class Phase2UiRouteTests(unittest.TestCase):
             "sales_transaction_id": str(pack["sales_transaction_id"]),
         }
 
+    def _write_drift_metrics_ref(
+        self,
+        *,
+        file_name: str,
+        benchmark_version: str,
+        median_manual_fields_per_intake: float | None = 1.0,
+        autoplan_zero_edit_common_case_rate: float | None = 1.0,
+        manual_transport_fields_per_delivery: float | None = 0.5,
+        doc_autolink_precision: float | None = 0.95,
+        payment_suggestion_acceptance_rate: float | None = 0.80,
+        auto_action_success_rate: float | None = 0.90,
+    ) -> Path:
+        payload = {
+            "as_of_date": "2026-02-28",
+            "lookback_window_days": 30,
+            "benchmark_version": benchmark_version,
+            "generated_at_utc": "2026-02-28T12:00:00Z",
+            "median_manual_fields_per_intake": median_manual_fields_per_intake,
+            "autoplan_zero_edit_common_case_rate": autoplan_zero_edit_common_case_rate,
+            "manual_transport_fields_per_delivery": manual_transport_fields_per_delivery,
+            "doc_autolink_precision": doc_autolink_precision,
+            "payment_suggestion_acceptance_rate": payment_suggestion_acceptance_rate,
+            "auto_action_success_rate": auto_action_success_rate,
+        }
+        path = self.temp_dir / file_name
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        return path
+
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
@@ -707,6 +735,88 @@ class Phase2UiRouteTests(unittest.TestCase):
             self.assertIn("Latest drift report:", body)
             self.assertNotIn("name='waiver_id'", body)
             self.assertNotIn("name='policy_set_id'", body)
+        finally:
+            _stop_process(proc)
+
+    def test_portfolio_drift_ops_summary_links_to_exceptions_filter(self) -> None:
+        as_of_date = "2026-02-28"
+        benchmark_version = "phase2.pr12.v1"
+        benchmark_ref = self._write_drift_metrics_ref(
+            file_name="ui-benchmark-drift-ops.json",
+            benchmark_version=benchmark_version,
+            median_manual_fields_per_intake=1.0,
+        )
+        live_ref = self._write_drift_metrics_ref(
+            file_name="ui-live-drift-ops.json",
+            benchmark_version=benchmark_version,
+            median_manual_fields_per_intake=2.5,
+        )
+        self.orchestrator.phase2_drift_triage(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+            out_dir=self.temp_dir / "drift-ops-triage",
+            benchmark_metrics_ref=benchmark_ref,
+            live_metrics_ref=live_ref,
+        )
+        try:
+            port = _pick_free_port()
+        except PermissionError:
+            self.skipTest("socket bind not permitted in current sandbox")
+        proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
+        try:
+            _wait_for_route(port, "/v2/portfolio")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v2/portfolio?as_of={as_of_date}&lookback_window_days=30&benchmark_version={benchmark_version}",
+                timeout=3,
+            ) as response:
+                body = response.read().decode("utf-8")
+            self.assertIn("Drift Ops Summary", body)
+            self.assertIn("Open Drift Cases", body)
+            self.assertIn("case_type=DRIFT_MONITORING", body)
+            self.assertNotIn("name='waiver_id'", body)
+        finally:
+            _stop_process(proc)
+
+    def test_exceptions_filter_by_case_type_drift_monitoring(self) -> None:
+        as_of_date = "2026-02-28"
+        benchmark_version = "phase2.pr12.v1"
+        benchmark_ref = self._write_drift_metrics_ref(
+            file_name="ui-benchmark-exc-filter.json",
+            benchmark_version=benchmark_version,
+            autoplan_zero_edit_common_case_rate=0.95,
+        )
+        live_ref = self._write_drift_metrics_ref(
+            file_name="ui-live-exc-filter.json",
+            benchmark_version=benchmark_version,
+            autoplan_zero_edit_common_case_rate=0.82,
+        )
+        self.orchestrator.phase2_drift_triage(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+            out_dir=self.temp_dir / "drift-exc-filter",
+            benchmark_metrics_ref=benchmark_ref,
+            live_metrics_ref=live_ref,
+        )
+        try:
+            port = _pick_free_port()
+        except PermissionError:
+            self.skipTest("socket bind not permitted in current sandbox")
+        proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
+        try:
+            _wait_for_route(port, "/v2/exceptions")
+            query = urllib.parse.urlencode(
+                {
+                    "case_type": "DRIFT_MONITORING",
+                    "status": "OPEN",
+                    "as_of_date": as_of_date,
+                }
+            )
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/v2/exceptions?{query}", timeout=3) as response:
+                body = response.read().decode("utf-8")
+            self.assertIn("filter: case_type=DRIFT_MONITORING; status=OPEN", body)
+            self.assertIn("DRIFT_MONITORING", body)
         finally:
             _stop_process(proc)
 

@@ -135,6 +135,8 @@ python3 run.py seed-phase2-benchmark --as-of 2026-02-28 --benchmark-version phas
 python3 run.py phase2-gate-report --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/release-readiness/pr12
 python3 run.py run-phase2-benchmark --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr12/manual
 python3 run.py phase2-drift-report --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr13/manual
+python3 run.py phase2-drift-triage --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr14/manual
+python3 run.py phase2-drift-status --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1
 ```
 
 PR11 gate reliability adds:
@@ -147,6 +149,11 @@ PR13 drift monitoring adds:
 - `phase2-drift-report` benchmark-to-live drift artifacts (`phase2_drift_report_<as_of>.json/.md`),
 - additive threshold config via `config/drift_thresholds.json` (default fallback if missing),
 - read-only drift strip on `/v2/portfolio` for PR8/PR9/PR10 drift states and latest report link.
+
+PR14 drift operations adds:
+- `phase2-drift-triage` deterministic projection of drift states to `DRIFT_MONITORING` cases (idempotent, replay-safe),
+- `phase2-drift-status` read-only summary for drift case load and latest triage/report refs,
+- portfolio read-only Drift Ops Summary with explicit link to `/v2/exceptions?case_type=DRIFT_MONITORING&status=OPEN`.
 
 Phase 1 state writes to:
 - `.state/drep.sqlite`

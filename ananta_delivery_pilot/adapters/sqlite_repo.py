@@ -2523,16 +2523,35 @@ class SQLiteRepo:
         row = conn.execute("SELECT * FROM exception_cases WHERE exception_case_id = ?", (exception_case_id,)).fetchone()
         return dict(row)
 
-    def list_exception_cases(self, *, status: str | None = None) -> list[dict[str, Any]]:
+    def list_exception_cases(
+        self,
+        *,
+        status: str | None = None,
+        case_type: str | None = None,
+        contract_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where: list[str] = []
+        params: list[Any] = []
         if status:
-            return self.fetch_all(
-                "SELECT * FROM exception_cases WHERE status = ? ORDER BY created_at ASC",
-                (status,),
-            )
-        return self.fetch_all("SELECT * FROM exception_cases ORDER BY created_at ASC")
+            where.append("status = ?")
+            params.append(status)
+        if case_type:
+            where.append("case_type = ?")
+            params.append(case_type)
+        if contract_id:
+            where.append("contract_id = ?")
+            params.append(contract_id)
+        query = "SELECT * FROM exception_cases"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY created_at ASC"
+        return self.fetch_all(query, tuple(params))
 
     def get_exception_case(self, exception_case_id: str) -> dict[str, Any] | None:
         return self.fetch_one("SELECT * FROM exception_cases WHERE exception_case_id = ?", (exception_case_id,))
+
+    def get_exception_case_by_idempotency(self, *, idempotency_key: str) -> dict[str, Any] | None:
+        return self.fetch_one("SELECT * FROM exception_cases WHERE idempotency_key = ?", (idempotency_key,))
 
     def add_human_decision(
         self,
