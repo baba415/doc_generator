@@ -138,6 +138,7 @@ python3 run.py phase2-drift-report --as-of 2026-02-28 --lookback-window-days 30 
 python3 run.py phase2-drift-triage --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr14/manual
 python3 run.py phase2-drift-status --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1
 python3 run.py phase2-drift-root-cause --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr15/manual
+python3 run.py phase2-operator-playbooks --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr16/manual
 ```
 
 PR11 gate reliability adds:
@@ -160,6 +161,12 @@ PR15 drift root-cause reduction adds:
 - `phase2-drift-root-cause` deterministic root-cause diagnostics artifacts (`phase2_drift_root_cause_<as_of>.json/.md`),
 - append-only audit event `PHASE2_DRIFT_ROOT_CAUSE_EXPORTED`,
 - portfolio read-only Drift Root Cause Summary panel (top recurring causes + report link + exceptions deep-link).
+
+PR16 operator playbooks adds:
+- `phase2-operator-playbooks` deterministic guidance artifacts (`phase2_operator_playbooks_<as_of>.json/.md`),
+- append-only audit event `PHASE2_OPERATOR_PLAYBOOKS_EXPORTED`,
+- portfolio read-only Operator Playbooks panel (top-3 playbooks + aggregate state/reason + exceptions deep-link),
+- guidance-only behavior (no execute/apply/edit controls from portfolio).
 
 Phase 1 state writes to:
 - `.state/drep.sqlite`

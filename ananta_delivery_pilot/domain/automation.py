@@ -63,6 +63,30 @@ ROOT_CAUSE_REASON_PRECEDENCE = [
     "no_recurring_root_cause",
 ]
 
+PLAYBOOK_ALLOWED_CODES = {
+    "PB_OBSERVABILITY_RECOVERY",
+    "PB_BENCHMARK_ALIGNMENT",
+    "PB_INTAKE_QUALITY_STABILIZATION",
+    "PB_PLANNING_POLICY_REVIEW",
+    "PB_TRANSPORT_ASSIGNMENT_RETRAIN",
+    "PB_DOCUMENT_LINKAGE_TUNING",
+    "PB_SETTLEMENT_MATCHING_REVIEW",
+    "PB_MANUAL_OVERRIDE_REDUCTION",
+    "PB_MONITOR_ONLY",
+}
+
+ROOT_CAUSE_PLAYBOOK_MAP: dict[str, tuple[str, str | None]] = {
+    "insufficient_observability_data": ("PB_OBSERVABILITY_RECOVERY", "PB_MONITOR_ONLY"),
+    "benchmark_dataset_misalignment": ("PB_BENCHMARK_ALIGNMENT", "PB_MONITOR_ONLY"),
+    "input_quality_regression": ("PB_INTAKE_QUALITY_STABILIZATION", "PB_MANUAL_OVERRIDE_REDUCTION"),
+    "planning_policy_mismatch": ("PB_PLANNING_POLICY_REVIEW", "PB_MANUAL_OVERRIDE_REDUCTION"),
+    "transport_assignment_instability": ("PB_TRANSPORT_ASSIGNMENT_RETRAIN", "PB_MANUAL_OVERRIDE_REDUCTION"),
+    "document_linkage_instability": ("PB_DOCUMENT_LINKAGE_TUNING", "PB_MANUAL_OVERRIDE_REDUCTION"),
+    "settlement_matching_instability": ("PB_SETTLEMENT_MATCHING_REVIEW", "PB_MANUAL_OVERRIDE_REDUCTION"),
+    "manual_override_concentration": ("PB_MANUAL_OVERRIDE_REDUCTION", "PB_MONITOR_ONLY"),
+    "no_recurring_root_cause": ("PB_MONITOR_ONLY", None),
+}
+
 DEFAULT_DRIFT_THRESHOLDS: dict[str, Any] = {
     "version": "phase2.pr13.defaults.v1",
     "pr8": {
@@ -2424,6 +2448,285 @@ class AutomationOrchestrator:
             "latest_report_md_path": str(payload.get("report_md_path") or ""),
         }
 
+    def phase2_operator_playbooks(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+        out_dir: Path,
+        drift_report_ref: Path | None = None,
+        triage_status_ref: Path | None = None,
+        root_cause_report_ref: Path | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        if lookback_window_days <= 0:
+            raise ValueError("lookback_window_days must be > 0")
+        try:
+            date.fromisoformat(as_of_date)
+        except ValueError as error:
+            raise ValueError("as_of_date must be YYYY-MM-DD") from error
+        out_dir.mkdir(parents=True, exist_ok=True)
+        generated_at_utc = utc_now_iso_z()
+
+        if drift_report_ref is not None:
+            drift_payload_raw = json.loads(drift_report_ref.read_text(encoding="utf-8"))
+            drift_payload = self._safe_json_object(drift_payload_raw)
+            drift_report_source = str(drift_report_ref)
+        else:
+            drift_result = self.phase2_drift_report(
+                as_of_date=as_of_date,
+                lookback_window_days=int(lookback_window_days),
+                benchmark_version=benchmark_version,
+                out_dir=out_dir,
+                persist=False,
+            )
+            drift_payload = self._safe_json_object(drift_result.get("drift_report"))
+            drift_report_source = str(drift_result.get("report_json_path") or "")
+
+        if triage_status_ref is not None:
+            triage_snapshot_raw = json.loads(triage_status_ref.read_text(encoding="utf-8"))
+            triage_snapshot = self._safe_json_object(triage_snapshot_raw)
+            triage_status_source = str(triage_status_ref)
+        else:
+            triage_snapshot = self.phase2_drift_operations_snapshot(
+                as_of_date=as_of_date,
+                lookback_window_days=int(lookback_window_days),
+                benchmark_version=benchmark_version,
+            )
+            triage_status_source = str(triage_snapshot.get("latest_report_json_path") or "")
+
+        if root_cause_report_ref is not None:
+            root_cause_payload_raw = json.loads(root_cause_report_ref.read_text(encoding="utf-8"))
+            root_cause_payload = self._safe_json_object(root_cause_payload_raw)
+            root_cause_source = str(root_cause_report_ref)
+        else:
+            drift_ref_for_rc = Path(drift_report_source) if drift_report_source else None
+            triage_ref_for_rc = Path(triage_status_source) if triage_status_source else None
+            root_cause_result = self.phase2_drift_root_cause(
+                as_of_date=as_of_date,
+                lookback_window_days=int(lookback_window_days),
+                benchmark_version=benchmark_version,
+                out_dir=out_dir,
+                drift_report_ref=drift_ref_for_rc,
+                triage_status_ref=triage_ref_for_rc,
+                persist=False,
+            )
+            root_cause_payload = self._safe_json_object(root_cause_result.get("root_cause_report"))
+            root_cause_source = str(root_cause_result.get("report_json_path") or "")
+
+        root_aggregate = root_cause_payload.get("aggregate") if isinstance(root_cause_payload.get("aggregate"), dict) else {}
+        aggregate_state = str(root_aggregate.get("state") or "INSUFFICIENT_DATA")
+        aggregate_reason_code = str(root_aggregate.get("reason_code") or "insufficient_observability_data")
+        top_root_causes = root_aggregate.get("top_recurring_causes") if isinstance(root_aggregate.get("top_recurring_causes"), list) else []
+        if not top_root_causes:
+            top_root_causes = [
+                {
+                    "root_cause_code": "insufficient_observability_data",
+                    "occurrence_count": 0,
+                    "affected_contracts": 0,
+                    "recurring": False,
+                    "gates": [],
+                }
+            ]
+
+        drift_inputs = drift_payload.get("inputs") if isinstance(drift_payload.get("inputs"), dict) else {}
+        source_refs = {
+            "drift_report": drift_report_source,
+            "triage_status": triage_status_source,
+            "root_cause_report": root_cause_source,
+        }
+        missing_source_refs = not all(str(source_refs.get(key) or "").strip() for key in ("drift_report", "triage_status", "root_cause_report"))
+        if missing_source_refs:
+            aggregate_state = "INSUFFICIENT_DATA"
+            aggregate_reason_code = "insufficient_observability_data"
+            top_root_causes = [
+                {
+                    "root_cause_code": "insufficient_observability_data",
+                    "occurrence_count": 0,
+                    "affected_contracts": 0,
+                    "recurring": False,
+                    "gates": [],
+                }
+            ]
+        candidates_by_playbook: dict[str, dict[str, Any]] = {}
+        for item in top_root_causes:
+            if not isinstance(item, dict):
+                continue
+            root_cause_code = str(item.get("root_cause_code") or "").strip()
+            if root_cause_code not in ROOT_CAUSE_PLAYBOOK_MAP:
+                root_cause_code = "insufficient_observability_data"
+            mapped = ROOT_CAUSE_PLAYBOOK_MAP[root_cause_code]
+            playbook_codes = [mapped[0]]
+            if mapped[1]:
+                playbook_codes.append(str(mapped[1]))
+            for map_index, playbook_code in enumerate(playbook_codes):
+                if playbook_code not in PLAYBOOK_ALLOWED_CODES:
+                    continue
+                affected_contracts = int(item.get("affected_contracts") or 0)
+                recurring = bool(item.get("recurring"))
+                urgency = self._playbook_urgency(
+                    aggregate_state=aggregate_state,
+                    root_cause_code=root_cause_code,
+                    recurring=recurring,
+                    affected_contracts=affected_contracts,
+                )
+                evidence_checklist, missing_evidence, evidence_refs = self._playbook_evidence_bundle(
+                    playbook_code=playbook_code,
+                    root_cause_code=root_cause_code,
+                    source_refs=source_refs,
+                    drift_inputs=drift_inputs,
+                    root_cause_entry=item,
+                )
+                evidence_completeness = "COMPLETE" if not missing_evidence else "PARTIAL"
+                score = (
+                    self._playbook_urgency_weight(urgency)
+                    + (2 if recurring else 0)
+                    + min(affected_contracts, 3)
+                    + (-1 if evidence_completeness == "PARTIAL" else 0)
+                    + (2 if map_index == 0 else 0)
+                )
+                candidate = {
+                    "playbook_code": playbook_code,
+                    "urgency": urgency,
+                    "score": int(score),
+                    "_mapping_rank": int(map_index),
+                    "root_cause_code": root_cause_code,
+                    "affected_contracts": affected_contracts,
+                    "recurring": recurring,
+                    "occurrence_count": int(item.get("occurrence_count") or 0),
+                    "evidence_completeness": evidence_completeness,
+                    "evidence_checklist": evidence_checklist,
+                    "missing_evidence": missing_evidence,
+                    "evidence_refs": evidence_refs,
+                }
+                existing = candidates_by_playbook.get(playbook_code)
+                if existing is None:
+                    candidates_by_playbook[playbook_code] = candidate
+                else:
+                    existing_key = (
+                        int(existing.get("score") or 0),
+                        self._playbook_urgency_weight(str(existing.get("urgency") or "")),
+                        int(existing.get("affected_contracts") or 0),
+                        -int(existing.get("_mapping_rank") or 0),
+                        str(existing.get("playbook_code") or ""),
+                    )
+                    candidate_key = (
+                        int(candidate.get("score") or 0),
+                        self._playbook_urgency_weight(str(candidate.get("urgency") or "")),
+                        int(candidate.get("affected_contracts") or 0),
+                        -int(candidate.get("_mapping_rank") or 0),
+                        str(candidate.get("playbook_code") or ""),
+                    )
+                    if candidate_key > existing_key:
+                        candidates_by_playbook[playbook_code] = candidate
+
+        ranked_candidates = sorted(
+            candidates_by_playbook.values(),
+            key=lambda row: (
+                -int(row.get("score") or 0),
+                -self._playbook_urgency_weight(str(row.get("urgency") or "")),
+                -int(row.get("affected_contracts") or 0),
+                int(row.get("_mapping_rank") or 0),
+                str(row.get("playbook_code") or ""),
+            ),
+        )
+        selected_playbooks = ranked_candidates[:3]
+        for row in selected_playbooks:
+            if isinstance(row, dict):
+                row.pop("_mapping_rank", None)
+        aggregate = {
+            "state": aggregate_state,
+            "reason_code": aggregate_reason_code,
+            "selection_count": len(selected_playbooks),
+        }
+        report_payload = {
+            "inputs": {
+                "as_of_date": as_of_date,
+                "lookback_window_days": int(lookback_window_days),
+                "benchmark_version": benchmark_version,
+                "generated_at_utc": generated_at_utc,
+                "drift_report_ref": drift_report_source,
+                "triage_status_ref": triage_status_source,
+                "root_cause_report_ref": root_cause_source,
+            },
+            "aggregate": aggregate,
+            "playbooks": selected_playbooks,
+            "source_refs": source_refs,
+        }
+
+        report_json_path = out_dir / f"phase2_operator_playbooks_{as_of_date}.json"
+        report_md_path = out_dir / f"phase2_operator_playbooks_{as_of_date}.md"
+        report_json_path.write_text(json.dumps(report_payload, indent=2, sort_keys=True), encoding="utf-8")
+        report_md_path.write_text(self._phase2_operator_playbooks_markdown(report_payload), encoding="utf-8")
+
+        if persist:
+            with self.repo.transaction() as conn:
+                self.repo.append_event(
+                    conn,
+                    entity_type="METRICS",
+                    entity_id=f"PHASE2_OPERATOR_PLAYBOOKS::{as_of_date}::{benchmark_version}",
+                    event_type="PHASE2_OPERATOR_PLAYBOOKS_EXPORTED",
+                    as_of_date=as_of_date,
+                    payload={
+                        "as_of_date": as_of_date,
+                        "lookback_window_days": int(lookback_window_days),
+                        "benchmark_version": benchmark_version,
+                        "generated_at_utc": generated_at_utc,
+                        "aggregate_state": aggregate_state,
+                        "aggregate_reason_code": aggregate_reason_code,
+                        "selection_count": len(selected_playbooks),
+                        "selected_playbooks": selected_playbooks,
+                        "report_json_path": str(report_json_path),
+                        "report_md_path": str(report_md_path),
+                    },
+                    source="phase2-operator-playbooks",
+                )
+
+        return {
+            "ok": True,
+            "aggregate_state": aggregate_state,
+            "aggregate_reason_code": aggregate_reason_code,
+            "selected_playbooks": selected_playbooks,
+            "report_json_path": str(report_json_path),
+            "report_md_path": str(report_md_path),
+            "operator_playbooks_report": report_payload,
+        }
+
+    def phase2_operator_playbooks_snapshot(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+    ) -> dict[str, Any]:
+        latest_row = self.repo.fetch_one(
+            """
+            SELECT payload_json
+            FROM event_log
+            WHERE event_type = 'PHASE2_OPERATOR_PLAYBOOKS_EXPORTED'
+              AND as_of_date = ?
+              AND json_extract(payload_json, '$.benchmark_version') = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (as_of_date, benchmark_version),
+        )
+        payload = self._safe_json_object((latest_row or {}).get("payload_json"))
+        selected = payload.get("selected_playbooks") if isinstance(payload.get("selected_playbooks"), list) else []
+        return {
+            "as_of_date": as_of_date,
+            "lookback_window_days": int(lookback_window_days),
+            "benchmark_version": benchmark_version,
+            "aggregate_state": str(payload.get("aggregate_state") or "PASS"),
+            "aggregate_reason_code": str(payload.get("aggregate_reason_code") or "no_recurring_root_cause"),
+            "selection_count": int(payload.get("selection_count") or len(selected)),
+            "selected_playbooks": selected[:3],
+            "latest_generated_at_utc": str(payload.get("generated_at_utc") or ""),
+            "latest_report_json_path": str(payload.get("report_json_path") or ""),
+            "latest_report_md_path": str(payload.get("report_md_path") or ""),
+        }
+
     def phase2_gate_report(
         self,
         *,
@@ -2807,6 +3110,164 @@ class AutomationOrchestrator:
             ]
         )
         return "\n".join(lines)
+
+    def _phase2_operator_playbooks_markdown(self, report: dict[str, Any]) -> str:
+        inputs = report.get("inputs") if isinstance(report.get("inputs"), dict) else {}
+        aggregate = report.get("aggregate") if isinstance(report.get("aggregate"), dict) else {}
+        playbooks = report.get("playbooks") if isinstance(report.get("playbooks"), list) else []
+        lines = [
+            "# Phase 2 Operator Playbooks",
+            "",
+            "## Inputs",
+            f"- as_of_date: {inputs.get('as_of_date')}",
+            f"- lookback_window_days: {inputs.get('lookback_window_days')}",
+            f"- benchmark_version: {inputs.get('benchmark_version')}",
+            f"- generated_at_utc: {inputs.get('generated_at_utc')}",
+            f"- drift_report_ref: {inputs.get('drift_report_ref')}",
+            f"- triage_status_ref: {inputs.get('triage_status_ref')}",
+            f"- root_cause_report_ref: {inputs.get('root_cause_report_ref')}",
+            "",
+            "## Aggregate",
+            f"- state: {aggregate.get('state')}",
+            f"- reason_code: {aggregate.get('reason_code')}",
+            f"- selection_count: {aggregate.get('selection_count')}",
+            "",
+            "## Selected Playbooks",
+            "| Playbook | Urgency | Score | Root Cause | Recurring | Affected Contracts | Evidence Completeness |",
+            "|---|---|---:|---|---:|---:|---|",
+        ]
+        for row in playbooks:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                "| {playbook} | {urgency} | {score} | {cause} | {recurring} | {contracts} | {evidence} |".format(
+                    playbook=row.get("playbook_code"),
+                    urgency=row.get("urgency"),
+                    score=row.get("score"),
+                    cause=row.get("root_cause_code"),
+                    recurring=row.get("recurring"),
+                    contracts=row.get("affected_contracts"),
+                    evidence=row.get("evidence_completeness"),
+                )
+            )
+        if not playbooks:
+            lines.append("| _none_ | | | | | | |")
+        lines.extend(
+            [
+                "",
+                "## Raw JSON",
+                "```json",
+                json.dumps(report, indent=2, sort_keys=True),
+                "```",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _playbook_urgency(
+        self,
+        *,
+        aggregate_state: str,
+        root_cause_code: str,
+        recurring: bool,
+        affected_contracts: int,
+    ) -> str:
+        state = str(aggregate_state or "").upper()
+        code = str(root_cause_code or "")
+        if state == "ALERT" or code in {"insufficient_observability_data", "benchmark_dataset_misalignment"}:
+            return "URGENT"
+        if state == "WATCH":
+            if recurring and int(affected_contracts) >= 2:
+                return "HIGH"
+            return "MEDIUM"
+        if state == "PASS" and code == "no_recurring_root_cause":
+            return "LOW"
+        if recurring:
+            return "HIGH"
+        return "MEDIUM"
+
+    def _playbook_urgency_weight(self, urgency: str) -> int:
+        value = str(urgency or "").upper()
+        if value == "URGENT":
+            return 4
+        if value == "HIGH":
+            return 3
+        if value == "MEDIUM":
+            return 2
+        return 1
+
+    def _playbook_evidence_bundle(
+        self,
+        *,
+        playbook_code: str,
+        root_cause_code: str,
+        source_refs: dict[str, str],
+        drift_inputs: dict[str, Any],
+        root_cause_entry: dict[str, Any],
+    ) -> tuple[list[str], list[str], list[str]]:
+        source_drift = str(source_refs.get("drift_report") or "").strip()
+        source_triage = str(source_refs.get("triage_status") or "").strip()
+        source_root = str(source_refs.get("root_cause_report") or "").strip()
+        benchmark_ref = str(drift_inputs.get("benchmark_metrics_ref") or "").strip()
+        live_ref = str(drift_inputs.get("live_metrics_ref") or "").strip()
+        evidence_refs = [ref for ref in [source_drift, source_triage, source_root] if ref]
+        entry_refs = root_cause_entry.get("evidence_refs") if isinstance(root_cause_entry.get("evidence_refs"), list) else []
+        for ref in entry_refs:
+            value = str(ref or "").strip()
+            if value and value not in evidence_refs:
+                evidence_refs.append(value)
+
+        checklist_rules: dict[str, list[tuple[str, bool]]] = {
+            "PB_OBSERVABILITY_RECOVERY": [
+                ("latest drift report JSON path", bool(source_drift)),
+                ("latest drift triage status snapshot", bool(source_triage)),
+                ("latest autonomy metrics snapshot", bool(live_ref)),
+                ("missing telemetry fields list", root_cause_code == "insufficient_observability_data"),
+            ],
+            "PB_BENCHMARK_ALIGNMENT": [
+                ("benchmark run/version reference", bool(benchmark_ref)),
+                ("drift report benchmark_version reference", bool(source_drift)),
+                ("live metrics benchmark_version reference", bool(live_ref)),
+                ("version mismatch evidence", root_cause_code == "benchmark_dataset_misalignment"),
+            ],
+            "PB_INTAKE_QUALITY_STABILIZATION": [
+                ("intake decision distribution snapshot", bool(source_root)),
+                ("correction memory evidence refs", bool(entry_refs)),
+                ("affected buyer/product tuples", int(root_cause_entry.get("affected_contracts") or 0) > 0),
+            ],
+            "PB_PLANNING_POLICY_REVIEW": [
+                ("lot split common-case outcomes", bool(source_root)),
+                ("planning exception references", bool(entry_refs)),
+                ("policy version/source refs", bool(source_drift)),
+            ],
+            "PB_TRANSPORT_ASSIGNMENT_RETRAIN": [
+                ("transport confidence distribution refs", bool(source_root)),
+                ("assignment feedback refs", bool(entry_refs)),
+                ("compliance conflict refs", bool(source_triage)),
+            ],
+            "PB_DOCUMENT_LINKAGE_TUNING": [
+                ("auto-link precision snapshot", bool(source_root)),
+                ("ambiguous/blocked linkage case refs", bool(entry_refs)),
+                ("fingerprint/source filename samples", bool(source_drift)),
+            ],
+            "PB_SETTLEMENT_MATCHING_REVIEW": [
+                ("payment suggestion acceptance snapshot", bool(source_root)),
+                ("ambiguous allocation case refs", bool(entry_refs)),
+                ("payment reference mismatch refs", bool(source_drift)),
+            ],
+            "PB_MANUAL_OVERRIDE_REDUCTION": [
+                ("override concentration ratios", bool(source_root)),
+                ("top repeated override reasons", bool(entry_refs)),
+                ("exception case references", bool(source_triage)),
+            ],
+            "PB_MONITOR_ONLY": [
+                ("latest drift + root-cause report refs", bool(source_drift and source_root)),
+            ],
+        }
+        rules = checklist_rules.get(playbook_code, [])
+        evidence_checklist = [item for item, _ in rules]
+        missing_evidence = [item for item, ok in rules if not ok]
+        return evidence_checklist, missing_evidence, evidence_refs
 
     def _diagnose_root_cause_for_gate(
         self,

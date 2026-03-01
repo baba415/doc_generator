@@ -43,6 +43,7 @@ def phase1_commands() -> set[str]:
         "phase2-drift-triage",
         "phase2-drift-status",
         "phase2-drift-root-cause",
+        "phase2-operator-playbooks",
     }
 
 
@@ -222,6 +223,18 @@ def build_parser() -> argparse.ArgumentParser:
     phase2_drift_root_cause.add_argument("--out-dir", required=True)
     phase2_drift_root_cause.add_argument("--drift-report", default="")
     phase2_drift_root_cause.add_argument("--triage-status", default="")
+
+    phase2_operator_playbooks = subparsers.add_parser(
+        "phase2-operator-playbooks",
+        help="Generate deterministic operator playbooks guidance report",
+    )
+    phase2_operator_playbooks.add_argument("--as-of", required=True)
+    phase2_operator_playbooks.add_argument("--lookback-window-days", type=int, default=30)
+    phase2_operator_playbooks.add_argument("--benchmark-version", required=True)
+    phase2_operator_playbooks.add_argument("--out-dir", required=True)
+    phase2_operator_playbooks.add_argument("--drift-report", default="")
+    phase2_operator_playbooks.add_argument("--triage-status", default="")
+    phase2_operator_playbooks.add_argument("--root-cause-report", default="")
 
     return parser
 
@@ -513,6 +526,24 @@ def main(argv: list[str] | None = None) -> None:
             out_dir=out_dir,
             drift_report_ref=drift_report_ref,
             triage_status_ref=triage_status_ref,
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "phase2-operator-playbooks":
+        orchestrator = _automation(root_dir)
+        out_dir = Path(args.out_dir).expanduser()
+        drift_report_ref = Path(args.drift_report).expanduser() if str(args.drift_report or "").strip() else None
+        triage_status_ref = Path(args.triage_status).expanduser() if str(args.triage_status or "").strip() else None
+        root_cause_report_ref = Path(args.root_cause_report).expanduser() if str(args.root_cause_report or "").strip() else None
+        result = orchestrator.phase2_operator_playbooks(
+            as_of_date=str(args.as_of),
+            lookback_window_days=int(args.lookback_window_days),
+            benchmark_version=str(args.benchmark_version),
+            out_dir=out_dir,
+            drift_report_ref=drift_report_ref,
+            triage_status_ref=triage_status_ref,
+            root_cause_report_ref=root_cause_report_ref,
         )
         print(json.dumps(result, indent=2))
         return

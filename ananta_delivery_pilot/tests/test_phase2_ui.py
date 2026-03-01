@@ -878,6 +878,75 @@ class Phase2UiRouteTests(unittest.TestCase):
         finally:
             _stop_process(proc)
 
+    def test_portfolio_operator_playbooks_panel_is_read_only(self) -> None:
+        as_of_date = "2026-02-28"
+        benchmark_version = "phase2.pr12.v1"
+        benchmark_ref = self._write_drift_metrics_ref(
+            file_name="ui-benchmark-playbooks.json",
+            benchmark_version=benchmark_version,
+            autoplan_zero_edit_common_case_rate=0.95,
+        )
+        live_ref = self._write_drift_metrics_ref(
+            file_name="ui-live-playbooks.json",
+            benchmark_version=benchmark_version,
+            autoplan_zero_edit_common_case_rate=0.82,
+        )
+        drift_report = self.orchestrator.phase2_drift_report(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+            out_dir=self.temp_dir / "playbooks-drift-report",
+            benchmark_metrics_ref=benchmark_ref,
+            live_metrics_ref=live_ref,
+            persist=False,
+        )
+        triage_status = self.orchestrator.phase2_drift_operations_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+        )
+        triage_ref = self.temp_dir / "playbooks-triage-status.json"
+        triage_ref.write_text(json.dumps(triage_status, indent=2, sort_keys=True), encoding="utf-8")
+        root_cause = self.orchestrator.phase2_drift_root_cause(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+            out_dir=self.temp_dir / "playbooks-root-cause",
+            drift_report_ref=Path(str(drift_report["report_json_path"])),
+            triage_status_ref=triage_ref,
+            persist=False,
+        )
+        self.orchestrator.phase2_operator_playbooks(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+            out_dir=self.temp_dir / "playbooks-export",
+            drift_report_ref=Path(str(drift_report["report_json_path"])),
+            triage_status_ref=triage_ref,
+            root_cause_report_ref=Path(str(root_cause["report_json_path"])),
+            persist=True,
+        )
+        try:
+            port = _pick_free_port()
+        except PermissionError:
+            self.skipTest("socket bind not permitted in current sandbox")
+        proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
+        try:
+            _wait_for_route(port, "/v2/portfolio")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v2/portfolio?as_of={as_of_date}&lookback_window_days=30&benchmark_version={benchmark_version}",
+                timeout=3,
+            ) as response:
+                body = response.read().decode("utf-8")
+            self.assertIn("Operator Playbooks", body)
+            self.assertIn("PB_PLANNING_POLICY_REVIEW", body)
+            self.assertIn("case_type=DRIFT_MONITORING", body)
+            self.assertNotIn("Apply Playbook", body)
+            self.assertNotIn("Execute Playbook", body)
+            self.assertNotIn("name='playbook_code'", body)
+        finally:
+            _stop_process(proc)
+
 
 def _pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
