@@ -44,6 +44,7 @@ def phase1_commands() -> set[str]:
         "phase2-drift-status",
         "phase2-drift-root-cause",
         "phase2-operator-playbooks",
+        "dg1b-shadow-proof",
     }
 
 
@@ -235,6 +236,13 @@ def build_parser() -> argparse.ArgumentParser:
     phase2_operator_playbooks.add_argument("--drift-report", default="")
     phase2_operator_playbooks.add_argument("--triage-status", default="")
     phase2_operator_playbooks.add_argument("--root-cause-report", default="")
+
+    dg1b_shadow_proof = subparsers.add_parser(
+        "dg1b-shadow-proof",
+        help="Generate DG-1B shadow-mode proof artifacts (no live Rails writes)",
+    )
+    dg1b_shadow_proof.add_argument("--as-of", required=True)
+    dg1b_shadow_proof.add_argument("--out-dir", default="")
 
     return parser
 
@@ -544,6 +552,20 @@ def main(argv: list[str] | None = None) -> None:
             drift_report_ref=drift_report_ref,
             triage_status_ref=triage_status_ref,
             root_cause_report_ref=root_cause_report_ref,
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "dg1b-shadow-proof":
+        orchestrator = _automation(root_dir)
+        out_dir = (
+            Path(args.out_dir).expanduser()
+            if str(args.out_dir or "").strip()
+            else (root_dir / ".state" / "phase2-proof" / "dg1b" / args.as_of)
+        )
+        result = orchestrator.dg1b_shadow_proof(
+            as_of_date=str(args.as_of),
+            out_dir=out_dir,
         )
         print(json.dumps(result, indent=2))
         return

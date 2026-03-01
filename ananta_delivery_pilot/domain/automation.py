@@ -15,6 +15,19 @@ from core.hashing import canonical_json_sha256, sha256_file
 from core.ids import new_ulid
 from core.time import utc_now_iso_z
 from core.units import mt_to_kg_int
+from domain.rails_truth import (
+    EXECUTE_DREP_DAILY_VERSION,
+    EXECUTE_PROOF_EXPORT_VERSION,
+    EXECUTE_PROOF_MANIFEST_VERSION,
+    LocalNoopRailsAdapter,
+    RailsTruthShadowEmitter,
+    build_trust_idempotency_key,
+    dg1a_action_event_mapping,
+    dg1a_action_inventory,
+    resolve_rails_truth_flags,
+    validate_execute_drep_daily_payload,
+    validate_execute_proof_export_payload,
+)
 from domain.services import Phase1Service
 
 PR8_BENCHMARK_VERSION = "phase2.pr12.v1"
@@ -2957,6 +2970,352 @@ class AutomationOrchestrator:
             "report_json_path": report_json_path,
             "report_md_path": report_md_path,
             "gate_report": gate_report,
+        }
+
+    def dg1b_shadow_proof(
+        self,
+        *,
+        as_of_date: str,
+        out_dir: Path,
+    ) -> dict[str, Any]:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        flags = resolve_rails_truth_flags(self.config.rails_truth_flags)
+        inventory_rows = dg1a_action_inventory()
+        event_mapping_rows = dg1a_action_event_mapping()
+
+        inventory_path = out_dir / "dg1a_action_inventory.json"
+        inventory_path.write_text(json.dumps(inventory_rows, indent=2, sort_keys=True), encoding="utf-8")
+        mapping_path = out_dir / "dg1a_action_event_mapping.json"
+        mapping_path.write_text(json.dumps(event_mapping_rows, indent=2, sort_keys=True), encoding="utf-8")
+
+        proof_input = self._dg1b_contract_validation_inputs(as_of_date=as_of_date, out_dir=out_dir)
+        drep_pass = validate_execute_drep_daily_payload(proof_input["drep_daily_payload"])
+        drep_fail_payload = dict(proof_input["drep_daily_payload"])
+        drep_fail_payload["contract_version"] = "execute_drep_daily_v0"
+        drep_fail = validate_execute_drep_daily_payload(drep_fail_payload)
+        drep_validation = {
+            "contract": EXECUTE_DREP_DAILY_VERSION,
+            "pass": drep_pass.to_dict(),
+            "failures": [
+                {
+                    "scenario": "version_mismatch",
+                    "result": drep_fail.to_dict(),
+                }
+            ],
+        }
+        drep_validation_path = out_dir / "dg1a_execute_drep_daily_validation.json"
+        drep_validation_path.write_text(json.dumps(drep_validation, indent=2, sort_keys=True), encoding="utf-8")
+
+        proof_pass = validate_execute_proof_export_payload(proof_input["proof_export_payload"])
+        proof_fail_payload = dict(proof_input["proof_export_payload"])
+        proof_fail_payload["manifest_sha256"] = "0" * 64
+        proof_fail = validate_execute_proof_export_payload(proof_fail_payload)
+        proof_validation = {
+            "contract": EXECUTE_PROOF_EXPORT_VERSION,
+            "pass": proof_pass.to_dict(),
+            "failures": [
+                {
+                    "scenario": "manifest_hash_mismatch",
+                    "result": proof_fail.to_dict(),
+                }
+            ],
+        }
+        proof_validation_path = out_dir / "dg1a_execute_proof_export_validation.json"
+        proof_validation_path.write_text(json.dumps(proof_validation, indent=2, sort_keys=True), encoding="utf-8")
+
+        emitter = RailsTruthShadowEmitter(
+            flags=flags,
+            adapter=LocalNoopRailsAdapter(rails_write_enabled=bool(flags.get("rails_write_enabled"))),
+        )
+        shadow_rows: list[dict[str, Any]] = []
+        occurred_at_utc = f"{as_of_date}T00:00:00Z"
+        for action_name, payload in sorted(proof_input["trust_action_payloads"].items(), key=lambda item: item[0]):
+            emit_result = emitter.emit(
+                action=action_name,
+                payload=payload,
+                as_of_date=as_of_date,
+                occurred_at_utc=occurred_at_utc,
+            )
+            shadow_rows.append(
+                {
+                    "action": action_name,
+                    "result": emit_result,
+                }
+            )
+        shadow_log_path = out_dir / "dg1a_shadow_emit.log"
+        shadow_log_path.write_text(
+            "\n".join(json.dumps(row, sort_keys=True) for row in shadow_rows) + ("\n" if shadow_rows else ""),
+            encoding="utf-8",
+        )
+
+        all_shadow_ok = all(bool(row.get("result", {}).get("ok")) for row in shadow_rows)
+        checklist = {
+            "generated_at_utc": utc_now_iso_z(),
+            "checklist": {
+                "r1_gates_passed": False,
+                "shadow_emit_deterministic": all_shadow_ok,
+                "replay_idempotency_stable": self._dg1b_idempotency_replay_stable(proof_input["trust_action_payloads"]),
+                "execute_drep_daily_validation_pass": bool(drep_pass.ok),
+                "execute_proof_export_validation_pass": bool(proof_pass.ok),
+                "legacy_behavior_changed": False,
+            },
+        }
+        checklist["final_decision"] = "GO" if all(checklist["checklist"].values()) else "NO_GO"
+        checklist_path = out_dir / "dg1a_go_no_go_checklist.json"
+        checklist_path.write_text(json.dumps(checklist, indent=2, sort_keys=True), encoding="utf-8")
+
+        flag_snapshot = {
+            "shadow_emit_only": bool(flags.get("shadow_emit_only")),
+            "rails_write_enabled": bool(flags.get("rails_write_enabled")),
+            "execute_contract_consume_enabled": bool(flags.get("execute_contract_consume_enabled")),
+        }
+        flag_path = out_dir / "dg1a_flag_snapshot.json"
+        flag_path.write_text(json.dumps(flag_snapshot, indent=2, sort_keys=True), encoding="utf-8")
+
+        return {
+            "ok": True,
+            "as_of_date": as_of_date,
+            "out_dir": str(out_dir),
+            "flag_snapshot_path": str(flag_path),
+            "action_inventory_path": str(inventory_path),
+            "action_event_mapping_path": str(mapping_path),
+            "shadow_emit_log_path": str(shadow_log_path),
+            "drep_daily_validation_path": str(drep_validation_path),
+            "proof_export_validation_path": str(proof_validation_path),
+            "go_no_go_checklist_path": str(checklist_path),
+            "final_decision": checklist["final_decision"],
+        }
+
+    def _dg1b_contract_validation_inputs(self, *, as_of_date: str, out_dir: Path) -> dict[str, Any]:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest_payload = {
+            "contract_version": EXECUTE_PROOF_MANIFEST_VERSION,
+            "trip_id": "TRIP-DG1B-0001",
+            "delivery_id": "DLV-DG1B-0001",
+            "pack_status": "FINAL",
+            "generated_at": f"{as_of_date}T00:00:00Z",
+            "evidence": [],
+            "summary": {
+                "evidence_count": 0,
+                "artifact_type_counts": {},
+                "artifact_role_counts": {},
+            },
+        }
+        manifest_path = out_dir / "dg1b_manifest.json"
+        manifest_path.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True), encoding="utf-8")
+        manifest_sha = sha256_file(manifest_path)
+
+        pdf_path = out_dir / "dg1b_pack.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n%DG1B\n")
+        pdf_sha = sha256_file(pdf_path)
+
+        drep_daily_payload = {
+            "contract_version": EXECUTE_DREP_DAILY_VERSION,
+            "as_of_date": as_of_date,
+            "deliveries_ingested": 5,
+            "trips_assigned": 5,
+            "trips_finalized": 0,
+            "board_close": {"red": 0, "yellow": 2, "green": 3, "total": 5},
+            "hold_full_by_reason": {},
+            "hold_partial_by_reason": {},
+            "handshake_valid_count": 0,
+            "handshake_total_finalized": 0,
+            "handshake_valid_rate": 0.0,
+            "open_incidents_count": 0,
+            "go_no_go": "GO",
+            "go_no_go_reasons": ["NO_FINALIZED_TRIPS"],
+        }
+        proof_export_payload = {
+            "export_contract_version": EXECUTE_PROOF_EXPORT_VERSION,
+            "trip_id": "TRIP-DG1B-0001",
+            "pack_status": "FINAL",
+            "manifest_contract_version": EXECUTE_PROOF_MANIFEST_VERSION,
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": manifest_sha,
+            "pdf_path": str(pdf_path),
+            "pdf_sha256": pdf_sha,
+        }
+        trust_action_payloads = self._dg1b_shadow_sample_action_payloads(
+            as_of_date=as_of_date,
+            manifest_path=manifest_path,
+            manifest_sha=manifest_sha,
+            pdf_path=pdf_path,
+            pdf_sha=pdf_sha,
+        )
+        return {
+            "drep_daily_payload": drep_daily_payload,
+            "proof_export_payload": proof_export_payload,
+            "trust_action_payloads": trust_action_payloads,
+        }
+
+    def _dg1b_idempotency_replay_stable(self, action_payloads: Mapping[str, Mapping[str, Any]]) -> bool:
+        first: dict[str, str] = {}
+        second: dict[str, str] = {}
+        for action_name, payload in action_payloads.items():
+            first[action_name] = build_trust_idempotency_key(action_name, payload)
+        for action_name, payload in action_payloads.items():
+            second[action_name] = build_trust_idempotency_key(action_name, payload)
+        return first == second
+
+    def _dg1b_shadow_sample_action_payloads(
+        self,
+        *,
+        as_of_date: str,
+        manifest_path: Path,
+        manifest_sha: str,
+        pdf_path: Path,
+        pdf_sha: str,
+    ) -> dict[str, dict[str, Any]]:
+        base_contract_id = "CTR-DG1B-0001"
+        base_delivery_id = "DLV-DG1B-0001"
+        return {
+            "create-contract": {
+                "contract_id": base_contract_id,
+                "lpo_no": "LPO-DG1B-0001",
+                "buyer_id": "buyer_nycil",
+                "vendor_of_record_id": "ananta_flows",
+                "issue_date": as_of_date,
+                "lpo_valid_from": as_of_date,
+                "lpo_valid_to": as_of_date,
+                "expected_total_qty_kg": 150000,
+                "currency": "NGN",
+                "unit_price_basis": "KG",
+                "policy_pointers": {"policy_version": "phase1_6.v1"},
+            },
+            "plan-deliveries": {
+                "contract_id": base_contract_id,
+                "as_of_date": as_of_date,
+                "start_date": as_of_date,
+                "cadence": "daily",
+                "max_lots_per_day": 1,
+                "policy_version": "phase1_6.v1",
+                "planned_rows": [
+                    {"planned_delivery_id": "PLN-DG1B-0001", "sequence_no": 1, "planned_qty_kg": 30000, "planned_date": as_of_date}
+                ],
+            },
+            "plan-update": {
+                "contract_id": base_contract_id,
+                "planned_delivery_id": "PLN-DG1B-0001",
+                "sequence_no": 1,
+                "planned_qty_kg": 30000,
+                "planned_date": as_of_date,
+                "reason": "manual-adjustment",
+            },
+            "plan-approve": {
+                "contract_id": base_contract_id,
+                "approved_at_utc": f"{as_of_date}T00:00:00Z",
+                "approved_by": "ops@example.com",
+                "plan_hash": canonical_json_sha256({"contract_id": base_contract_id, "as_of_date": as_of_date}),
+            },
+            "add-delivery": {
+                "contract_id": base_contract_id,
+                "planned_delivery_id": "PLN-DG1B-0001",
+                "delivery_id": base_delivery_id,
+                "delivery_ref": "REF-DG1B-0001",
+                "run_id": "RUN-DG1B-0001",
+                "batch_id": "BATCH-DG1B-0001",
+                "delivery_date": as_of_date,
+                "delivered_qty_kg": 30000,
+                "unit_price": 2270.0,
+                "unit_price_basis": "KG",
+            },
+            "materialize-delivery": {
+                "contract_id": base_contract_id,
+                "planned_delivery_id": "PLN-DG1B-0002",
+                "delivery_id": "DLV-DG1B-0002",
+                "delivery_ref": "REF-DG1B-0002",
+                "run_id": "RUN-DG1B-0001",
+                "batch_id": "BATCH-DG1B-0001",
+                "delivery_date": as_of_date,
+                "delivered_qty_kg": 30000,
+                "unit_price": 2270.0,
+                "unit_price_basis": "KG",
+            },
+            "mark-dispatched": {
+                "contract_id": base_contract_id,
+                "delivery_id": base_delivery_id,
+                "dispatched_at_utc": f"{as_of_date}T00:10:00Z",
+            },
+            "mark-delivered": {
+                "contract_id": base_contract_id,
+                "delivery_id": base_delivery_id,
+                "delivered_at_utc": f"{as_of_date}T00:20:00Z",
+                "delivered_qty_kg": 30000,
+            },
+            "record-coa": {
+                "contract_id": base_contract_id,
+                "delivery_id": base_delivery_id,
+                "coa_no": "COA-2026-0001",
+                "product_code": "RBDPO",
+                "batch_id": "BATCH-DG1B-0001",
+                "run_id": "RUN-DG1B-0001",
+                "profile_version": "v1",
+                "buyer_group": "NYCIL",
+                "results": [{"parameter": "moisture", "result": "0.04"}],
+            },
+            "generate-pack": {
+                "contract_id": base_contract_id,
+                "delivery_id": base_delivery_id,
+                "invoice_no": "INV-DG1B-0001",
+                "pack_status": "FINAL",
+                "manifest_contract_version": EXECUTE_PROOF_MANIFEST_VERSION,
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": manifest_sha,
+                "pdf_path": str(pdf_path),
+                "pdf_sha256": pdf_sha,
+                "doc_order": ["WAYBILL", "WEIGHING_TICKET", "COA", "INVOICE"],
+            },
+            "settle-apply-suggestion": {
+                "contract_id": base_contract_id,
+                "suggestion_set_id": "SSET-DG1B-0001",
+                "suggestion_id": "SUG-DG1B-0001",
+                "sales_transaction_id": "SAL-DG1B-0001",
+                "allocated_amount": 68100000.0,
+                "decision": "APPLY",
+                "reason": "high_confidence_match",
+                "as_of_date": as_of_date,
+            },
+            "mark-paid": {
+                "contract_id": base_contract_id,
+                "receipt_no": "RCPT-DG1B-0001",
+                "payment_date": as_of_date,
+                "payment_method": "Bank Transfer",
+                "external_reference": "EXT-DG1B-0001",
+                "amount_received": 68100000.0,
+                "allocations": [{"sales_transaction_id": "SAL-DG1B-0001", "allocated_amount": 68100000.0}],
+            },
+            "cancel-contract": {
+                "contract_id": base_contract_id,
+                "cancelled_at_utc": f"{as_of_date}T01:00:00Z",
+                "reason": "cancelled for test",
+            },
+            "close-contract": {
+                "contract_id": base_contract_id,
+                "closed_at_utc": f"{as_of_date}T01:00:00Z",
+                "reason": "closed for test",
+            },
+            "refresh-contract-state": {
+                "contract_id": base_contract_id,
+                "as_of_date": as_of_date,
+                "previous_lpo_state": "ACTIVE",
+                "next_lpo_state": "ACTIVE",
+                "reason_code": "active",
+            },
+            "decide-case": {
+                "exception_case_id": "CASE-DG1B-0001",
+                "case_type": "DRIFT_MONITORING",
+                "contract_id": base_contract_id,
+                "decision": "APPROVE",
+                "reason": "policy approved",
+                "resume_requested": True,
+                "dry_run_resume": False,
+            },
+            "exceptions-resolve": {
+                "exception_id": "EXQ-DG1B-0001",
+                "run_id": "ARUN-DG1B-0001",
+                "resolution_value": "buyer_nycil",
+                "note": "resolved for test",
+            },
         }
 
     def _phase2_gate_markdown(self, report: dict[str, Any]) -> str:

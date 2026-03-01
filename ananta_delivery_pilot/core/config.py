@@ -44,6 +44,7 @@ class RuntimeConfig:
     automation_thresholds: dict[str, Any]
     delivery_policies: dict[str, Any]
     drift_thresholds: dict[str, Any]
+    rails_truth_flags: dict[str, Any]
 
     @classmethod
     def load(cls, root_dir: Path) -> "RuntimeConfig":
@@ -62,6 +63,8 @@ class RuntimeConfig:
         delivery_policies = read_json(delivery_policies_path) if delivery_policies_path.exists() else {}
         drift_thresholds_path = config_dir / "drift_thresholds.json"
         drift_thresholds = read_json(drift_thresholds_path) if drift_thresholds_path.exists() else {}
+        rails_truth_flags_path = config_dir / "rails_truth_flags.json"
+        rails_truth_flags = read_json(rails_truth_flags_path) if rails_truth_flags_path.exists() else {}
         state_dir = root_dir / ".state"
         output_v2_dir = root_dir / "output_v2"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -77,6 +80,7 @@ class RuntimeConfig:
             automation_thresholds=automation_thresholds,
             delivery_policies=delivery_policies,
             drift_thresholds=drift_thresholds,
+            rails_truth_flags=rails_truth_flags,
         )
 
     def resolve_entity(self, entity_id: str | None = None, entity_name: str | None = None) -> tuple[str, Entity]:

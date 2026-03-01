@@ -1,0 +1,6 @@
+{
+  "schema_version": "dg1b.v1",
+  "shadow_emit_only": true,
+  "rails_write_enabled": false,
+  "execute_contract_consume_enabled": false
+}

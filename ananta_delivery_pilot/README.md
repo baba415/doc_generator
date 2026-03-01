@@ -139,6 +139,7 @@ python3 run.py phase2-drift-triage --as-of 2026-02-28 --lookback-window-days 30 
 python3 run.py phase2-drift-status --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1
 python3 run.py phase2-drift-root-cause --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr15/manual
 python3 run.py phase2-operator-playbooks --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr16/manual
+python3 run.py dg1b-shadow-proof --as-of 2026-03-01 --out-dir .state/phase2-proof/dg1b/manual
 ```
 
 PR11 gate reliability adds:
@@ -167,6 +168,12 @@ PR16 operator playbooks adds:
 - append-only audit event `PHASE2_OPERATOR_PLAYBOOKS_EXPORTED`,
 - portfolio read-only Operator Playbooks panel (top-3 playbooks + aggregate state/reason + exceptions deep-link),
 - guidance-only behavior (no execute/apply/edit controls from portfolio).
+
+DG-1B shadow mode adds:
+- strict read-only consumer validators for `execute_drep_daily_v1`, `execute_proof_export_v1`, and manifest linkage checks for `execute_proof_manifest_v1`,
+- deterministic trust-action event mapping and idempotency key builders (no live Rails writes),
+- shadow emitter + local no-op Rails adapter seam, controlled by `config/rails_truth_flags.json`,
+- proof artifact command `dg1b-shadow-proof` under `.state/phase2-proof/dg1b/`.
 
 Phase 1 state writes to:
 - `.state/drep.sqlite`
