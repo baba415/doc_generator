@@ -2190,7 +2190,9 @@ class AutomationOrchestrator:
                 lookback_window_days=int(lookback_window_days),
                 benchmark_version=benchmark_version,
             )
-            triage_status_source = str(triage_snapshot.get("latest_report_json_path") or "")
+            triage_status_path = out_dir / f"phase2_drift_status_{as_of_date}.json"
+            triage_status_path.write_text(json.dumps(triage_snapshot, indent=2, sort_keys=True), encoding="utf-8")
+            triage_status_source = str(triage_status_path)
 
         metrics = self.compute_metrics_snapshot(
             as_of_date=as_of_date,
@@ -2494,7 +2496,9 @@ class AutomationOrchestrator:
                 lookback_window_days=int(lookback_window_days),
                 benchmark_version=benchmark_version,
             )
-            triage_status_source = str(triage_snapshot.get("latest_report_json_path") or "")
+            triage_status_path = out_dir / f"phase2_drift_status_{as_of_date}.json"
+            triage_status_path.write_text(json.dumps(triage_snapshot, indent=2, sort_keys=True), encoding="utf-8")
+            triage_status_source = str(triage_status_path)
 
         if root_cause_report_ref is not None:
             root_cause_payload_raw = json.loads(root_cause_report_ref.read_text(encoding="utf-8"))
@@ -2536,7 +2540,11 @@ class AutomationOrchestrator:
             "triage_status": triage_status_source,
             "root_cause_report": root_cause_source,
         }
-        missing_source_refs = not all(str(source_refs.get(key) or "").strip() for key in ("drift_report", "triage_status", "root_cause_report"))
+        triage_latest_report_ref = str(triage_snapshot.get("latest_report_json_path") or "").strip()
+        missing_source_refs = (
+            not all(str(source_refs.get(key) or "").strip() for key in ("drift_report", "triage_status", "root_cause_report"))
+            or not triage_latest_report_ref
+        )
         if missing_source_refs:
             aggregate_state = "INSUFFICIENT_DATA"
             aggregate_reason_code = "insufficient_observability_data"
@@ -2560,7 +2568,7 @@ class AutomationOrchestrator:
             playbook_codes = [mapped[0]]
             if mapped[1]:
                 playbook_codes.append(str(mapped[1]))
-            for map_index, playbook_code in enumerate(playbook_codes):
+            for playbook_code in playbook_codes:
                 if playbook_code not in PLAYBOOK_ALLOWED_CODES:
                     continue
                 affected_contracts = int(item.get("affected_contracts") or 0)
@@ -2584,13 +2592,11 @@ class AutomationOrchestrator:
                     + (2 if recurring else 0)
                     + min(affected_contracts, 3)
                     + (-1 if evidence_completeness == "PARTIAL" else 0)
-                    + (2 if map_index == 0 else 0)
                 )
                 candidate = {
                     "playbook_code": playbook_code,
                     "urgency": urgency,
                     "score": int(score),
-                    "_mapping_rank": int(map_index),
                     "root_cause_code": root_cause_code,
                     "affected_contracts": affected_contracts,
                     "recurring": recurring,
@@ -2608,14 +2614,12 @@ class AutomationOrchestrator:
                         int(existing.get("score") or 0),
                         self._playbook_urgency_weight(str(existing.get("urgency") or "")),
                         int(existing.get("affected_contracts") or 0),
-                        -int(existing.get("_mapping_rank") or 0),
                         str(existing.get("playbook_code") or ""),
                     )
                     candidate_key = (
                         int(candidate.get("score") or 0),
                         self._playbook_urgency_weight(str(candidate.get("urgency") or "")),
                         int(candidate.get("affected_contracts") or 0),
-                        -int(candidate.get("_mapping_rank") or 0),
                         str(candidate.get("playbook_code") or ""),
                     )
                     if candidate_key > existing_key:
@@ -2627,14 +2631,21 @@ class AutomationOrchestrator:
                 -int(row.get("score") or 0),
                 -self._playbook_urgency_weight(str(row.get("urgency") or "")),
                 -int(row.get("affected_contracts") or 0),
-                int(row.get("_mapping_rank") or 0),
                 str(row.get("playbook_code") or ""),
             ),
         )
+        if missing_source_refs:
+            observability_index = next(
+                (
+                    index
+                    for index, row in enumerate(ranked_candidates)
+                    if str(row.get("playbook_code") or "") == "PB_OBSERVABILITY_RECOVERY"
+                ),
+                -1,
+            )
+            if observability_index > 0:
+                ranked_candidates.insert(0, ranked_candidates.pop(observability_index))
         selected_playbooks = ranked_candidates[:3]
-        for row in selected_playbooks:
-            if isinstance(row, dict):
-                row.pop("_mapping_rank", None)
         aggregate = {
             "state": aggregate_state,
             "reason_code": aggregate_reason_code,

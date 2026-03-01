@@ -153,7 +153,7 @@ class Phase2Pr16OperatorPlaybooksTests(unittest.TestCase):
         second_codes = [str(item.get("playbook_code") or "") for item in second["selected_playbooks"]]
         self.assertEqual(first_codes, second_codes)
         self.assertEqual(
-            ["PB_DOCUMENT_LINKAGE_TUNING", "PB_SETTLEMENT_MATCHING_REVIEW", "PB_MANUAL_OVERRIDE_REDUCTION"],
+            ["PB_DOCUMENT_LINKAGE_TUNING", "PB_MANUAL_OVERRIDE_REDUCTION", "PB_SETTLEMENT_MATCHING_REVIEW"],
             first_codes,
         )
         self.assertTrue(all(code.startswith("PB_") for code in first_codes))
@@ -172,6 +172,25 @@ class Phase2Pr16OperatorPlaybooksTests(unittest.TestCase):
         self.assertTrue(selected)
         self.assertEqual("PB_OBSERVABILITY_RECOVERY", str(selected[0].get("playbook_code") or ""))
         self.assertEqual("insufficient_observability_data", str(result.get("aggregate_reason_code") or ""))
+
+    def test_default_path_persists_and_uses_triage_status_ref_artifact(self) -> None:
+        out_dir = self.temp_dir / "default-path-ref"
+        result = self.orchestrator.phase2_operator_playbooks(
+            as_of_date="2026-02-28",
+            lookback_window_days=30,
+            benchmark_version="phase2.pr12.v1",
+            out_dir=out_dir,
+            persist=False,
+        )
+        self.assertTrue(result["ok"])
+        report_path = Path(str(result["report_json_path"]))
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
+        triage_status_ref = str(inputs.get("triage_status_ref") or "")
+        drift_report_ref = str(inputs.get("drift_report_ref") or "")
+        self.assertTrue(triage_status_ref.endswith("phase2_drift_status_2026-02-28.json"))
+        self.assertNotEqual(drift_report_ref, triage_status_ref)
+        self.assertTrue(Path(triage_status_ref).exists())
 
     def test_playbooks_export_appends_audit_event(self) -> None:
         benchmark_version = "phase2.pr12.v1"
