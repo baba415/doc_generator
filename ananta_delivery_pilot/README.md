@@ -134,6 +134,7 @@ python3 run.py autonomy-metrics --as-of 2026-03-31 --lookback-window-days 30 --b
 python3 run.py seed-phase2-benchmark --as-of 2026-02-28 --benchmark-version phase2.pr12.v1
 python3 run.py phase2-gate-report --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/release-readiness/pr12
 python3 run.py run-phase2-benchmark --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr12/manual
+python3 run.py phase2-drift-report --as-of 2026-02-28 --lookback-window-days 30 --benchmark-version phase2.pr12.v1 --out-dir .state/phase2-proof/pr13/manual
 ```
 
 PR11 gate reliability adds:
@@ -141,6 +142,11 @@ PR11 gate reliability adds:
 - promotion-ready gate report artifacts (`phase2_gate_report_<as_of>.json/.md`),
 - waiver validation from `.state/release-readiness/phase2_gate_waivers.json`,
 - read-only gate-health strip on `/v2/portfolio`.
+
+PR13 drift monitoring adds:
+- `phase2-drift-report` benchmark-to-live drift artifacts (`phase2_drift_report_<as_of>.json/.md`),
+- additive threshold config via `config/drift_thresholds.json` (default fallback if missing),
+- read-only drift strip on `/v2/portfolio` for PR8/PR9/PR10 drift states and latest report link.
 
 Phase 1 state writes to:
 - `.state/drep.sqlite`

@@ -39,6 +39,7 @@ def phase1_commands() -> set[str]:
         "seed-phase2-benchmark",
         "run-phase2-benchmark",
         "phase2-gate-report",
+        "phase2-drift-report",
     }
 
 
@@ -177,6 +178,17 @@ def build_parser() -> argparse.ArgumentParser:
     phase2_gate_report.add_argument("--benchmark-version", required=True)
     phase2_gate_report.add_argument("--waivers", default="")
     phase2_gate_report.add_argument("--out-dir", required=True)
+
+    phase2_drift_report = subparsers.add_parser(
+        "phase2-drift-report",
+        help="Generate PR8/PR9/PR10 benchmark-to-live drift report",
+    )
+    phase2_drift_report.add_argument("--as-of", required=True)
+    phase2_drift_report.add_argument("--lookback-window-days", type=int, default=30)
+    phase2_drift_report.add_argument("--benchmark-version", required=True)
+    phase2_drift_report.add_argument("--out-dir", required=True)
+    phase2_drift_report.add_argument("--benchmark-metrics", default="")
+    phase2_drift_report.add_argument("--live-metrics", default="")
 
     return parser
 
@@ -410,6 +422,22 @@ def main(argv: list[str] | None = None) -> None:
             benchmark_version=str(args.benchmark_version),
             waivers_path=waivers_path,
             out_dir=out_dir,
+        )
+        print(json.dumps(result, indent=2))
+        return
+
+    if args.command == "phase2-drift-report":
+        orchestrator = _automation(root_dir)
+        out_dir = Path(args.out_dir).expanduser()
+        benchmark_metrics_ref = Path(args.benchmark_metrics).expanduser() if str(args.benchmark_metrics or "").strip() else None
+        live_metrics_ref = Path(args.live_metrics).expanduser() if str(args.live_metrics or "").strip() else None
+        result = orchestrator.phase2_drift_report(
+            as_of_date=str(args.as_of),
+            lookback_window_days=int(args.lookback_window_days),
+            benchmark_version=str(args.benchmark_version),
+            out_dir=out_dir,
+            benchmark_metrics_ref=benchmark_metrics_ref,
+            live_metrics_ref=live_metrics_ref,
         )
         print(json.dumps(result, indent=2))
         return

@@ -353,6 +353,11 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 lookback_window_days=lookback_window_days,
                 benchmark_version=benchmark_version,
             )
+            drift_health = service.portfolio_drift_strip(
+                as_of_date=as_of_date_utc,
+                lookback_window_days=lookback_window_days,
+                benchmark_version=benchmark_version,
+            )
             preview_token = str((query.get("preview_token") or [""])[0] or "").strip()
             preview_result: dict[str, object] | None = None
             preview_stale = False
@@ -427,6 +432,27 @@ def run_server_v2(root_dir: Path, host: str = "127.0.0.1", port: int = 8865) -> 
                 )
             if not gates:
                 table.append("<tr><td colspan='4' class='muted'>No gate report data for current inputs.</td></tr>")
+            table.append("</tbody></table>")
+            table.append("<h3>Drift Monitor (PR8/PR9/PR10)</h3>")
+            table.append("<p class='muted'>Read-only benchmark-to-live drift view. Operational controls remain in existing run/exception flows.</p>")
+            latest_drift_report_path = str(drift_health.get("latest_report_path") or "").strip()
+            if latest_drift_report_path:
+                table.append(
+                    f"<p class='muted'>Latest drift report: "
+                    f"<a href='file://{_escape(latest_drift_report_path)}' target='_blank'>{_escape(latest_drift_report_path)}</a></p>"
+                )
+            drift_gates = drift_health.get("gates", []) if isinstance(drift_health.get("gates"), list) else []
+            table.append("<table><thead><tr><th>Gate</th><th>Drift State</th><th>Reason</th></tr></thead><tbody>")
+            for gate in drift_gates:
+                table.append(
+                    "<tr>"
+                    f"<td>{_escape(gate.get('gate_name'))}</td>"
+                    f"<td>{_escape(gate.get('drift_state'))}</td>"
+                    f"<td>{_escape(gate.get('reason_code'))}</td>"
+                    "</tr>"
+                )
+            if not drift_gates:
+                table.append("<tr><td colspan='3' class='muted'>No drift data for current inputs.</td></tr>")
             table.append("</tbody></table>")
             if preview_result:
                 preview_rows = preview_result.get("skipped_contracts", [])

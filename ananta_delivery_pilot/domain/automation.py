@@ -21,6 +21,70 @@ PR8_BENCHMARK_VERSION = "phase2.pr12.v1"
 PR9_BENCHMARK_VERSION = "phase2.pr9.v1"
 PR10_BENCHMARK_VERSION = "phase2.pr10.v1"
 
+DRIFT_ALLOWED_REASON_CODES = {
+    "pass",
+    "insufficient_live_data",
+    "insufficient_benchmark_data",
+    "benchmark_version_mismatch",
+    "drift_exceeds_threshold",
+    "drift_within_watch_band",
+}
+
+DRIFT_REASON_PRECEDENCE = [
+    "benchmark_version_mismatch",
+    "insufficient_benchmark_data",
+    "insufficient_live_data",
+    "drift_exceeds_threshold",
+    "drift_within_watch_band",
+    "pass",
+]
+
+DEFAULT_DRIFT_THRESHOLDS: dict[str, Any] = {
+    "version": "phase2.pr13.defaults.v1",
+    "pr8": {
+        "median_manual_fields_per_intake": {
+            "delta_type": "absolute",
+            "direction": "increase",
+            "watch": 0.5,
+            "alert": 1.0,
+        },
+        "autoplan_zero_edit_common_case_rate": {
+            "delta_type": "absolute",
+            "direction": "decrease",
+            "watch": 0.05,
+            "alert": 0.10,
+        },
+    },
+    "pr9": {
+        "manual_transport_fields_per_delivery": {
+            "delta_type": "absolute",
+            "direction": "increase",
+            "watch": 0.30,
+            "alert": 0.75,
+        },
+        "doc_autolink_precision": {
+            "delta_type": "absolute",
+            "direction": "decrease",
+            "watch": 0.03,
+            "alert": 0.05,
+        },
+    },
+    "pr10": {
+        "payment_suggestion_acceptance_rate": {
+            "delta_type": "absolute",
+            "direction": "decrease",
+            "watch": 0.05,
+            "alert": 0.10,
+        },
+        "auto_action_success_rate": {
+            "delta_type": "absolute",
+            "direction": "decrease",
+            "watch": 0.05,
+            "alert": 0.10,
+        },
+    },
+}
+
 
 @dataclass
 class ResolutionResult:
@@ -1329,6 +1393,306 @@ class AutomationOrchestrator:
             "latest_report_path": latest_report_path,
         }
 
+    def phase2_drift_health_snapshot(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+    ) -> dict[str, Any]:
+        report = self.phase2_drift_report(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+            out_dir=None,
+            persist=False,
+        )
+        latest_row = self.repo.fetch_one(
+            """
+            SELECT payload_json
+            FROM event_log
+            WHERE event_type = 'PHASE2_DRIFT_REPORT_EXPORTED'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+        latest_report_path = ""
+        if latest_row and latest_row.get("payload_json"):
+            payload = json.loads(str(latest_row.get("payload_json") or "{}"))
+            latest_report_path = str(payload.get("report_md_path") or payload.get("report_json_path") or "")
+        return {
+            "as_of_date": report["drift_report"]["inputs"]["as_of_date"],
+            "lookback_window_days": report["drift_report"]["inputs"]["lookback_window_days"],
+            "benchmark_version": report["drift_report"]["inputs"]["benchmark_version"],
+            "generated_at_utc": report["drift_report"]["inputs"]["generated_at_utc"],
+            "drift_state": report["drift_report"]["aggregate"]["drift_state"],
+            "recommendation": report["drift_report"]["aggregate"]["recommendation"],
+            "gates": report["drift_report"]["gates"],
+            "latest_report_path": latest_report_path,
+        }
+
+    def phase2_drift_report(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+        out_dir: Path | None = None,
+        benchmark_metrics_ref: Path | None = None,
+        live_metrics_ref: Path | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        if lookback_window_days <= 0:
+            raise ValueError("lookback_window_days must be > 0")
+        try:
+            date.fromisoformat(as_of_date)
+        except ValueError as error:
+            raise ValueError("as_of_date must be YYYY-MM-DD") from error
+
+        generated_at_utc = utc_now_iso_z()
+        snapshot_out_dir = out_dir
+        if snapshot_out_dir is None:
+            snapshot_out_dir = self.config.state_dir / "tmp" / "phase2-drift" / f"{as_of_date}-{benchmark_version}"
+        snapshot_out_dir.mkdir(parents=True, exist_ok=True)
+
+        benchmark_gate_report_ref = ""
+        if benchmark_metrics_ref is not None:
+            benchmark_metrics = self._load_metrics_snapshot_from_ref(benchmark_metrics_ref)
+            benchmark_metrics_source = str(benchmark_metrics_ref)
+            benchmark_snapshot_path = str(benchmark_metrics_ref)
+        else:
+            self.seed_phase2_benchmark(
+                as_of_date=as_of_date,
+                benchmark_version=benchmark_version,
+                reset=False,
+                lookback_window_days=int(lookback_window_days),
+            )
+            benchmark_run = self.phase2_gate_report(
+                as_of_date=as_of_date,
+                lookback_window_days=int(lookback_window_days),
+                benchmark_version=benchmark_version,
+                out_dir=snapshot_out_dir,
+                persist=False,
+            )
+            benchmark_gate_report = benchmark_run.get("gate_report") if isinstance(benchmark_run, dict) else {}
+            if not isinstance(benchmark_gate_report, dict):
+                benchmark_gate_report = {}
+            benchmark_metrics = self._benchmark_metrics_from_gate_report(
+                gate_report=benchmark_gate_report,
+                as_of_date=as_of_date,
+                lookback_window_days=int(lookback_window_days),
+                benchmark_version=benchmark_version,
+                generated_at_utc=generated_at_utc,
+            )
+            benchmark_metrics_source = "phase2-benchmark-pipeline"
+            benchmark_gate_report_ref = str(benchmark_run.get("report_json_path") or "")
+            benchmark_snapshot_file = snapshot_out_dir / f"phase2_benchmark_metrics_{as_of_date}.json"
+            benchmark_snapshot_file.write_text(
+                json.dumps(benchmark_metrics, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            benchmark_snapshot_path = str(benchmark_snapshot_file)
+
+        if live_metrics_ref is not None:
+            live_metrics = self._load_metrics_snapshot_from_ref(live_metrics_ref)
+            live_metrics_source = str(live_metrics_ref)
+            live_snapshot_path = str(live_metrics_ref)
+        else:
+            if persist:
+                live_export = self.autonomy_metrics(
+                    as_of_date=as_of_date,
+                    out_dir=snapshot_out_dir,
+                    lookback_window_days=int(lookback_window_days),
+                    benchmark_version=benchmark_version,
+                )
+                live_metrics = live_export.get("metrics") if isinstance(live_export, dict) else {}
+                if not isinstance(live_metrics, dict):
+                    live_metrics = {}
+                live_metrics_source = "autonomy-metrics"
+                live_snapshot_path = str(live_export.get("metrics_path") or "")
+            else:
+                live_metrics = self.compute_metrics_snapshot(
+                    as_of_date=as_of_date,
+                    lookback_window_days=int(lookback_window_days),
+                    benchmark_version=benchmark_version,
+                )
+                live_snapshot = snapshot_out_dir / f"autonomy_metrics_{as_of_date}.json"
+                live_snapshot.write_text(json.dumps(live_metrics, indent=2, sort_keys=True), encoding="utf-8")
+                live_metrics_source = "compute_metrics_snapshot"
+                live_snapshot_path = str(live_snapshot)
+
+        thresholds, threshold_source, threshold_config_version = self._resolve_drift_thresholds()
+        thresholds_path = ""
+        if out_dir is not None:
+            threshold_file = snapshot_out_dir / f"phase2_drift_thresholds_{as_of_date}.json"
+            threshold_payload = {
+                "source": threshold_source,
+                "config_version": threshold_config_version,
+                "thresholds": thresholds,
+                "generated_at_utc": generated_at_utc,
+            }
+            threshold_file.write_text(json.dumps(threshold_payload, indent=2, sort_keys=True), encoding="utf-8")
+            thresholds_path = str(threshold_file)
+
+        metric_specs = self._drift_metric_specs()
+        gates: list[dict[str, Any]] = []
+        for gate_name, metric_names in metric_specs.items():
+            comparisons: list[dict[str, Any]] = []
+            has_alert = False
+            has_watch = False
+            missing_benchmark = False
+            missing_live = False
+
+            for metric_name in metric_names:
+                threshold = thresholds.get(gate_name, {}).get(metric_name, {})
+                benchmark_value = benchmark_metrics.get(metric_name)
+                live_value = live_metrics.get(metric_name)
+                comparison = self._evaluate_drift_metric(
+                    metric_name=metric_name,
+                    benchmark_value=benchmark_value,
+                    live_value=live_value,
+                    threshold=threshold if isinstance(threshold, dict) else {},
+                )
+                comparisons.append(comparison)
+                if comparison["benchmark_value"] is None:
+                    missing_benchmark = True
+                if comparison["live_value"] is None:
+                    missing_live = True
+                state = str(comparison.get("comparison_state") or "")
+                if state == "alert":
+                    has_alert = True
+                elif state == "watch":
+                    has_watch = True
+
+            version_mismatch = (
+                str(benchmark_metrics.get("benchmark_version") or "").strip() != benchmark_version
+                or str(live_metrics.get("benchmark_version") or "").strip() != benchmark_version
+            )
+            candidates: list[str] = []
+            if version_mismatch:
+                candidates.append("benchmark_version_mismatch")
+            if missing_benchmark:
+                candidates.append("insufficient_benchmark_data")
+            if missing_live:
+                candidates.append("insufficient_live_data")
+            if has_alert:
+                candidates.append("drift_exceeds_threshold")
+            elif has_watch:
+                candidates.append("drift_within_watch_band")
+            else:
+                candidates.append("pass")
+            reason_code = self._resolve_drift_reason_code(candidates)
+            drift_state = self._reason_to_drift_state(reason_code)
+            gates.append(
+                {
+                    "gate_name": gate_name,
+                    "drift_state": drift_state,
+                    "reason_code": reason_code,
+                    "comparisons": comparisons,
+                }
+            )
+
+        aggregate_state = self._aggregate_drift_state(gates)
+        recommendation = self._aggregate_drift_recommendation(aggregate_state)
+        blocking_reasons = [
+            f"{gate.get('gate_name')}:{gate.get('reason_code')}"
+            for gate in gates
+            if str(gate.get("drift_state") or "").upper() in {"MISMATCH", "INSUFFICIENT_DATA", "ALERT"}
+        ]
+        drift_report = {
+            "inputs": {
+                "as_of_date": as_of_date,
+                "lookback_window_days": int(lookback_window_days),
+                "benchmark_version": benchmark_version,
+                "generated_at_utc": generated_at_utc,
+                "benchmark_metrics_ref": benchmark_metrics_source,
+                "live_metrics_ref": live_metrics_source,
+            },
+            "gates": gates,
+            "aggregate": {
+                "drift_state": aggregate_state,
+                "recommendation": recommendation,
+                "blocking_reasons": blocking_reasons,
+            },
+        }
+
+        report_json_path = ""
+        report_md_path = ""
+        if out_dir is not None:
+            report_json = snapshot_out_dir / f"phase2_drift_report_{as_of_date}.json"
+            report_md = snapshot_out_dir / f"phase2_drift_report_{as_of_date}.md"
+            report_json.write_text(json.dumps(drift_report, indent=2, sort_keys=True), encoding="utf-8")
+            report_md.write_text(self._phase2_drift_markdown(drift_report), encoding="utf-8")
+            report_json_path = str(report_json)
+            report_md_path = str(report_md)
+
+        if persist:
+            with self.repo.transaction() as conn:
+                self.repo.append_event(
+                    conn,
+                    entity_type="METRICS",
+                    entity_id=f"PHASE2_DRIFT_REPORT::{as_of_date}::{benchmark_version}",
+                    event_type="PHASE2_DRIFT_REPORT_EXPORTED",
+                    as_of_date=as_of_date,
+                    payload={
+                        "report_json_path": report_json_path,
+                        "report_md_path": report_md_path,
+                        "benchmark_metrics_path": benchmark_snapshot_path,
+                        "benchmark_gate_report_ref": benchmark_gate_report_ref,
+                        "live_metrics_path": live_snapshot_path,
+                        "thresholds_path": thresholds_path,
+                        "threshold_source": threshold_source,
+                        "threshold_config_version": threshold_config_version,
+                        "drift_state": aggregate_state,
+                        "recommendation": recommendation,
+                        "lookback_window_days": int(lookback_window_days),
+                    },
+                    source="phase2-drift-report",
+                )
+                report_idempotency_key = canonical_json_sha256(
+                    {
+                        "as_of_date": as_of_date,
+                        "lookback_window_days": int(lookback_window_days),
+                        "benchmark_version": benchmark_version,
+                        "benchmark_metrics_ref": str(benchmark_metrics_ref) if benchmark_metrics_ref else "",
+                        "live_metrics_ref": str(live_metrics_ref) if live_metrics_ref else "",
+                    }
+                )
+                existing_report = self.repo.find_idempotent_response(
+                    conn,
+                    command_name="phase2-drift-report",
+                    idempotency_key=report_idempotency_key,
+                )
+                if not existing_report:
+                    self.repo.save_idempotent_response(
+                        conn,
+                        command_name="phase2-drift-report",
+                        idempotency_key=report_idempotency_key,
+                        response={
+                            "ok": True,
+                            "drift_state": aggregate_state,
+                            "recommendation": recommendation,
+                            "report_json_path": report_json_path,
+                            "report_md_path": report_md_path,
+                            "drift_report": drift_report,
+                        },
+                    )
+
+        return {
+            "ok": True,
+            "drift_state": aggregate_state,
+            "recommendation": recommendation,
+            "report_json_path": report_json_path,
+            "report_md_path": report_md_path,
+            "benchmark_metrics_path": benchmark_snapshot_path,
+            "benchmark_gate_report_ref": benchmark_gate_report_ref,
+            "live_metrics_path": live_snapshot_path,
+            "thresholds_path": thresholds_path,
+            "threshold_source": threshold_source,
+            "threshold_config_version": threshold_config_version,
+            "drift_report": drift_report,
+        }
+
     def phase2_gate_report(
         self,
         *,
@@ -1589,6 +1953,244 @@ class AutomationOrchestrator:
             ]
         )
         return "\n".join(lines)
+
+    def _phase2_drift_markdown(self, report: dict[str, Any]) -> str:
+        inputs = report.get("inputs") if isinstance(report.get("inputs"), dict) else {}
+        gates = report.get("gates") if isinstance(report.get("gates"), list) else []
+        aggregate = report.get("aggregate") if isinstance(report.get("aggregate"), dict) else {}
+        lines = [
+            "# Phase 2 Drift Report",
+            "",
+            "## Inputs",
+            f"- as_of_date: {inputs.get('as_of_date')}",
+            f"- lookback_window_days: {inputs.get('lookback_window_days')}",
+            f"- benchmark_version: {inputs.get('benchmark_version')}",
+            f"- generated_at_utc: {inputs.get('generated_at_utc')}",
+            f"- benchmark_metrics_ref: {inputs.get('benchmark_metrics_ref')}",
+            f"- live_metrics_ref: {inputs.get('live_metrics_ref')}",
+            "",
+            "## Per-Gate Drift",
+        ]
+        for gate in gates:
+            lines.extend(
+                [
+                    f"### {gate.get('gate_name')}",
+                    f"- drift_state: {gate.get('drift_state')}",
+                    f"- reason_code: {gate.get('reason_code')}",
+                    "",
+                    "| Metric | Benchmark | Live | Delta | Threshold | Within Threshold |",
+                    "|---|---:|---:|---:|---|---:|",
+                ]
+            )
+            comparisons = gate.get("comparisons") if isinstance(gate.get("comparisons"), list) else []
+            for row in comparisons:
+                threshold = row.get("threshold") if isinstance(row.get("threshold"), dict) else {}
+                lines.append(
+                    "| {metric} | {benchmark} | {live} | {delta} | {threshold} | {within} |".format(
+                        metric=row.get("metric_name"),
+                        benchmark=row.get("benchmark_value"),
+                        live=row.get("live_value"),
+                        delta=row.get("delta"),
+                        threshold=json.dumps(threshold, sort_keys=True),
+                        within=row.get("within_threshold"),
+                    )
+                )
+            if not comparisons:
+                lines.append("| _none_ | | | | | |")
+            lines.append("")
+        lines.extend(
+            [
+                "## Aggregate",
+                f"- drift_state: {aggregate.get('drift_state')}",
+                f"- recommendation: {aggregate.get('recommendation')}",
+                f"- blocking_reasons: {json.dumps(aggregate.get('blocking_reasons', []), sort_keys=True)}",
+                "",
+                "## Raw JSON",
+                "```json",
+                json.dumps(report, indent=2, sort_keys=True),
+                "```",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _drift_metric_specs(self) -> dict[str, list[str]]:
+        return {
+            "pr8": [
+                "median_manual_fields_per_intake",
+                "autoplan_zero_edit_common_case_rate",
+            ],
+            "pr9": [
+                "manual_transport_fields_per_delivery",
+                "doc_autolink_precision",
+            ],
+            "pr10": [
+                "payment_suggestion_acceptance_rate",
+                "auto_action_success_rate",
+            ],
+        }
+
+    def _resolve_drift_thresholds(self) -> tuple[dict[str, Any], str, str]:
+        if isinstance(self.config.drift_thresholds, dict) and self.config.drift_thresholds:
+            merged = json.loads(json.dumps(DEFAULT_DRIFT_THRESHOLDS))
+            for gate_name in ("pr8", "pr9", "pr10"):
+                gate_cfg = self.config.drift_thresholds.get(gate_name)
+                if not isinstance(gate_cfg, dict):
+                    continue
+                for metric_name, metric_default in merged.get(gate_name, {}).items():
+                    metric_cfg = gate_cfg.get(metric_name)
+                    if not isinstance(metric_cfg, dict):
+                        continue
+                    merged_metric = dict(metric_default)
+                    merged_metric.update(metric_cfg)
+                    merged[gate_name][metric_name] = merged_metric
+            version = str(self.config.drift_thresholds.get("version") or "configured")
+            return merged, "config", version
+        return json.loads(json.dumps(DEFAULT_DRIFT_THRESHOLDS)), "default", str(
+            DEFAULT_DRIFT_THRESHOLDS.get("version") or "phase2.pr13.defaults.v1"
+        )
+
+    def _load_metrics_snapshot_from_ref(self, path: Path) -> dict[str, Any]:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Metrics snapshot at {path} must be a JSON object")
+        return payload
+
+    def _benchmark_metrics_from_gate_report(
+        self,
+        *,
+        gate_report: dict[str, Any],
+        as_of_date: str,
+        lookback_window_days: int,
+        benchmark_version: str,
+        generated_at_utc: str,
+    ) -> dict[str, Any]:
+        gates = gate_report.get("gates") if isinstance(gate_report.get("gates"), list) else []
+        by_gate = {
+            str(row.get("gate_name") or ""): row
+            for row in gates
+            if isinstance(row, dict) and str(row.get("gate_name") or "").strip()
+        }
+        pr8 = by_gate.get("pr8") if isinstance(by_gate.get("pr8"), dict) else {}
+        pr9 = by_gate.get("pr9") if isinstance(by_gate.get("pr9"), dict) else {}
+        pr10 = by_gate.get("pr10") if isinstance(by_gate.get("pr10"), dict) else {}
+        pr8_metrics = pr8.get("metrics") if isinstance(pr8.get("metrics"), dict) else {}
+        pr9_metrics = pr9.get("metrics") if isinstance(pr9.get("metrics"), dict) else {}
+        pr10_metrics = pr10.get("metrics") if isinstance(pr10.get("metrics"), dict) else {}
+        return {
+            "as_of_date": as_of_date,
+            "lookback_window_days": int(lookback_window_days),
+            "benchmark_version": benchmark_version,
+            "generated_at_utc": generated_at_utc,
+            "median_manual_fields_per_intake": pr8_metrics.get("median_manual_fields_per_intake"),
+            "autoplan_zero_edit_common_case_rate": pr8_metrics.get("autoplan_zero_edit_common_case_rate"),
+            "manual_transport_fields_per_delivery": pr9_metrics.get("manual_transport_fields_per_delivery"),
+            "doc_autolink_precision": pr9_metrics.get("doc_autolink_precision"),
+            "payment_suggestion_acceptance_rate": pr10_metrics.get("payment_suggestion_acceptance_rate"),
+            "auto_action_success_rate": pr10_metrics.get("auto_action_success_rate"),
+        }
+
+    def _evaluate_drift_metric(
+        self,
+        *,
+        metric_name: str,
+        benchmark_value: Any,
+        live_value: Any,
+        threshold: dict[str, Any],
+    ) -> dict[str, Any]:
+        delta_type = str(threshold.get("delta_type") or "absolute")
+        direction = str(threshold.get("direction") or "increase").lower()
+        watch = threshold.get("watch")
+        alert = threshold.get("alert")
+        benchmark_numeric: float | None = None
+        live_numeric: float | None = None
+        try:
+            benchmark_numeric = float(benchmark_value) if benchmark_value is not None else None
+        except (TypeError, ValueError):
+            benchmark_numeric = None
+        try:
+            live_numeric = float(live_value) if live_value is not None else None
+        except (TypeError, ValueError):
+            live_numeric = None
+        delta: float | None = None
+        comparison_state = "insufficient"
+        within_threshold: bool | None = None
+        if benchmark_numeric is not None and live_numeric is not None:
+            delta = round(live_numeric - benchmark_numeric, 6)
+            watch_v = float(watch) if watch is not None else None
+            alert_v = float(alert) if alert is not None else None
+            alert_hit = False
+            watch_hit = False
+            if direction == "decrease":
+                if alert_v is not None and delta < -alert_v:
+                    alert_hit = True
+                elif watch_v is not None and delta < -watch_v:
+                    watch_hit = True
+            else:
+                if alert_v is not None and delta > alert_v:
+                    alert_hit = True
+                elif watch_v is not None and delta > watch_v:
+                    watch_hit = True
+            if alert_hit:
+                comparison_state = "alert"
+                within_threshold = False
+            elif watch_hit:
+                comparison_state = "watch"
+                within_threshold = False
+            else:
+                comparison_state = "pass"
+                within_threshold = True
+        return {
+            "metric_name": metric_name,
+            "benchmark_value": benchmark_numeric,
+            "live_value": live_numeric,
+            "delta": delta,
+            "delta_type": delta_type,
+            "threshold": {
+                "watch": watch,
+                "alert": alert,
+                "direction": direction,
+            },
+            "within_threshold": within_threshold,
+            "comparison_state": comparison_state,
+        }
+
+    def _resolve_drift_reason_code(self, candidates: list[str]) -> str:
+        normalized = [code for code in candidates if code in DRIFT_ALLOWED_REASON_CODES]
+        for code in DRIFT_REASON_PRECEDENCE:
+            if code in normalized:
+                return code
+        return "pass"
+
+    def _reason_to_drift_state(self, reason_code: str) -> str:
+        if reason_code == "benchmark_version_mismatch":
+            return "MISMATCH"
+        if reason_code in {"insufficient_benchmark_data", "insufficient_live_data"}:
+            return "INSUFFICIENT_DATA"
+        if reason_code == "drift_exceeds_threshold":
+            return "ALERT"
+        if reason_code == "drift_within_watch_band":
+            return "WATCH"
+        return "PASS"
+
+    def _aggregate_drift_state(self, gates: list[dict[str, Any]]) -> str:
+        states = [str(item.get("drift_state") or "") for item in gates]
+        if any(state == "MISMATCH" for state in states):
+            return "MISMATCH"
+        if any(state == "INSUFFICIENT_DATA" for state in states):
+            return "INSUFFICIENT_DATA"
+        if any(state == "ALERT" for state in states):
+            return "ALERT"
+        if any(state == "WATCH" for state in states):
+            return "WATCH"
+        return "PASS"
+
+    def _aggregate_drift_recommendation(self, drift_state: str) -> str:
+        if drift_state == "PASS":
+            return "NO_ACTION"
+        if drift_state == "WATCH":
+            return "INVESTIGATE"
+        return "BLOCK_PROMOTION"
 
     def _validate_phase2_gate_waivers(
         self,

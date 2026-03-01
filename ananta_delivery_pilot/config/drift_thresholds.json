@@ -1,0 +1,45 @@
+{
+  "version": "phase2.pr13.v1",
+  "pr8": {
+    "median_manual_fields_per_intake": {
+      "delta_type": "absolute",
+      "direction": "increase",
+      "watch": 0.5,
+      "alert": 1.0
+    },
+    "autoplan_zero_edit_common_case_rate": {
+      "delta_type": "absolute",
+      "direction": "decrease",
+      "watch": 0.05,
+      "alert": 0.1
+    }
+  },
+  "pr9": {
+    "manual_transport_fields_per_delivery": {
+      "delta_type": "absolute",
+      "direction": "increase",
+      "watch": 0.3,
+      "alert": 0.75
+    },
+    "doc_autolink_precision": {
+      "delta_type": "absolute",
+      "direction": "decrease",
+      "watch": 0.03,
+      "alert": 0.05
+    }
+  },
+  "pr10": {
+    "payment_suggestion_acceptance_rate": {
+      "delta_type": "absolute",
+      "direction": "decrease",
+      "watch": 0.05,
+      "alert": 0.1
+    },
+    "auto_action_success_rate": {
+      "delta_type": "absolute",
+      "direction": "decrease",
+      "watch": 0.05,
+      "alert": 0.1
+    }
+  }
+}

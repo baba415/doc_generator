@@ -1532,6 +1532,22 @@ class Phase1Service:
             waivers_path=self.config.state_dir / "release-readiness" / "phase2_gate_waivers.json",
         )
 
+    def portfolio_drift_strip(
+        self,
+        *,
+        as_of_date: str,
+        lookback_window_days: int = 30,
+        benchmark_version: str = "phase2.pr12.v1",
+    ) -> dict[str, Any]:
+        from domain.automation import AutomationOrchestrator
+
+        orchestrator = AutomationOrchestrator(self.config, self.repo, self)
+        return orchestrator.phase2_drift_health_snapshot(
+            as_of_date=as_of_date,
+            lookback_window_days=lookback_window_days,
+            benchmark_version=benchmark_version,
+        )
+
     def portfolio_sla_trends(
         self,
         *,

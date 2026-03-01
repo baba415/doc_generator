@@ -673,6 +673,43 @@ class Phase2UiRouteTests(unittest.TestCase):
         finally:
             _stop_process(proc)
 
+    def test_portfolio_drift_strip_renders_read_only_status(self) -> None:
+        as_of_date = "2026-02-28"
+        benchmark_version = "phase2.pr12.v1"
+        self.orchestrator.seed_phase2_benchmark(
+            as_of_date=as_of_date,
+            benchmark_version=benchmark_version,
+            reset=False,
+            lookback_window_days=30,
+        )
+        self.orchestrator.phase2_drift_report(
+            as_of_date=as_of_date,
+            lookback_window_days=30,
+            benchmark_version=benchmark_version,
+            out_dir=self.temp_dir / "drift-report",
+        )
+        try:
+            port = _pick_free_port()
+        except PermissionError:
+            self.skipTest("socket bind not permitted in current sandbox")
+        proc = _start_ui_server(repo_root=self.repo_root, root=self.temp_dir, port=port)
+        try:
+            _wait_for_route(port, "/v2/portfolio")
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v2/portfolio?as_of={as_of_date}&lookback_window_days=30&benchmark_version={benchmark_version}",
+                timeout=3,
+            ) as response:
+                body = response.read().decode("utf-8")
+            self.assertIn("Drift Monitor (PR8/PR9/PR10)", body)
+            self.assertIn("<td>pr8</td>", body)
+            self.assertIn("<td>pr9</td>", body)
+            self.assertIn("<td>pr10</td>", body)
+            self.assertIn("Latest drift report:", body)
+            self.assertNotIn("name='waiver_id'", body)
+            self.assertNotIn("name='policy_set_id'", body)
+        finally:
+            _stop_process(proc)
+
 
 def _pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

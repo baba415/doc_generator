@@ -43,6 +43,7 @@ class RuntimeConfig:
     coa_profiles: dict[str, Any]
     automation_thresholds: dict[str, Any]
     delivery_policies: dict[str, Any]
+    drift_thresholds: dict[str, Any]
 
     @classmethod
     def load(cls, root_dir: Path) -> "RuntimeConfig":
@@ -59,6 +60,8 @@ class RuntimeConfig:
         automation_thresholds = read_json(thresholds_path) if thresholds_path.exists() else {}
         delivery_policies_path = config_dir / "delivery_policies.json"
         delivery_policies = read_json(delivery_policies_path) if delivery_policies_path.exists() else {}
+        drift_thresholds_path = config_dir / "drift_thresholds.json"
+        drift_thresholds = read_json(drift_thresholds_path) if drift_thresholds_path.exists() else {}
         state_dir = root_dir / ".state"
         output_v2_dir = root_dir / "output_v2"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -73,6 +76,7 @@ class RuntimeConfig:
             coa_profiles=coa_profiles,
             automation_thresholds=automation_thresholds,
             delivery_policies=delivery_policies,
+            drift_thresholds=drift_thresholds,
         )
 
     def resolve_entity(self, entity_id: str | None = None, entity_name: str | None = None) -> tuple[str, Entity]:
