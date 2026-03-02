@@ -20,7 +20,7 @@ Legacy outputs continue to write to `output/`.
 Run:
 
 ```bash
-cd /Users/macbookairv2/doc_generator/ananta_delivery_pilot
+cd ananta_delivery_pilot
 python3 run.py serve --host 127.0.0.1 --port 8765
 ```
 
@@ -66,7 +66,7 @@ PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m unittest -v tests.test_phase2_ui
 Host-level UI smoke (non-sandbox, non-skipped):
 
 ```bash
-cd /Users/macbookairv2/doc_generator/ananta_delivery_pilot
+cd ananta_delivery_pilot
 ./scripts/host_ui_smoke.sh 8865
 ```
 

@@ -181,7 +181,7 @@ class Phase2UiRouteTests(unittest.TestCase):
                 body = response.read().decode("utf-8")
                 self.assertIn("Advanced intake fields", body)
                 self.assertIn("Parse LPO + Review", body)
-                self.assertIn("Critical fields", body.lower())
+                self.assertIn("critical fields", body.lower())
         finally:
             _stop_process(proc)
 
