@@ -12,7 +12,7 @@ from typing import Any
 from adapters.sqlite_repo import SQLiteRepo
 from core.config import RuntimeConfig
 from core.hashing import canonical_json_sha256, sha256_file
-from core.ids import new_ulid
+from core.ids import generate_pilot_uuid, new_ulid
 from core.time import utc_now_iso_z
 from core.units import mt_to_kg_int
 from domain.rails_truth import (
@@ -1288,13 +1288,14 @@ class AutomationOrchestrator:
                     INSERT INTO evidence_originals(
                       evidence_id, contract_id, delivery_id, sales_transaction_id, sales_line_id, file_name, doc_type,
                       link_status, link_confidence, link_reason_code, link_source, linked_at, source_path, stored_path,
-                      sha256, captured_at, created_at, updated_at
+                      sha256, captured_at, core_uuid, created_at, updated_at
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, 'WAYBILL', ?, 0.95, ?, 'benchmark', ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, 'WAYBILL', ?, 0.95, ?, 'benchmark', ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(evidence_id) DO UPDATE SET
                       link_status = excluded.link_status,
                       link_reason_code = excluded.link_reason_code,
                       linked_at = excluded.linked_at,
+                      core_uuid = COALESCE(evidence_originals.core_uuid, excluded.core_uuid),
                       updated_at = excluded.updated_at
                     """,
                     (
@@ -1311,6 +1312,7 @@ class AutomationOrchestrator:
                         f"/tmp/bench-store/{fixture_key}/{idx}.pdf",
                         canonical_json_sha256({"fixture_key": fixture_key, "evidence": idx}),
                         linked_at,
+                        generate_pilot_uuid(),
                         linked_at,
                         now,
                     ),

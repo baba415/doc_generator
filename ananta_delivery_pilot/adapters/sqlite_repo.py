@@ -12,7 +12,7 @@ from typing import Any, Iterator
 from core.config import RuntimeConfig, infer_buyer_group, infer_lane
 from core.enums import ContractStatus, DeliveryStatus, DocumentType, PaymentStatus
 from core.hashing import canonical_json_sha256
-from core.ids import new_ulid
+from core.ids import generate_pilot_uuid, new_ulid
 from core.time import utc_now_iso_z, utc_today_iso
 from core.units import kg_to_mt_decimal, mt_to_kg_int
 from domain.transitions import derive_contract_status, validate_delivery_transition
@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS parties (
   bank_account_number TEXT,
   bank_currency TEXT,
   aliases_json TEXT NOT NULL DEFAULT '[]',
+  core_uuid TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -102,6 +103,7 @@ CREATE TABLE IF NOT EXISTS contracts (
   over_delivery_tolerance_pct REAL NOT NULL DEFAULT 5.0,
   status TEXT NOT NULL DEFAULT 'OPEN',
   notes TEXT,
+  core_uuid TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -149,6 +151,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
   invoiced_at TEXT,
   paid_at TEXT,
   over_delivery_override_reason TEXT,
+  core_uuid TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -254,6 +257,7 @@ CREATE TABLE IF NOT EXISTS payments (
   idempotency_key TEXT NOT NULL,
   receipt_no TEXT NOT NULL,
   receipt_doc_id TEXT REFERENCES documents(doc_id),
+  core_uuid TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(idempotency_key),
@@ -302,6 +306,7 @@ CREATE TABLE IF NOT EXISTS evidence_originals (
   stored_path TEXT NOT NULL,
   sha256 TEXT NOT NULL,
   captured_at TEXT NOT NULL,
+  core_uuid TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT
 );
@@ -575,6 +580,7 @@ CREATE TABLE IF NOT EXISTS exception_cases (
   reason_code TEXT,
   details_json TEXT NOT NULL DEFAULT '{}',
   idempotency_key TEXT,
+  core_uuid TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   resolved_at TEXT,
@@ -1128,6 +1134,33 @@ class SQLiteRepo:
             return
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_def}")
 
+    def _backfill_core_uuids(self, conn: sqlite3.Connection) -> None:
+        """Assign pilot UUIDs to all entity rows that don't have one yet.
+
+        Idempotent: rows with an existing core_uuid are never modified.
+        Called automatically during schema migration (init_db / reinit).
+        """
+        from core.ids import generate_pilot_uuid
+        tables = ["parties", "contracts", "deliveries", "payments", "evidence_originals", "exception_cases"]
+        pk_map = {
+            "parties": "party_id",
+            "contracts": "contract_id",
+            "deliveries": "delivery_id",
+            "payments": "payment_id",
+            "evidence_originals": "evidence_id",
+            "exception_cases": "exception_case_id",
+        }
+        for table in tables:
+            pk = pk_map[table]
+            rows = conn.execute(
+                f"SELECT {pk} FROM {table} WHERE core_uuid IS NULL"
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    f"UPDATE {table} SET core_uuid = ? WHERE {pk} = ?",
+                    (generate_pilot_uuid(), row[0]),
+                )
+
     def _apply_schema_migrations(self, conn: sqlite3.Connection, config: RuntimeConfig) -> None:
         self._add_column_if_missing(conn, "contracts", "master_contract_id TEXT REFERENCES contracts(contract_id)")
         self._add_column_if_missing(conn, "contracts", "lpo_valid_from TEXT")
@@ -1155,6 +1188,14 @@ class SQLiteRepo:
         self._add_column_if_missing(conn, "evidence_originals", "link_source TEXT")
         self._add_column_if_missing(conn, "evidence_originals", "linked_at TEXT")
         self._add_column_if_missing(conn, "evidence_originals", "updated_at TEXT")
+        # Phase 1A: identity bridge — core_uuid columns for cross-system mapping
+        self._add_column_if_missing(conn, "parties", "core_uuid TEXT")
+        self._add_column_if_missing(conn, "contracts", "core_uuid TEXT")
+        self._add_column_if_missing(conn, "deliveries", "core_uuid TEXT")
+        self._add_column_if_missing(conn, "payments", "core_uuid TEXT")
+        self._add_column_if_missing(conn, "evidence_originals", "core_uuid TEXT")
+        self._add_column_if_missing(conn, "exception_cases", "core_uuid TEXT")
+        self._backfill_core_uuids(conn)
 
         backfill_policy = str(config.delivery_policies.get("validity_backfill_policy") or "null_if_missing")
         now = utc_now_iso_z()
@@ -1313,9 +1354,9 @@ class SQLiteRepo:
                 INSERT INTO parties(
                     party_id, legal_name, code, tin, rc_number, address, city_state_country, website,
                     phone, email, bank_name, bank_account_name, bank_account_number, bank_currency, aliases_json,
-                    created_at, updated_at
+                    core_uuid, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(party_id) DO UPDATE SET
                     legal_name=excluded.legal_name,
                     code=excluded.code,
@@ -1331,6 +1372,7 @@ class SQLiteRepo:
                     bank_account_number=excluded.bank_account_number,
                     bank_currency=excluded.bank_currency,
                     aliases_json=excluded.aliases_json,
+                    core_uuid=COALESCE(parties.core_uuid, excluded.core_uuid),
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -1349,6 +1391,7 @@ class SQLiteRepo:
                     entity.bank.account_number if entity.bank else "",
                     entity.bank.currency if entity.bank else "NGN",
                     json.dumps(entity.aliases or []),
+                    generate_pilot_uuid(),
                     now,
                     now,
                 ),
@@ -1659,9 +1702,9 @@ class SQLiteRepo:
                     operator_id, source_id, processor_id, lane, currency, issue_date, lpo_valid_from, lpo_valid_to, lpo_state,
                     due_date, due_terms,
                     expected_total_qty, expected_total_qty_kg, expected_total_value, over_delivery_tolerance_pct, status, notes,
-                    created_at, updated_at
+                    core_uuid, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     contract_id,
@@ -1687,6 +1730,7 @@ class SQLiteRepo:
                     tolerance_pct,
                     ContractStatus.OPEN.value,
                     notes,
+                    generate_pilot_uuid(),
                     now,
                     now,
                 ),
@@ -1790,9 +1834,9 @@ class SQLiteRepo:
                 INSERT INTO deliveries(
                     delivery_id, contract_id, contract_line_id, delivery_ref, run_id, batch_id, delivery_date,
                     delivered_qty, delivered_qty_kg, unit, unit_price, unit_price_basis, gross_amount, truck_no, driver_name, driver_phone, notes,
-                    status, over_delivery_override_reason, created_at, updated_at
+                    status, over_delivery_override_reason, core_uuid, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     delivery_id,
@@ -1814,6 +1858,7 @@ class SQLiteRepo:
                     payload.get("notes"),
                     DeliveryStatus.PLANNED.value,
                     override_reason,
+                    generate_pilot_uuid(),
                     now,
                     now,
                 ),
@@ -2501,8 +2546,8 @@ class SQLiteRepo:
             """
             INSERT INTO exception_cases(
                 exception_case_id, autonomy_run_id, action_intent_id, contract_id, delivery_id, planned_delivery_id,
-                case_type, severity, status, reason_code, details_json, idempotency_key, created_at, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
+                case_type, severity, status, reason_code, details_json, idempotency_key, core_uuid, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)
             """,
             (
                 exception_case_id,
@@ -2516,6 +2561,7 @@ class SQLiteRepo:
                 reason_code,
                 json.dumps(details or {}, sort_keys=True),
                 idempotency_key,
+                generate_pilot_uuid(),
                 now,
                 now,
             ),

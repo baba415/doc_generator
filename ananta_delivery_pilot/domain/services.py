@@ -16,7 +16,7 @@ from adapters.storage import output_delivery_dir, persist_evidence_original
 from core.config import RuntimeConfig, infer_buyer_group
 from core.enums import DeliveryStatus, DocumentType, PaymentStatus
 from core.hashing import canonical_json_sha256, sha256_file
-from core.ids import new_ulid
+from core.ids import generate_pilot_uuid, new_ulid
 from core.manifest import build_manifest, write_manifest
 from core.time import utc_now_iso_z, utc_today_iso
 from core.units import kg_to_mt_decimal, mt_to_kg_int
@@ -611,9 +611,9 @@ class Phase1Service:
                     INSERT INTO evidence_originals(
                         evidence_id, contract_id, delivery_id, sales_transaction_id, sales_line_id,
                         file_name, doc_type, link_status, link_confidence, link_reason_code, link_source, linked_at,
-                        source_path, stored_path, sha256, captured_at, created_at, updated_at
+                        source_path, stored_path, sha256, captured_at, core_uuid, created_at, updated_at
                     )
-                    VALUES(?, ?, ?, ?, NULL, ?, ?, 'UNLINKED', NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, NULL, ?, ?, 'UNLINKED', NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         stored["evidence_id"],
@@ -626,6 +626,7 @@ class Phase1Service:
                         stored["stored_path"],
                         stored["sha256"],
                         stored["captured_at"],
+                        generate_pilot_uuid(),
                         now,
                         now,
                     ),
@@ -839,9 +840,9 @@ class Phase1Service:
                 """
                 INSERT INTO payments(
                     payment_id, vendor_of_record_id, buyer_id, payment_date, amount_received, currency,
-                    payment_method, external_reference, idempotency_key, receipt_no, created_at, updated_at
+                    payment_method, external_reference, idempotency_key, receipt_no, core_uuid, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     payment_id,
@@ -854,6 +855,7 @@ class Phase1Service:
                     payload.get("external_reference"),
                     idempotency_key,
                     receipt_no,
+                    generate_pilot_uuid(),
                     now,
                     now,
                 ),
@@ -3271,9 +3273,9 @@ class Phase1Service:
                 INSERT INTO evidence_originals(
                     evidence_id, contract_id, delivery_id, sales_transaction_id, sales_line_id,
                     file_name, doc_type, link_status, link_confidence, link_reason_code, link_source, linked_at,
-                    source_path, stored_path, sha256, captured_at, created_at, updated_at
+                    source_path, stored_path, sha256, captured_at, core_uuid, created_at, updated_at
                 )
-                VALUES(?, ?, ?, ?, NULL, ?, ?, 'UNLINKED', NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, NULL, ?, ?, 'UNLINKED', NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     stored["evidence_id"],
@@ -3286,6 +3288,7 @@ class Phase1Service:
                     stored["stored_path"],
                     stored["sha256"],
                     stored["captured_at"],
+                    generate_pilot_uuid(),
                     now,
                     now,
                 ),
