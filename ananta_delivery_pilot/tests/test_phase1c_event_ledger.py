@@ -129,6 +129,7 @@ class Phase1CEventLedgerTests(unittest.TestCase):
             pk_column="contract_id",
             state_column="lpo_state",
             new_state="ACTIVE",
+            idempotency_key=f"TERMS_SUBMITTED:{contract_id}:test-001",
         )
 
         self.assertIn("event_id", result)
@@ -175,6 +176,7 @@ class Phase1CEventLedgerTests(unittest.TestCase):
                 pk_column="contract_id",
                 state_column="lpo_state",
                 new_state="ACTIVE",
+                idempotency_key=f"TERMS_SUBMITTED:{contract_id}:test-002",
             )
 
         self.assertTrue(len(ctx.exception.errors) > 0)
@@ -218,6 +220,7 @@ class Phase1CEventLedgerTests(unittest.TestCase):
             evidence_pk_column="evidence_id",
             evidence_id=evidence_id,
             evidence_updates={"link_status": "LINKED"},
+            idempotency_key=f"DREP_EVIDENCE_ATTACHED:{evidence_id}:test-003",
         )
 
         self.assertIn("event_id", result)
@@ -257,6 +260,7 @@ class Phase1CEventLedgerTests(unittest.TestCase):
                 evidence_pk_column="evidence_id",
                 evidence_id=evidence_id,
                 evidence_updates={"link_status": "LINKED"},
+                idempotency_key=f"EVIDENCE_SUBMITTED:{evidence_id}:test-004",
             )
 
         self.assertTrue(len(ctx.exception.errors) > 0)
@@ -382,18 +386,7 @@ class Phase1CEventLedgerTests(unittest.TestCase):
                 (idem_key,),
             ).fetchone()
         self.assertEqual(count["n"], 1)
-
-        # JSONL must contain the conflict entry
-        conflicts_path = self.repo.db_path.parent / "conflicts.jsonl"
-        self.assertTrue(conflicts_path.exists())
-        entries = [json.loads(line) for line in conflicts_path.read_text().splitlines() if line]
-        conflict_entries = [
-            e for e in entries
-            if e.get("idempotency_key") == idem_key
-        ]
-        self.assertEqual(len(conflict_entries), 1)
-        self.assertEqual(conflict_entries[0]["existing_content_hash"], hash_1)
-        self.assertEqual(conflict_entries[0]["new_content_hash"], hash_2)
+        # Note: JSONL is written by apply_* methods (outside tx); not by _append_validated_event directly
 
     # ------------------------------------------------------------------
     # Test 7: Content hash determinism — same envelope → same hash (100 runs)
@@ -473,6 +466,7 @@ class Phase1CEventLedgerTests(unittest.TestCase):
             pk_column="contract_id",
             state_column="lpo_state",
             new_state="ACTIVE",
+            idempotency_key=f"TERMS_SUBMITTED:{contract_id}:test-009",
         )
 
         with self.repo.transaction() as conn:
@@ -492,3 +486,129 @@ class Phase1CEventLedgerTests(unittest.TestCase):
         # Must not be empty strings
         self.assertTrue(len(row["validated_against_ref"]) > 0)
         self.assertTrue(len(row["validated_against_hash"]) > 0)
+
+    # ------------------------------------------------------------------
+    # Test 10: Idempotency dedup via public API — same key + same payload → dedup
+    # ------------------------------------------------------------------
+    def test_idempotency_dedup_via_public_api(self) -> None:
+        """Same idempotency_key + same payload → return existing event (dedup)."""
+        contract_id = self._insert_contract(lpo_state="DRAFT")
+        payload = _valid_terms_submitted_payload()
+        key = f"TERMS_SUBMITTED:{contract_id}:test-idem-dedup"
+
+        result1 = self.repo.apply_transition(
+            event_type="TERMS_SUBMITTED",
+            entity_type="contract",
+            entity_id=contract_id,
+            payload=payload,
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=key,
+        )
+
+        # Second call with same key and same payload → dedup
+        result2 = self.repo.apply_transition(
+            event_type="TERMS_SUBMITTED",
+            entity_type="contract",
+            entity_id=contract_id,
+            payload=payload,
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=key,
+        )
+
+        self.assertEqual(result1["event_id"], result2["event_id"])
+        self.assertFalse(result1.get("deduped"))
+        self.assertTrue(result2.get("deduped"))
+
+        # Only 1 row in event_log for this key
+        with self.repo.transaction() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) as n FROM event_log WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()
+        self.assertEqual(count["n"], 1)
+
+    # ------------------------------------------------------------------
+    # Test 11: Idempotency conflict via public API — same key + different payload → error + JSONL
+    # ------------------------------------------------------------------
+    def test_idempotency_conflict_via_public_api(self) -> None:
+        """Same idempotency_key + different payload → IdempotencyConflictError + JSONL written."""
+        contract_id_a = self._insert_contract(lpo_state="DRAFT")
+        contract_id_b = self._insert_contract(lpo_state="DRAFT")
+        key = f"TERMS_SUBMITTED:shared-key:test-idem-conflict"
+
+        payload_a = _valid_terms_submitted_payload()
+        payload_b = _valid_terms_submitted_payload()  # different UUID in trade_id
+
+        # First call with contract_id_a
+        self.repo.apply_transition(
+            event_type="TERMS_SUBMITTED",
+            entity_type="contract",
+            entity_id=contract_id_a,
+            payload=payload_a,
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=key,
+        )
+
+        # Second call: same key, different payload → IdempotencyConflictError
+        with self.assertRaises(IdempotencyConflictError) as ctx:
+            self.repo.apply_transition(
+                event_type="TERMS_SUBMITTED",
+                entity_type="contract",
+                entity_id=contract_id_b,
+                payload=payload_b,
+                table="contracts",
+                pk_column="contract_id",
+                state_column="lpo_state",
+                new_state="ACTIVE",
+                idempotency_key=key,
+            )
+
+        err = ctx.exception
+        self.assertEqual(err.idempotency_key, key)
+
+        # JSONL conflict log must be written (outside transaction)
+        conflicts_path = self.repo.db_path.parent / "conflicts.jsonl"
+        self.assertTrue(conflicts_path.exists(), "conflicts.jsonl not written")
+        entries = [json.loads(line) for line in conflicts_path.read_text().splitlines() if line]
+        conflict_entries = [e for e in entries if e.get("idempotency_key") == key]
+        self.assertEqual(len(conflict_entries), 1)
+        self.assertEqual(conflict_entries[0]["existing_content_hash"], err.existing_hash)
+        self.assertEqual(conflict_entries[0]["new_content_hash"], err.new_hash)
+
+    # ------------------------------------------------------------------
+    # Test 12: Phantom event prevention — nonexistent entity_id raises, no event appended
+    # ------------------------------------------------------------------
+    def test_transition_nonexistent_entity_raises_no_phantom_event(self) -> None:
+        """apply_transition with bad entity_id → ValueError, no event in event_log."""
+        nonexistent_id = "nonexistent-id-999"
+        payload = _valid_terms_submitted_payload()
+
+        with self.assertRaises(ValueError, msg="Expected ValueError for missing entity"):
+            self.repo.apply_transition(
+                event_type="TERMS_SUBMITTED",
+                entity_type="contract",
+                entity_id=nonexistent_id,
+                payload=payload,
+                table="contracts",
+                pk_column="contract_id",
+                state_column="lpo_state",
+                new_state="ACTIVE",
+                idempotency_key=f"TERMS_SUBMITTED:{nonexistent_id}:test-phantom",
+            )
+
+        # Verify no phantom event was appended
+        with self.repo.transaction() as conn:
+            events = conn.execute(
+                "SELECT * FROM event_log WHERE entity_id = ?",
+                (nonexistent_id,),
+            ).fetchall()
+        self.assertEqual(len(events), 0, "No event should be appended for a nonexistent entity")

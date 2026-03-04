@@ -68,6 +68,7 @@ def canonical_hash(envelope: dict) -> str:
 @dataclass
 class ValidationResult:
     valid: bool
+    catalog_match: bool = True  # False when event_type is not in catalog
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     core_requirements_ref: str = ""
@@ -159,6 +160,7 @@ class EnvelopeValidator:
         )
 
         if event_type not in self._catalog:
+            result.catalog_match = False
             result.warnings.append(
                 f"Unknown event_type={event_type!r}; "
                 "likely ignored — verify during Phase 3 sandbox replay"
