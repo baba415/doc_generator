@@ -3,11 +3,11 @@
 Status: Step 1 spec lock only (no runtime changes in this step)  
 Owner: `ananta_delivery_pilot` (Merchant/Ops harness)  
 Canonical dependencies:
-- Rails/Core: `/Users/macbookairv2/Projects/ananta-mvp`
-- Execute (canonical): `/Users/macbookairv2/Projects/ananta-execute`
+- Rails/Core: `/Users/macbookairv2/Prinsip/core`
+- Execute (canonical): `/Users/macbookairv2/Prinsip/execute`
 - Execute contracts:
-  - `/Users/macbookairv2/Projects/ananta-execute/execute_v11/contracts/drep_daily_contract.py`
-  - `/Users/macbookairv2/Projects/ananta-execute/execute_v11/contracts/proof_pack_export_contract.py`
+  - `/Users/macbookairv2/Prinsip/execute/execute_v11/contracts/drep_daily_contract.py`
+  - `/Users/macbookairv2/Prinsip/execute/execute_v11/contracts/proof_pack_export_contract.py`
 
 ## 0) Scope lock and invariants
 
@@ -18,7 +18,7 @@ Hard lock for DG-1A:
 2. No DB schema changes.
 3. No CLI behavior changes.
 4. Preserve current delivery flow and all existing invariants.
-5. Treat `/Users/macbookairv2/Projects/ananta-execute` as canonical Execute source.
+5. Treat `/Users/macbookairv2/Prinsip/execute` as canonical Execute source.
 6. Do not use `/Users/macbookairv2/excute_card` as shipping source.
 
 ---
@@ -98,7 +98,7 @@ Idempotency invariant for implementation:
 
 Canonical contract:
 - Version constant: `execute_drep_daily_v1`
-- Validator: `/Users/macbookairv2/Projects/ananta-execute/execute_v11/contracts/drep_daily_contract.py`
+- Validator: `/Users/macbookairv2/Prinsip/execute/execute_v11/contracts/drep_daily_contract.py`
 
 DG-1A consumer rules:
 1. Must validate payload with Execute validator semantics.
@@ -118,7 +118,7 @@ Fail-closed reason codes:
 
 Canonical contract:
 - Version constant: `execute_proof_export_v1`
-- Validator: `/Users/macbookairv2/Projects/ananta-execute/execute_v11/contracts/proof_pack_export_contract.py`
+- Validator: `/Users/macbookairv2/Prinsip/execute/execute_v11/contracts/proof_pack_export_contract.py`
 
 DG-1A consumer rules:
 1. Must validate payload with Execute validator semantics.
