@@ -288,7 +288,7 @@ class Phase1CEventLedgerTests(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
-    # Test 5: Idempotency safe dedup — same key + same hash → existing event returned
+    # Test 5: Idempotency safe dedup — _check_idempotency returns "dedup" for same key+hash
     # ------------------------------------------------------------------
     def test_idempotency_safe_dedup_returns_existing_event(self) -> None:
         entity_id = new_ulid()
@@ -296,7 +296,7 @@ class Phase1CEventLedgerTests(unittest.TestCase):
         c_hash = canonical_hash(payload)
         idem_key = f"DEDUP_TEST:{entity_id}:{c_hash}"
 
-        # First write
+        # First write via _append_validated_event
         with self.repo.transaction() as conn:
             result1 = self.repo._append_validated_event(
                 conn,
@@ -310,22 +310,14 @@ class Phase1CEventLedgerTests(unittest.TestCase):
                 validated_against_hash="test-hash",
             )
 
-        # Second write — same key + same hash
-        with self.repo.transaction() as conn:
-            result2 = self.repo._append_validated_event(
-                conn,
-                event_type="DEDUP_TEST",
-                entity_type="test",
-                entity_id=entity_id,
-                payload=payload,
-                idempotency_key=idem_key,
-                content_hash=c_hash,
-                validated_against_ref="test-ref",
-                validated_against_hash="test-hash",
-            )
+        # _check_idempotency must report "dedup" for same key + same hash
+        status, val = self.repo._check_idempotency(idem_key, c_hash)
+        self.assertEqual(status, "dedup")
+        self.assertEqual(val, result1["event_id"])
 
+        # _get_event_by_id returns same event_id with deduped=True
+        result2 = self.repo._get_event_by_id(val)
         self.assertEqual(result1["event_id"], result2["event_id"])
-        self.assertFalse(result1.get("deduped"))
         self.assertTrue(result2.get("deduped"))
 
         # Only 1 row in event_log
@@ -337,7 +329,7 @@ class Phase1CEventLedgerTests(unittest.TestCase):
         self.assertEqual(count["n"], 1)
 
     # ------------------------------------------------------------------
-    # Test 6: Idempotency conflict — same key + different hash → error + JSONL
+    # Test 6: Idempotency conflict — _check_idempotency returns "conflict" for same key+different hash
     # ------------------------------------------------------------------
     def test_idempotency_conflict_raises_and_logs_jsonl(self) -> None:
         entity_id = new_ulid()
@@ -359,34 +351,18 @@ class Phase1CEventLedgerTests(unittest.TestCase):
                 validated_against_hash="test-hash",
             )
 
-        # Second write with hash_2 → conflict
-        with self.assertRaises(IdempotencyConflictError) as ctx:
-            with self.repo.transaction() as conn:
-                self.repo._append_validated_event(
-                    conn,
-                    event_type="CONFLICT_TEST",
-                    entity_type="test",
-                    entity_id=entity_id,
-                    payload={"data": "payload_version_2"},
-                    idempotency_key=idem_key,
-                    content_hash=hash_2,
-                    validated_against_ref="test-ref",
-                    validated_against_hash="test-hash",
-                )
+        # _check_idempotency must report "conflict" for same key + different hash
+        status, val = self.repo._check_idempotency(idem_key, hash_2)
+        self.assertEqual(status, "conflict")
+        self.assertEqual(val, hash_1)  # val is the existing hash on conflict
 
-        err = ctx.exception
-        self.assertEqual(err.idempotency_key, idem_key)
-        self.assertEqual(err.existing_hash, hash_1)
-        self.assertEqual(err.new_hash, hash_2)
-
-        # Still only 1 row (conflict rolled back)
+        # Still only 1 row
         with self.repo.transaction() as conn:
             count = conn.execute(
                 "SELECT COUNT(*) as n FROM event_log WHERE idempotency_key = ?",
                 (idem_key,),
             ).fetchone()
         self.assertEqual(count["n"], 1)
-        # Note: JSONL is written by apply_* methods (outside tx); not by _append_validated_event directly
 
     # ------------------------------------------------------------------
     # Test 7: Content hash determinism — same envelope → same hash (100 runs)
@@ -612,3 +588,131 @@ class Phase1CEventLedgerTests(unittest.TestCase):
                 (nonexistent_id,),
             ).fetchall()
         self.assertEqual(len(events), 0, "No event should be appended for a nonexistent entity")
+
+    # ------------------------------------------------------------------
+    # Test 13: Dedup causes zero truth table writes — updated_at unchanged
+    # ------------------------------------------------------------------
+    def test_dedup_causes_zero_truth_table_writes(self) -> None:
+        """On idempotent retry, entity updated_at must not change and no new event appended."""
+        import time
+        contract_id = self._insert_contract(lpo_state="DRAFT")
+        payload = _valid_terms_submitted_payload()
+        key = f"TERMS_SUBMITTED:{contract_id}:dedup-zero-write"
+
+        # First call — legitimate write
+        result1 = self.repo.apply_transition(
+            event_type="TERMS_SUBMITTED",
+            entity_type="contract",
+            entity_id=contract_id,
+            payload=payload,
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=key,
+        )
+
+        # Record updated_at after first call
+        with self.repo.transaction() as conn:
+            before = conn.execute(
+                "SELECT updated_at FROM contracts WHERE contract_id = ?",
+                (contract_id,),
+            ).fetchone()["updated_at"]
+
+        time.sleep(1)  # ensure clock advances so any spurious write would change updated_at
+
+        # Second call — same key + same payload → dedup
+        result2 = self.repo.apply_transition(
+            event_type="TERMS_SUBMITTED",
+            entity_type="contract",
+            entity_id=contract_id,
+            payload=payload,
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=key,
+        )
+
+        self.assertEqual(result1["event_id"], result2["event_id"])
+        self.assertTrue(result2.get("deduped"))
+
+        with self.repo.transaction() as conn:
+            after = conn.execute(
+                "SELECT updated_at FROM contracts WHERE contract_id = ?",
+                (contract_id,),
+            ).fetchone()["updated_at"]
+            count = conn.execute(
+                "SELECT COUNT(*) as n FROM event_log WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()["n"]
+
+        self.assertEqual(before, after, "updated_at must not change on dedup retry")
+        self.assertEqual(count, 1, "Only 1 event_log row for deduplicated key")
+
+    # ------------------------------------------------------------------
+    # Test 14: Conflict causes zero truth table writes — entity state unchanged
+    # ------------------------------------------------------------------
+    def test_conflict_causes_zero_truth_table_writes(self) -> None:
+        """On idempotency conflict, entity state and updated_at must not change."""
+        contract_id = self._insert_contract(lpo_state="DRAFT")
+        key = f"TERMS_SUBMITTED:{contract_id}:conflict-zero-write"
+
+        payload_a = _valid_terms_submitted_payload()
+        payload_b = _valid_terms_submitted_payload()  # different UUID → different hash
+
+        # First call
+        self.repo.apply_transition(
+            event_type="TERMS_SUBMITTED",
+            entity_type="contract",
+            entity_id=contract_id,
+            payload=payload_a,
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=key,
+        )
+
+        # Record state after first call
+        with self.repo.transaction() as conn:
+            snap = conn.execute(
+                "SELECT lpo_state, updated_at FROM contracts WHERE contract_id = ?",
+                (contract_id,),
+            ).fetchone()
+        state_after_first = snap["lpo_state"]
+        updated_at_after_first = snap["updated_at"]
+
+        # Second call: same key, different payload → conflict
+        with self.assertRaises(IdempotencyConflictError):
+            self.repo.apply_transition(
+                event_type="TERMS_SUBMITTED",
+                entity_type="contract",
+                entity_id=contract_id,
+                payload=payload_b,
+                table="contracts",
+                pk_column="contract_id",
+                state_column="lpo_state",
+                new_state="AUTHORIZED",
+                idempotency_key=key,
+            )
+
+        with self.repo.transaction() as conn:
+            snap2 = conn.execute(
+                "SELECT lpo_state, updated_at FROM contracts WHERE contract_id = ?",
+                (contract_id,),
+            ).fetchone()
+            count = conn.execute(
+                "SELECT COUNT(*) as n FROM event_log WHERE idempotency_key = ?",
+                (key,),
+            ).fetchone()["n"]
+
+        self.assertEqual(snap2["lpo_state"], state_after_first, "state must not change on conflict")
+        self.assertEqual(snap2["updated_at"], updated_at_after_first, "updated_at must not change on conflict")
+        self.assertEqual(count, 1, "event_log count must remain 1 after conflict")
+
+        # Conflict JSONL must be written
+        conflicts_path = self.repo.db_path.parent / "conflicts.jsonl"
+        self.assertTrue(conflicts_path.exists())
+        entries = [json.loads(line) for line in conflicts_path.read_text().splitlines() if line]
+        self.assertTrue(any(e.get("idempotency_key") == key for e in entries))

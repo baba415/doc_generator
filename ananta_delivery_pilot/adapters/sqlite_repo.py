@@ -3423,6 +3423,43 @@ class SQLiteRepo:
         with log_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
 
+    def _check_idempotency(
+        self, idempotency_key: str, content_hash: str
+    ) -> tuple[str, str | None]:
+        """Check event_log for an existing entry with idempotency_key.
+
+        Returns:
+          ("new",      None)            — key not seen before
+          ("dedup",    existing_event_id) — same key + same hash
+          ("conflict", existing_hash)   — same key + different hash
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT event_id, content_hash FROM event_log WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None:
+            return ("new", None)
+        if row["content_hash"] == content_hash:
+            return ("dedup", row["event_id"])
+        return ("conflict", row["content_hash"])
+
+    def _get_event_by_id(self, event_id: str) -> dict[str, Any]:
+        """Retrieve a persisted event for dedup returns."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT event_id FROM event_log WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return {"event_id": row["event_id"], "deduped": True}
+
     def _append_validated_event(
         self,
         conn: sqlite3.Connection,
@@ -3439,28 +3476,11 @@ class SQLiteRepo:
         replay_obligations: list[Any] | None = None,
         catalog_match: bool = True,
     ) -> dict[str, Any]:
-        """Append a validated event to event_log with idempotency dedup.
+        """INSERT a new event into event_log. Caller guarantees key is new.
 
-        Same key + same content_hash → returns existing event (safe dedup).
-        Same key + different content_hash → raises IdempotencyConflictError
-          (JSONL write is done by the caller OUTSIDE the transaction).
         catalog_match=False → schema_ok=0 (pilot-internal / unknown event type).
+        The UNIQUE index on idempotency_key is the safety net for races.
         """
-        from domain.event_ledger import IdempotencyConflictError
-
-        existing = conn.execute(
-            "SELECT event_id, content_hash FROM event_log WHERE idempotency_key = ?",
-            (idempotency_key,),
-        ).fetchone()
-
-        if existing is not None:
-            if existing["content_hash"] == content_hash:
-                return {"event_id": existing["event_id"], "deduped": True}
-            # Conflict — raise only; JSONL write happens outside the transaction
-            raise IdempotencyConflictError(
-                idempotency_key, existing["content_hash"], content_hash
-            )
-
         event_id = generate_pilot_uuid()
         now = utc_now_iso_z()
         obligations_json = json.dumps(replay_obligations or [])
@@ -3500,11 +3520,12 @@ class SQLiteRepo:
         idempotency_key: str,
         rails_trade_id: str | None = None,
     ) -> dict[str, Any]:
-        """TRANSITION tier: validate → atomic(state mutation + event append).
+        """TRANSITION tier: validate → idempotency check → atomic(state mutation + event append).
 
-        On schema failure: writes rejection JSONL, raises SchemaValidationError.
-        State is unchanged if validation fails.
-        idempotency_key must be caller-supplied (stable key for this action attempt).
+        Idempotency check happens BEFORE any mutation:
+          dedup   → return existing event, zero truth table writes
+          conflict → write JSONL, raise IdempotencyConflictError, zero writes
+          new key  → UPDATE state + append event atomically
         """
         from domain.event_ledger import IdempotencyConflictError, SchemaValidationError, canonical_hash
 
@@ -3524,46 +3545,50 @@ class SQLiteRepo:
             raise SchemaValidationError(result.errors)
 
         c_hash = canonical_hash(payload)
-        obligations = list(
-            self._validator._catalog.get(event_type, {}).get("replay_obligations", [])
-        )
 
-        try:
-            with self.transaction() as conn:
-                cursor = conn.execute(
-                    f"UPDATE {table} SET {state_column} = ?, updated_at = ? WHERE {pk_column} = ?",
-                    (new_state, utc_now_iso_z(), entity_id),
-                )
-                if cursor.rowcount == 0:
-                    raise ValueError(
-                        f"Entity {entity_type}:{entity_id} not found — "
-                        f"state mutation failed, aborting event append"
-                    )
-                return self._append_validated_event(
-                    conn,
-                    event_type=event_type,
-                    entity_type=entity_type,
-                    entity_id=entity_id,
-                    payload=payload,
-                    rails_trade_id=rails_trade_id,
-                    idempotency_key=idempotency_key,
-                    content_hash=c_hash,
-                    validated_against_ref=result.core_requirements_ref,
-                    validated_against_hash=result.core_requirements_hash,
-                    replay_obligations=obligations,
-                    catalog_match=result.catalog_match,
-                )
-        except IdempotencyConflictError as e:
+        # Check idempotency BEFORE any mutation
+        idem_status, idem_val = self._check_idempotency(idempotency_key, c_hash)
+        if idem_status == "dedup":
+            return self._get_event_by_id(idem_val)  # zero writes
+        if idem_status == "conflict":
             self._write_rejection_log(
                 event_type=event_type,
                 entity_id=entity_id,
                 rails_trade_id=rails_trade_id,
                 errors=[],
-                idempotency_key=e.idempotency_key,
-                existing_content_hash=e.existing_hash,
-                new_content_hash=e.new_hash,
+                idempotency_key=idempotency_key,
+                existing_content_hash=idem_val,
+                new_content_hash=c_hash,
             )
-            raise
+            raise IdempotencyConflictError(idempotency_key, idem_val, c_hash)
+
+        obligations = list(
+            self._validator._catalog.get(event_type, {}).get("replay_obligations", [])
+        )
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                f"UPDATE {table} SET {state_column} = ?, updated_at = ? WHERE {pk_column} = ?",
+                (new_state, utc_now_iso_z(), entity_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError(
+                    f"Entity {entity_type}:{entity_id} not found — "
+                    f"state mutation failed, aborting event append"
+                )
+            return self._append_validated_event(
+                conn,
+                event_type=event_type,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                payload=payload,
+                rails_trade_id=rails_trade_id,
+                idempotency_key=idempotency_key,
+                content_hash=c_hash,
+                validated_against_ref=result.core_requirements_ref,
+                validated_against_hash=result.core_requirements_hash,
+                replay_obligations=obligations,
+                catalog_match=result.catalog_match,
+            )
 
     def apply_prep_evidence(
         self,
@@ -3579,11 +3604,12 @@ class SQLiteRepo:
         idempotency_key: str,
         rails_trade_id: str | None = None,
     ) -> dict[str, Any]:
-        """PREP_EVIDENCE tier: validate → atomic(evidence mutation + event append).
+        """PREP_EVIDENCE tier: validate → idempotency check → atomic(evidence mutation + event append).
 
-        On schema failure: writes rejection JSONL, raises SchemaValidationError.
-        Evidence record is unchanged if validation fails.
-        idempotency_key must be caller-supplied (stable key for this action attempt).
+        Idempotency check happens BEFORE any mutation:
+          dedup   → return existing event, zero truth table writes
+          conflict → write JSONL, raise IdempotencyConflictError, zero writes
+          new key  → UPDATE evidence + append event atomically
         """
         from domain.event_ledger import IdempotencyConflictError, SchemaValidationError, canonical_hash
 
@@ -3603,50 +3629,54 @@ class SQLiteRepo:
             raise SchemaValidationError(result.errors)
 
         c_hash = canonical_hash(payload)
-        obligations = list(
-            self._validator._catalog.get(event_type, {}).get("replay_obligations", [])
-        )
 
-        try:
-            with self.transaction() as conn:
-                if evidence_updates:
-                    set_clause = ", ".join(f"{col} = ?" for col in evidence_updates)
-                    values = list(evidence_updates.values()) + [evidence_id]
-                    cursor = conn.execute(
-                        f"UPDATE {evidence_table} SET {set_clause} "
-                        f"WHERE {evidence_pk_column} = ?",
-                        values,
-                    )
-                    if cursor.rowcount == 0:
-                        raise ValueError(
-                            f"Entity {entity_type}:{evidence_id} not found — "
-                            f"evidence mutation failed, aborting event append"
-                        )
-                return self._append_validated_event(
-                    conn,
-                    event_type=event_type,
-                    entity_type=entity_type,
-                    entity_id=entity_id,
-                    payload=payload,
-                    rails_trade_id=rails_trade_id,
-                    idempotency_key=idempotency_key,
-                    content_hash=c_hash,
-                    validated_against_ref=result.core_requirements_ref,
-                    validated_against_hash=result.core_requirements_hash,
-                    replay_obligations=obligations,
-                    catalog_match=result.catalog_match,
-                )
-        except IdempotencyConflictError as e:
+        # Check idempotency BEFORE any mutation
+        idem_status, idem_val = self._check_idempotency(idempotency_key, c_hash)
+        if idem_status == "dedup":
+            return self._get_event_by_id(idem_val)  # zero writes
+        if idem_status == "conflict":
             self._write_rejection_log(
                 event_type=event_type,
                 entity_id=entity_id,
                 rails_trade_id=rails_trade_id,
                 errors=[],
-                idempotency_key=e.idempotency_key,
-                existing_content_hash=e.existing_hash,
-                new_content_hash=e.new_hash,
+                idempotency_key=idempotency_key,
+                existing_content_hash=idem_val,
+                new_content_hash=c_hash,
             )
-            raise
+            raise IdempotencyConflictError(idempotency_key, idem_val, c_hash)
+
+        obligations = list(
+            self._validator._catalog.get(event_type, {}).get("replay_obligations", [])
+        )
+        with self.transaction() as conn:
+            if evidence_updates:
+                set_clause = ", ".join(f"{col} = ?" for col in evidence_updates)
+                values = list(evidence_updates.values()) + [evidence_id]
+                cursor = conn.execute(
+                    f"UPDATE {evidence_table} SET {set_clause} "
+                    f"WHERE {evidence_pk_column} = ?",
+                    values,
+                )
+                if cursor.rowcount == 0:
+                    raise ValueError(
+                        f"Entity {entity_type}:{evidence_id} not found — "
+                        f"evidence mutation failed, aborting event append"
+                    )
+            return self._append_validated_event(
+                conn,
+                event_type=event_type,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                payload=payload,
+                rails_trade_id=rails_trade_id,
+                idempotency_key=idempotency_key,
+                content_hash=c_hash,
+                validated_against_ref=result.core_requirements_ref,
+                validated_against_hash=result.core_requirements_hash,
+                replay_obligations=obligations,
+                catalog_match=result.catalog_match,
+            )
 
     def apply_prep_note(
         self,
@@ -3658,11 +3688,13 @@ class SQLiteRepo:
         idempotency_key: str,
         rails_trade_id: str | None = None,
     ) -> dict[str, Any]:
-        """PREP_NOTE tier: validate → atomic(event append only).
+        """PREP_NOTE tier: validate → idempotency check → atomic(event append only).
 
         Lowest tier — never blocks state transitions.
-        On schema failure: writes rejection JSONL, raises SchemaValidationError.
-        idempotency_key must be caller-supplied (stable key for this action attempt).
+        Idempotency check happens BEFORE any mutation:
+          dedup   → return existing event, zero writes
+          conflict → write JSONL, raise IdempotencyConflictError, zero writes
+          new key  → append event atomically
         """
         from domain.event_ledger import IdempotencyConflictError, SchemaValidationError, canonical_hash
 
@@ -3682,37 +3714,41 @@ class SQLiteRepo:
             raise SchemaValidationError(result.errors)
 
         c_hash = canonical_hash(payload)
-        obligations = list(
-            self._validator._catalog.get(event_type, {}).get("replay_obligations", [])
-        )
 
-        try:
-            with self.transaction() as conn:
-                return self._append_validated_event(
-                    conn,
-                    event_type=event_type,
-                    entity_type=entity_type,
-                    entity_id=entity_id,
-                    payload=payload,
-                    rails_trade_id=rails_trade_id,
-                    idempotency_key=idempotency_key,
-                    content_hash=c_hash,
-                    validated_against_ref=result.core_requirements_ref,
-                    validated_against_hash=result.core_requirements_hash,
-                    replay_obligations=obligations,
-                    catalog_match=result.catalog_match,
-                )
-        except IdempotencyConflictError as e:
+        # Check idempotency BEFORE any mutation
+        idem_status, idem_val = self._check_idempotency(idempotency_key, c_hash)
+        if idem_status == "dedup":
+            return self._get_event_by_id(idem_val)  # zero writes
+        if idem_status == "conflict":
             self._write_rejection_log(
                 event_type=event_type,
                 entity_id=entity_id,
                 rails_trade_id=rails_trade_id,
                 errors=[],
-                idempotency_key=e.idempotency_key,
-                existing_content_hash=e.existing_hash,
-                new_content_hash=e.new_hash,
+                idempotency_key=idempotency_key,
+                existing_content_hash=idem_val,
+                new_content_hash=c_hash,
             )
-            raise
+            raise IdempotencyConflictError(idempotency_key, idem_val, c_hash)
+
+        obligations = list(
+            self._validator._catalog.get(event_type, {}).get("replay_obligations", [])
+        )
+        with self.transaction() as conn:
+            return self._append_validated_event(
+                conn,
+                event_type=event_type,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                payload=payload,
+                rails_trade_id=rails_trade_id,
+                idempotency_key=idempotency_key,
+                content_hash=c_hash,
+                validated_against_ref=result.core_requirements_ref,
+                validated_against_hash=result.core_requirements_hash,
+                replay_obligations=obligations,
+                catalog_match=result.catalog_match,
+            )
 
 
 def _resolve_coa_profile(coa_profiles: dict[str, Any], *, buyer_group: str, product_code: str) -> dict[str, Any]:
