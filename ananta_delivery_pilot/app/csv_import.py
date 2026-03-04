@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -15,6 +16,7 @@ from core.config import RuntimeConfig, infer_lane
 from core.ids import new_ulid
 from core.time import utc_now_iso_z
 from core.units import kg_to_mt_decimal, mt_to_kg_int
+from domain.event_ledger import IdempotencyConflictError, SchemaValidationError
 
 try:
     from core.ids import generate_pilot_uuid as _generate_pilot_uuid
@@ -123,6 +125,29 @@ KNOWN_COLUMNS: dict[str, set[str]] = {
     },
 }
 
+EVENT_TYPE_MAP: dict[str, str] = {
+    "trades": "TERMS_SUBMITTED",
+    "deliveries": "SHIPMENT_DISPATCHED",
+    "counterparties": "pilot:counterparty:registered",
+    "payments": "pilot:payment:recorded",
+}
+
+ENTITY_TYPE_MAP: dict[str, str] = {
+    "trades": "trade",
+    "deliveries": "delivery",
+    "counterparties": "counterparty",
+    "payments": "payment",
+}
+
+TRANSITION_TARGETS: dict[str, tuple[str, str, str]] = {
+    "trades": ("contracts", "contract_id", "status"),
+    "deliveries": ("deliveries", "delivery_id", "status"),
+    # Counterparties and payments do not have explicit state columns; updated_at
+    # is used as the mutable transition target for bootstrap/event coupling.
+    "counterparties": ("parties", "party_id", "updated_at"),
+    "payments": ("payments", "payment_id", "updated_at"),
+}
+
 
 class RowRejected(ValueError):
     def __init__(self, field: str, message: str) -> None:
@@ -150,6 +175,20 @@ class ImportSummary:
     rejected: int = 0
     rejected_rows: list[RejectedRow] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TransitionPlan:
+    event_type: str
+    entity_type: str
+    entity_id: str
+    table: str
+    pk_column: str
+    state_column: str
+    new_state: str
+    payload: dict[str, Any]
+    rails_trade_id: str | None
+    idempotency_key: str
 
 
 def format_import_summary(summary: ImportSummary) -> str:
@@ -199,6 +238,7 @@ class CsvImporter:
         # Ensure schema exists before processing rows.
         self.repo.init_db(self.config)
         summary = ImportSummary(file_path=str(file_path))
+        file_hash = self._sha256_file(file_path)
 
         with file_path.open("r", encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -213,67 +253,195 @@ class CsvImporter:
                     f"Unrecognized columns ignored: {', '.join(sorted(unknown_columns))}"
                 )
 
-            conn = self.repo._connect()
-            try:
-                for row_number, raw_row in enumerate(reader, start=2):
-                    row = self._normalize_row(raw_row)
-                    if self._is_blank_row(row):
-                        continue
-                    summary.total_rows += 1
-                    conn.execute("BEGIN")
-                    try:
-                        self._import_one_row(conn, import_type=normalized_type, row=row)
-                    except RowDuplicate:
-                        conn.execute("ROLLBACK")
+            for row_number, raw_row in enumerate(reader, start=1):
+                csv_line_number = row_number + 1
+                row = self._normalize_row(raw_row)
+                if self._is_blank_row(row):
+                    continue
+                summary.total_rows += 1
+
+                try:
+                    plan = self._plan_transition(
+                        import_type=normalized_type,
+                        row=row,
+                        row_number=row_number,
+                        file_path=file_path,
+                        file_hash=file_hash,
+                    )
+                    outcome = self._process_transition_row(
+                        import_type=normalized_type,
+                        row=row,
+                        plan=plan,
+                    )
+                except RowDuplicate:
+                    summary.skipped_duplicates += 1
+                    continue
+                except RowRejected as exc:
+                    summary.rejected += 1
+                    summary.rejected_rows.append(
+                        RejectedRow(row_number=csv_line_number, field=exc.field, message=str(exc))
+                    )
+                    continue
+                except SchemaValidationError as exc:
+                    summary.rejected += 1
+                    summary.rejected_rows.append(
+                        RejectedRow(
+                            row_number=csv_line_number,
+                            field="event",
+                            message="; ".join(exc.errors),
+                        )
+                    )
+                    continue
+                except IdempotencyConflictError as exc:
+                    summary.rejected += 1
+                    summary.rejected_rows.append(
+                        RejectedRow(
+                            row_number=csv_line_number,
+                            field="idempotency_key",
+                            message=str(exc),
+                        )
+                    )
+                    continue
+                except sqlite3.IntegrityError as exc:
+                    message = str(exc)
+                    if "UNIQUE constraint failed" in message:
                         summary.skipped_duplicates += 1
-                        continue
-                    except RowRejected as exc:
-                        conn.execute("ROLLBACK")
-                        summary.rejected += 1
-                        summary.rejected_rows.append(
-                            RejectedRow(row_number=row_number, field=exc.field, message=str(exc))
-                        )
-                        continue
-                    except sqlite3.IntegrityError as exc:
-                        conn.execute("ROLLBACK")
-                        message = str(exc)
-                        if "UNIQUE constraint failed" in message:
-                            summary.skipped_duplicates += 1
-                        else:
-                            summary.rejected += 1
-                            summary.rejected_rows.append(
-                                RejectedRow(row_number=row_number, field="row", message=message)
-                            )
-                        continue
-                    except Exception as exc:
-                        conn.execute("ROLLBACK")
-                        summary.rejected += 1
-                        summary.rejected_rows.append(
-                            RejectedRow(row_number=row_number, field="row", message=str(exc))
-                        )
-                        continue
                     else:
-                        if self.dry_run:
-                            conn.execute("ROLLBACK")
-                        else:
-                            conn.execute("COMMIT")
-                        summary.imported += 1
-            finally:
-                conn.close()
+                        summary.rejected += 1
+                        summary.rejected_rows.append(
+                            RejectedRow(row_number=csv_line_number, field="row", message=message)
+                        )
+                    continue
+                except Exception as exc:
+                    summary.rejected += 1
+                    summary.rejected_rows.append(
+                        RejectedRow(row_number=csv_line_number, field="row", message=str(exc))
+                    )
+                    continue
+
+                if self.dry_run:
+                    summary.imported += 1
+                    summary.warnings.append(
+                        "Would create event "
+                        f"{plan.event_type} for {plan.entity_type}:{plan.entity_id} "
+                        f"with key {plan.idempotency_key}"
+                    )
+                elif outcome == "dedup":
+                    summary.skipped_duplicates += 1
+                else:
+                    summary.imported += 1
         return summary
 
-    def _import_one_row(self, conn: sqlite3.Connection, *, import_type: str, row: dict[str, str]) -> None:
+    def _process_transition_row(
+        self,
+        *,
+        import_type: str,
+        row: dict[str, str],
+        plan: TransitionPlan,
+    ) -> str:
+        if self.dry_run:
+            self._validate_transition_plan(plan)
+            return "would_import"
+
+        try:
+            receipt = self._apply_transition(plan)
+        except ValueError as exc:
+            if "not found" not in str(exc):
+                raise
+            self._bootstrap_missing_entity(import_type=import_type, row=row, entity_id=plan.entity_id)
+            receipt = self._apply_transition(plan)
+
+        return "dedup" if bool(receipt.get("deduped")) else "imported"
+
+    def _apply_transition(self, plan: TransitionPlan) -> dict[str, Any]:
+        return self.repo.apply_transition(
+            event_type=plan.event_type,
+            entity_type=plan.entity_type,
+            entity_id=plan.entity_id,
+            payload=plan.payload,
+            table=plan.table,
+            pk_column=plan.pk_column,
+            state_column=plan.state_column,
+            new_state=plan.new_state,
+            idempotency_key=plan.idempotency_key,
+            rails_trade_id=plan.rails_trade_id,
+        )
+
+    def _validate_transition_plan(self, plan: TransitionPlan) -> None:
+        validator = getattr(self.repo, "_validator", None)
+        if validator is None:
+            raise RuntimeError("SQLiteRepo.init_db() must be called before transition validation")
+        result = validator.validate(plan.event_type, plan.payload)
+        if not result.valid:
+            raise SchemaValidationError(result.errors)
+
+    def _bootstrap_missing_entity(self, *, import_type: str, row: dict[str, str], entity_id: str) -> None:
+        conn = self.repo._connect()
+        try:
+            conn.execute("BEGIN")
+            self._import_one_row(conn, import_type=import_type, row=row, entity_id=entity_id)
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    def _plan_transition(
+        self,
+        *,
+        import_type: str,
+        row: dict[str, str],
+        row_number: int,
+        file_path: Path,
+        file_hash: str,
+    ) -> TransitionPlan:
+        entity_id = self._resolve_entity_id(import_type=import_type, row=row)
+        table, pk_column, state_column = TRANSITION_TARGETS[import_type]
+        return TransitionPlan(
+            event_type=EVENT_TYPE_MAP[import_type],
+            entity_type=ENTITY_TYPE_MAP[import_type],
+            entity_id=entity_id,
+            table=table,
+            pk_column=pk_column,
+            state_column=state_column,
+            new_state=self._resolve_new_state(import_type=import_type, row=row),
+            payload=self._build_event_payload(
+                import_type=import_type,
+                row=row,
+                row_number=row_number,
+                file_path=file_path,
+                file_hash=file_hash,
+                entity_id=entity_id,
+            ),
+            rails_trade_id=self._resolve_rails_trade_id(
+                import_type=import_type,
+                row=row,
+                entity_id=entity_id,
+            ),
+            idempotency_key=f"csv:{file_hash}:{row_number}",
+        )
+
+    def _import_one_row(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        import_type: str,
+        row: dict[str, str],
+        entity_id: str,
+    ) -> None:
         if import_type == "counterparties":
             self._import_counterparty(conn, row)
             return
         if import_type == "trades":
-            self._import_trade(conn, row)
+            self._import_trade(conn, row, contract_id=entity_id)
             return
         if import_type == "deliveries":
-            self._import_delivery(conn, row)
+            self._import_delivery(conn, row, delivery_id=entity_id)
             return
         if import_type == "payments":
-            self._import_payment(conn, row)
+            self._import_payment(conn, row, payment_id=entity_id)
             return
         raise ValueError(f"Unsupported import type: {import_type}")
 
@@ -309,12 +477,18 @@ class CsvImporter:
         self._insert_filtered(conn, "parties", payload)
         self._seen_party_ids.add(party_id)
 
-    def _import_trade(self, conn: sqlite3.Connection, row: dict[str, str]) -> None:
+    def _import_trade(
+        self,
+        conn: sqlite3.Connection,
+        row: dict[str, str],
+        *,
+        contract_id: str | None = None,
+    ) -> None:
         contract_ref = self._optional_text(row, "contract_ref") or self._optional_text(row, "lpo_no")
         if not contract_ref:
             raise RowRejected("contract_ref", "missing required field")
         lpo_no = self._optional_text(row, "lpo_no") or contract_ref
-        contract_id = self._optional_text(row, "contract_id") or new_ulid()
+        contract_id = contract_id or self._optional_text(row, "contract_id") or new_ulid()
         if contract_id in self._seen_contract_ids or self._exists(conn, "contracts", "contract_id", contract_id):
             raise RowDuplicate(f"contract_id duplicate: {contract_id}")
         contract_ref_key = (contract_ref, lpo_no)
@@ -442,8 +616,14 @@ class CsvImporter:
         self._seen_contract_ids.add(contract_id)
         self._seen_contract_refs.add(contract_ref_key)
 
-    def _import_delivery(self, conn: sqlite3.Connection, row: dict[str, str]) -> None:
-        delivery_id = self._optional_text(row, "delivery_id") or new_ulid()
+    def _import_delivery(
+        self,
+        conn: sqlite3.Connection,
+        row: dict[str, str],
+        *,
+        delivery_id: str | None = None,
+    ) -> None:
+        delivery_id = delivery_id or self._optional_text(row, "delivery_id") or new_ulid()
         if delivery_id in self._seen_delivery_ids or self._exists(conn, "deliveries", "delivery_id", delivery_id):
             raise RowDuplicate(f"delivery_id duplicate: {delivery_id}")
 
@@ -560,8 +740,14 @@ class CsvImporter:
         self._seen_delivery_ids.add(delivery_id)
         self._seen_delivery_batch_keys.add(batch_key)
 
-    def _import_payment(self, conn: sqlite3.Connection, row: dict[str, str]) -> None:
-        payment_id = self._optional_text(row, "payment_id") or new_ulid()
+    def _import_payment(
+        self,
+        conn: sqlite3.Connection,
+        row: dict[str, str],
+        *,
+        payment_id: str | None = None,
+    ) -> None:
+        payment_id = payment_id or self._optional_text(row, "payment_id") or new_ulid()
         if payment_id in self._seen_payment_ids or self._exists(conn, "payments", "payment_id", payment_id):
             raise RowDuplicate(f"payment_id duplicate: {payment_id}")
 
@@ -628,6 +814,170 @@ class CsvImporter:
         self._seen_payment_ids.add(payment_id)
         self._seen_payment_idempotency.add(idempotency_key)
         self._seen_payment_receipts.add(receipt_no)
+
+    def _resolve_entity_id(self, *, import_type: str, row: dict[str, str]) -> str:
+        if import_type == "counterparties":
+            return self._required_text(row, "party_id")
+
+        if import_type == "trades":
+            contract_id = self._optional_text(row, "contract_id")
+            if contract_id:
+                return contract_id
+            contract_ref = self._optional_text(row, "contract_ref") or self._optional_text(row, "lpo_no")
+            lpo_no = self._optional_text(row, "lpo_no") or contract_ref
+            if contract_ref:
+                conn = self.repo._connect()
+                try:
+                    existing = conn.execute(
+                        "SELECT contract_id FROM contracts WHERE contract_ref = ? AND lpo_no = ? LIMIT 1",
+                        (contract_ref, lpo_no),
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if existing:
+                    return str(existing["contract_id"])
+            return new_ulid()
+
+        if import_type == "deliveries":
+            delivery_id = self._optional_text(row, "delivery_id")
+            if delivery_id:
+                return delivery_id
+            contract_id = self._optional_text(row, "contract_id")
+            run_id = self._optional_text(row, "run_id")
+            batch_id = self._optional_text(row, "batch_id")
+            if contract_id and run_id and batch_id:
+                conn = self.repo._connect()
+                try:
+                    existing = conn.execute(
+                        "SELECT delivery_id FROM deliveries WHERE contract_id = ? AND run_id = ? AND batch_id = ? LIMIT 1",
+                        (contract_id, run_id, batch_id),
+                    ).fetchone()
+                finally:
+                    conn.close()
+                if existing:
+                    return str(existing["delivery_id"])
+            return new_ulid()
+
+        if import_type == "payments":
+            return self._optional_text(row, "payment_id") or new_ulid()
+
+        raise ValueError(f"Unsupported import type: {import_type}")
+
+    def _resolve_new_state(self, *, import_type: str, row: dict[str, str]) -> str:
+        if import_type == "trades":
+            return "OPEN"
+        if import_type == "deliveries":
+            return (self._optional_text(row, "status") or "DISPATCHED").upper()
+        if import_type in {"counterparties", "payments"}:
+            return utc_now_iso_z()
+        raise ValueError(f"Unsupported import type: {import_type}")
+
+    def _resolve_rails_trade_id(
+        self,
+        *,
+        import_type: str,
+        row: dict[str, str],
+        entity_id: str,
+    ) -> str | None:
+        if import_type == "trades":
+            return entity_id
+        if import_type == "deliveries":
+            return self._optional_text(row, "contract_id") or None
+        return None
+
+    def _build_event_payload(
+        self,
+        *,
+        import_type: str,
+        row: dict[str, str],
+        row_number: int,
+        file_path: Path,
+        file_hash: str,
+        entity_id: str,
+    ) -> dict[str, Any]:
+        source = {
+            "source_system": "csv_import",
+            "source_ref": f"{file_path}:{row_number}",
+            "source_file_hash": file_hash,
+        }
+        csv_row = {key: value for key, value in row.items() if str(value or "").strip()}
+
+        if import_type == "trades":
+            contract_ref = self._optional_text(row, "contract_ref") or self._optional_text(row, "lpo_no")
+            lpo_no = self._optional_text(row, "lpo_no") or contract_ref
+            operator_default = str(self.config.system_profile.operator_entity_id or "guildgate").strip() or "guildgate"
+            operator_id = self._optional_text(row, "operator_id") or operator_default
+            payment_terms = self._optional_text(row, "due_terms") or "unspecified"
+            delivery_term = self._optional_text(row, "delivery_term") or "road_delivery"
+            delivery_location = self._optional_text(row, "delivery_location") or (contract_ref or "unspecified")
+            return {
+                "trade_id": self._stable_uuid(f"trade:{contract_ref}:{lpo_no}"),
+                "payload": {
+                    "actor_org_id": self._stable_uuid(f"actor:{operator_id}"),
+                    "payment_terms": payment_terms,
+                    "delivery_term": delivery_term,
+                    "delivery_location": delivery_location,
+                    "contract_ref": contract_ref,
+                    "lpo_no": lpo_no,
+                    "csv_row": csv_row,
+                },
+                **source,
+            }
+
+        if import_type == "deliveries":
+            contract_id = self._required_text(row, "contract_id")
+            shipment_seed = self._optional_text(row, "delivery_id") or entity_id
+            nested_payload: dict[str, Any] = {
+                "shipment_id": self._stable_uuid(f"shipment:{shipment_seed}"),
+                "run_id": self._optional_text(row, "run_id"),
+                "batch_id": self._optional_text(row, "batch_id"),
+                "delivery_ref": self._optional_text(row, "delivery_ref"),
+                "status": self._optional_text(row, "status") or "DISPATCHED",
+                "csv_row": csv_row,
+            }
+            procurement_doc_ref = self._optional_text(row, "procurement_doc_ref")
+            if procurement_doc_ref:
+                nested_payload["evidence_urls"] = [procurement_doc_ref]
+            return {
+                "trade_id": self._stable_uuid(f"trade:{contract_id}"),
+                "payload": nested_payload,
+                **source,
+            }
+
+        if import_type == "counterparties":
+            return {
+                "counterparty_id": self._required_text(row, "party_id"),
+                "legal_name": self._required_text(row, "legal_name"),
+                "payload": {"csv_row": csv_row},
+                **source,
+            }
+
+        if import_type == "payments":
+            return {
+                "payment_id": self._optional_text(row, "payment_id") or entity_id,
+                "vendor_of_record_id": self._required_text(row, "vendor_of_record_id"),
+                "buyer_id": self._required_text(row, "buyer_id"),
+                "amount_received": self._optional_text(row, "amount_received"),
+                "payment_date": self._optional_text(row, "payment_date"),
+                "payload": {
+                    "receipt_no": self._optional_text(row, "receipt_no"),
+                    "payment_row_idempotency": self._optional_text(row, "idempotency_key"),
+                    "csv_row": csv_row,
+                },
+                **source,
+            }
+
+        raise ValueError(f"Unsupported import type: {import_type}")
+
+    def _stable_uuid(self, seed: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"pilot-csv:{seed}"))
+
+    def _sha256_file(self, file_path: Path) -> str:
+        digest = hashlib.sha256()
+        with file_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _normalize_row(self, row: dict[str, Any]) -> dict[str, str]:
         cleaned: dict[str, str] = {}
