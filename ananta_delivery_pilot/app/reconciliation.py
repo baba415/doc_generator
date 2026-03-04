@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
-from adapters.sqlite_repo import SQLiteRepo
-from core.config import RuntimeConfig
 from core.time import utc_now_iso_z
 
 
@@ -160,6 +159,33 @@ def _load_payments(conn: Any) -> list[PaymentRecord]:
     return payments
 
 
+def _open_readonly_db(db_path: Path) -> sqlite3.Connection:
+    if not db_path.exists():
+        raise FileNotFoundError(
+            f"Error: database not found at {db_path}\n"
+            "Run the merchant pilot first to create the database."
+        )
+    # Open in read-only mode to guarantee reconciliation cannot mutate truth tables.
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _ensure_reconciliation_schema(conn: sqlite3.Connection) -> None:
+    required_tables = {"payments", "payment_allocations", "sales_transactions", "contracts"}
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall()
+    available = {str(row["name"]) for row in rows}
+    missing = sorted(required_tables - available)
+    if missing:
+        raise RuntimeError(
+            "Reconciliation schema not ready. Missing table(s): "
+            + ", ".join(missing)
+            + ". Run the merchant pilot setup first."
+        )
+
+
 def _choose_best_candidate(payment: PaymentRecord, candidates: list[int], bank_entries: list[BankEntry]) -> int:
     return sorted(
         candidates,
@@ -210,10 +236,9 @@ def reconcile_weekly(
     dry_run: bool = False,
     db_path: Path | None = None,
 ) -> ReconciliationResult:
-    config = RuntimeConfig.load(root_dir)
-    repo = SQLiteRepo(db_path or (config.state_dir / "drep.sqlite"))
-    repo.init_db(config)
-    with repo._connect() as conn:  # noqa: SLF001
+    resolved_db_path = db_path or (root_dir / ".state" / "drep.sqlite")
+    with _open_readonly_db(resolved_db_path) as conn:
+        _ensure_reconciliation_schema(conn)
         payments = _load_payments(conn)
     bank_entries = _read_bank_statement(bank_statement_path)
 
@@ -306,4 +331,3 @@ def reconcile_weekly(
         ]
     )
     return ReconciliationResult(report=report, report_path=out_path, summary_text=summary)
-

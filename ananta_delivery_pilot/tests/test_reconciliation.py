@@ -64,6 +64,31 @@ class WeeklyReconciliationTests(unittest.TestCase):
                 ),
             )
 
+    def _snapshot_db_state(self) -> tuple[dict[str, int], dict[str, str | None]]:
+        counts: dict[str, int] = {}
+        updated_at_max: dict[str, str | None] = {}
+        with self.repo.transaction() as conn:
+            table_rows = conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name ASC
+                """
+            ).fetchall()
+            table_names = [str(row["name"]) for row in table_rows]
+            for table in table_names:
+                row = conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+                counts[table] = int(row["count"] if row else 0)
+                columns = {
+                    str(col["name"])
+                    for col in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if "updated_at" in columns:
+                    max_row = conn.execute(f"SELECT MAX(updated_at) AS max_updated_at FROM {table}").fetchone()
+                    updated_at_max[table] = str(max_row["max_updated_at"]) if max_row and max_row["max_updated_at"] else None
+        return counts, updated_at_max
+
     def test_perfect_match_all_payments_match(self) -> None:
         self._insert_payment(payment_id="PAY-001", payment_date="2026-03-01", amount_ngn=5_000_000.0, reference="REF-001")
         self._insert_payment(payment_id="PAY-002", payment_date="2026-03-02", amount_ngn=3_000_000.0, reference="REF-002")
@@ -184,7 +209,22 @@ class WeeklyReconciliationTests(unittest.TestCase):
         self.assertIn("Reconciliation: 2026-W17", result.summary_text)
         self.assertIn("Delta:      ₦0.00", result.summary_text)
 
+    def test_reconciliation_does_not_mutate_database(self) -> None:
+        self._insert_payment(payment_id="PAY-LOCK", payment_date="2026-03-01", amount_ngn=5_000_000.0, reference="REF-001")
+        counts_before, updated_before = self._snapshot_db_state()
+
+        result = reconcile_weekly(
+            root_dir=self.temp_dir,
+            bank_statement_path=self._fixture("bank_perfect.csv"),
+            week="2026-W18",
+            dry_run=True,
+        )
+
+        counts_after, updated_after = self._snapshot_db_state()
+        self.assertEqual(counts_before, counts_after)
+        self.assertEqual(updated_before, updated_after)
+        self.assertEqual(1, result.report["matched_count"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
