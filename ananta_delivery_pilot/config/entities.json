@@ -114,6 +114,71 @@
       "aliases": [
         "ISLAMIC BANK NODE"
       ]
+    },
+    "buyer_vegoil_trading": {
+      "code": "VTC",
+      "legal_name": "VegOil Trading Co",
+      "address": "Apapa, Lagos",
+      "city_state_country": "Lagos State, Nigeria",
+      "_note": "Placeholder — for testing only. Not a live pilot customer.",
+      "aliases": [
+        "VEGOIL TRADING",
+        "VEGOIL TRADING CO"
+      ]
+    },
+    "buyer_lagos_foods": {
+      "code": "LFL",
+      "legal_name": "Lagos Foods Ltd",
+      "address": "Apapa, Lagos",
+      "city_state_country": "Lagos State, Nigeria",
+      "_note": "Placeholder — for testing only. Not a live pilot customer.",
+      "aliases": [
+        "LAGOS FOODS",
+        "LAGOS FOODS LTD"
+      ]
+    },
+    "buyer_delta_edibles": {
+      "code": "DEL",
+      "legal_name": "Delta Edibles",
+      "address": "Warri, Delta State",
+      "city_state_country": "Delta State, Nigeria",
+      "_note": "Placeholder — for testing only. Not a live pilot customer.",
+      "aliases": [
+        "DELTA EDIBLES"
+      ]
+    },
+    "seller_palm_industries": {
+      "code": "PIP",
+      "legal_name": "Palm Industries Plc",
+      "address": "Benin City, Edo State",
+      "city_state_country": "Edo State, Nigeria",
+      "_note": "Placeholder — for testing only. Not a live pilot customer.",
+      "aliases": [
+        "PALM INDUSTRIES",
+        "PALM INDUSTRIES PLC"
+      ]
+    },
+    "seller_okomu_oil_palm": {
+      "code": "OKO",
+      "legal_name": "Okomu Oil Palm Company Plc",
+      "address": "Sapele Road, Benin City",
+      "city_state_country": "Edo State, Nigeria",
+      "_note": "Placeholder — for testing only. Not a live pilot customer.",
+      "aliases": [
+        "OKOMU OIL PALM",
+        "OKOMU OIL PALM PLC"
+      ]
+    },
+    "seller_presco": {
+      "code": "PRS",
+      "legal_name": "Presco Plc",
+      "address": "Sapele, Delta State",
+      "city_state_country": "Delta State, Nigeria",
+      "_note": "Placeholder — for testing only. Not a live pilot customer.",
+      "aliases": [
+        "PRESCO",
+        "PRESCO PLC"
+      ]
     }
   }
 }

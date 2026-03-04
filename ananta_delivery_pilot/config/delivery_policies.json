@@ -23,6 +23,10 @@
     "CPKO": {
       "delivery_mode": "bulk",
       "default_lot_mt": 30
+    },
+    "RBDSFNO": {
+      "delivery_mode": "bulk",
+      "default_lot_mt": 30
     }
   }
 }
