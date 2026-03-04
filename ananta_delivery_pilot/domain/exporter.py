@@ -47,6 +47,16 @@ _EVENT_ENTITY_LOOKUP: dict[str, tuple[str, str]] = {
 EXPORT_VERSION = "1.0.0"
 PILOT_NAME = "ananta-delivery-pilot"
 
+# Fix 2: proper singularization (rstrip("s") corrupts "counterparties" → "counterpartie")
+_SINGULAR_MAP: dict[str, str] = {
+    "trades":         "trade",
+    "deliveries":     "delivery",
+    "settlements":    "settlement",
+    "exceptions":     "exception",
+    "evidence":       "evidence",
+    "counterparties": "counterparty",
+}
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -159,7 +169,7 @@ def build_id_map(
                     "pilot_id": pilot_id,
                     "core_uuid": core_uuid,
                     "core_id": None,
-                    "entity_type": group.rstrip("s"),  # "trades" → "trade" etc.
+                    "entity_type": _SINGULAR_MAP.get(group, group),
                     "current_state": state,
                     "event_count": stats.get("event_count", 0),
                     "last_event_at": stats.get("last_event_at"),
@@ -388,8 +398,14 @@ def build_replay_readiness_report(
     by_type: dict[str, dict] = {}
     issues: list[dict] = []
 
+    # Stricter definition (same as build_event_manifest):
+    # replay-ready = in catalog AND schema_ok=1.
+    # Events not in catalog are NOT ready (counted as errors here, consistent
+    # with the events_not_catalog_matched bucket in the event manifest).
+    ready_count = 0
     for row in rows:
         etype = row.get("event_type", "UNKNOWN")
+        schema_ok = row.get("schema_ok", 1)
         entry = by_type.setdefault(etype, {"count": 0, "warnings": 0, "errors": 0})
         entry["count"] += 1
 
@@ -397,11 +413,16 @@ def build_replay_readiness_report(
         if spec is None:
             issues.append({"class": "UNKNOWN_FIELD", "event_type": etype,
                            "message": f"event_type={etype!r} not in core catalog"})
-            entry["warnings"] += 1
+            entry["errors"] += 1  # not-in-catalog = not replay-ready
+        elif not schema_ok:
+            issues.append({"class": "SCHEMA_INVALID", "event_type": etype,
+                           "message": f"schema_ok=0 for event_type={etype!r}"})
+            entry["errors"] += 1
+        else:
+            ready_count += 1
 
     total_errors = sum(e["errors"] for e in by_type.values())
     total_warnings = sum(e["warnings"] for e in by_type.values())
-    ready_count = total - total_errors
     readiness_pct = round(ready_count / max(total, 1) * 100.0, 1) if total > 0 else 100.0
 
     return {
@@ -429,7 +450,15 @@ def build_manifest_metadata(
     replay_report: dict,
     file_hashes: dict[str, str],
 ) -> dict[str, Any]:
-    """Build manifest_metadata.json content."""
+    """Build manifest_metadata.json content.
+
+    manifest_metadata.json is the trust root of the export package.
+    It contains SHA-256 hashes of the other three files but cannot
+    contain its own hash (a file cannot hash itself). Core verifies
+    the other files against this document; this document's integrity
+    is established by the export channel (e.g. signed delivery, S3
+    object ETag, or out-of-band checksum).
+    """
     total_entities = id_map["summary"]["total_entities"]
     total_events = event_manifest["total_events"]
     replay_readiness_pct = event_manifest["replay_summary"]["replay_readiness_pct"]
@@ -441,6 +470,9 @@ def build_manifest_metadata(
         "pilot_name": PILOT_NAME,
         "core_requirements_ref": id_map.get("core_requirements_ref", ""),
         "core_requirements_hash": id_map.get("core_requirements_hash", ""),
+        # manifest_metadata.json is the trust root — it cannot self-hash.
+        # Its integrity is established by the export delivery channel.
+        "note": "manifest_metadata.json is the trust root and does not self-hash",
         "files": [
             {"name": name, "sha256": sha}
             for name, sha in file_hashes.items()
