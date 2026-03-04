@@ -5,11 +5,39 @@ import argparse
 import sys
 from pathlib import Path
 
+# TODO(Phase-1C): Migrate this script to the evented ingestion path.
+# Currently writes directly to SQLite tables without event_log entries.
+# After Phase 1C merges, all imports must go through apply_transition()
+# or apply_prep_evidence() to ensure schema validation, content hashing,
+# idempotency, and replay readiness.
+# See: ananta-ops/ANANTA_BUILD_ROADMAP_V3_5.md → Phase 1C → Atomic Coupling
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.csv_import import SUPPORTED_IMPORT_TYPES, format_import_summary, run_csv_import
+
+
+def _print_pre_event_warning() -> None:
+    warning = """
+╔══════════════════════════════════════════════════════════════════════╗
+║  ⚠️  WARNING: PRE-EVENT-LEDGER MODE                                ║
+║                                                                      ║
+║  This script writes directly to SQLite WITHOUT creating events       ║
+║  in the event_log. Imported data will NOT have:                      ║
+║    - Content hashes                                                  ║
+║    - Schema validation                                               ║
+║    - Idempotency protection                                          ║
+║    - Replay readiness                                                ║
+║                                                                      ║
+║  After Phase 1C merges, this script MUST be migrated to use the      ║
+║  evented ingestion path (apply_transition / apply_prep_evidence).    ║
+║                                                                      ║
+║  Do NOT use this as the production ingestion path.                   ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+    print(warning, file=sys.stderr)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _print_pre_event_warning()
     parser = build_parser()
     args = parser.parse_args(argv)
     file_path = Path(args.file).expanduser().resolve()
