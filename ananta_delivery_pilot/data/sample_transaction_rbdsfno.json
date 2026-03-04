@@ -1,0 +1,90 @@
+{
+  "invoice_date": "2026-03-04",
+  "due_date": "2026-03-18",
+  "currency": "NGN",
+  "payment_terms": "14 days",
+  "lpo_no": "TEST-RBDSFNO-001",
+  "lpo_date": "2026-03-01",
+  "mode": "normal_trade",
+  "funding_mode": "none",
+  "agreement_ref": "GGV-SUPPLY-2026-SFN-001",
+  "order_type": "Raw Materials",
+  "order_sub_type": "Refined Oil",
+  "product_name": "Refined Bleached Deodorized Sunflower Oil",
+  "product_code": "RBDSFNO",
+  "material_identification_code": "BCRSFNOST01",
+  "batch_id": "AFL-RBDSFNO-20260304-01",
+  "run_id": "RUN-RBDSFNO-20260304-01",
+  "manufacture_date": "2026-03-04",
+  "expiry_date": "2027-03-03",
+  "delivery_terms": "DAP",
+  "packaging": "Bulk",
+  "truck_no": "TEST-TRUCK-001",
+  "driver_name": "Test Driver",
+  "driver_phone": "08000000001",
+  "buyer_id": "buyer_vegoil_trading",
+  "processor_id": "processor_partner_refinery",
+  "vendor_of_record_id": "guildgate",
+  "source_id": "ananta_flows",
+  "buyer": {
+    "name": "VegOil Trading Co",
+    "address": "Apapa, Lagos",
+    "contact_person": "Test Contact"
+  },
+  "ship_to": {
+    "name": "VegOil Trading Co",
+    "address": "Apapa, Lagos",
+    "contact_person": "Test Contact"
+  },
+  "processor": {
+    "name": "Partner Refinery Ltd",
+    "address": "Ibadan, Oyo State",
+    "contact_person": "Operations Team"
+  },
+  "line_items": [
+    {
+      "description": "RBDSFNO supply — Refined Bleached Deodorized Sunflower Oil",
+      "quantity": 30000,
+      "unit": "kgs",
+      "unit_price": 2500,
+      "amount": 75000000,
+      "tax_class": "agri_input"
+    }
+  ],
+  "transport_charges": 0,
+  "installation_charges": 0,
+  "vat_rate": 0,
+  "discount": 0,
+  "wht_rate": 0,
+  "wht_applicable": false,
+  "vat_exemption_reason": "Configured as exempt supply class for pilot. Validate with finance.",
+  "wht_exemption_reason": "Marked not applicable by transaction rule.",
+  "notes": "Placeholder test transaction for RBDSFNO (Sunflower Oil). Not a live trade.",
+  "quality_parameters": [
+    {
+      "parameter": "Free Fatty Acid",
+      "standard": "0.10% max",
+      "result": ""
+    },
+    {
+      "parameter": "Moisture & Impurities",
+      "standard": "0.10% max",
+      "result": ""
+    },
+    {
+      "parameter": "Iodine Value",
+      "standard": "118 - 141",
+      "result": ""
+    },
+    {
+      "parameter": "Color (Lovibond 5.25\")",
+      "standard": "1.5 Red max",
+      "result": ""
+    },
+    {
+      "parameter": "Peroxide Value",
+      "standard": "10 meq/kg max",
+      "result": ""
+    }
+  ]
+}
