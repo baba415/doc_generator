@@ -1,0 +1,3 @@
+date,reference,description,amount_ngn,type
+2026-03-01,REF-SAMPLE-001,"Sample inbound transfer",5000000.00,credit
+2026-03-02,REF-SAMPLE-002,"Sample outbound transfer",-1200000.00,debit
