@@ -1,0 +1,331 @@
+{
+  "version": "0.1.0",
+  "core_requirements_ref": "b24d9ff3932b2c5e4fbbf796690aaec7f4d02021",
+  "core_event_requirements_hash": "55e485fddb9cd1d7ec6f435189b9450c38785b9e2b7782677d292bcbf6441a6c",
+  "extracted_from": {
+    "event_catalog": "src/app/api/events/eventCatalog.ts",
+    "route_handler": "src/app/api/events/route.ts",
+    "state_machine": "supabase/migrations/20260210120000_afr1_eventize_milestone_events.sql",
+    "shipment_create_rpc": "supabase/migrations/20260209113000_afr1_eventize_shipment_create_link.sql"
+  },
+  "event_types": {
+    "TERMS_SUBMITTED": {
+      "required_fields": ["trade_id", "payload.actor_org_id", "payload.payment_terms", "payload.delivery_term", "payload.delivery_location"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.actor_org_id": "uuid",
+        "payload.payment_terms": "non_empty_string",
+        "payload.delivery_term": "non_empty_string",
+        "payload.delivery_location": "non_empty_string"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER"] },
+      "state_prerequisites": ["trade.state = DRAFT", "trade.dispute_status != OPEN"],
+      "replay_obligations": [],
+      "pilot_alias": "DREP_CONTRACT_CREATED"
+    },
+    "BUYER_CONFIRMED": {
+      "required_fields": ["trade_id", "payload.actor_org_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.actor_org_id": "uuid"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER"] },
+      "state_prerequisites": ["trade.state = PENDING_CONFIRMATION", "trade.dispute_status != OPEN"],
+      "replay_obligations": ["TERMS_SUBMITTED or FINAL_TERMS_LOCKED"],
+      "pilot_alias": null
+    },
+    "SELLER_CONFIRMED": {
+      "required_fields": ["trade_id", "payload.actor_org_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.actor_org_id": "uuid"
+      },
+      "auth": { "allowed_roles": ["SELLER_MEMBER"] },
+      "state_prerequisites": ["trade.state = PENDING_CONFIRMATION", "trade.dispute_status != OPEN"],
+      "replay_obligations": ["TERMS_SUBMITTED or FINAL_TERMS_LOCKED"],
+      "pilot_alias": null
+    },
+    "CONTACT_INITIATED": {
+      "required_fields": ["trade_id"],
+      "field_formats": {
+        "trade_id": "uuid"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE", "TRADE_CREATOR"] },
+      "state_prerequisites": ["CURRENT_GAP: route catalog accepts but apply_trade_event currently rejects this type as invalid"],
+      "replay_obligations": [],
+      "pilot_alias": null
+    },
+    "NEGOTIATION_RETURNED_TO_DRAFT": {
+      "required_fields": ["trade_id", "payload.actor_org_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.actor_org_id": "uuid"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER"] },
+      "state_prerequisites": ["CURRENT_GAP: route catalog accepts but apply_trade_event currently rejects this type as invalid"],
+      "replay_obligations": ["(historical migration behavior) trade.state=PENDING_CONFIRMATION and no existing BUYER_CONFIRMED/SELLER_CONFIRMED events"],
+      "pilot_alias": null
+    },
+    "FINAL_TERMS_LOCKED": {
+      "required_fields": ["trade_id", "payload.actor_org_id", "payload.price", "payload.quantity", "payload.delivery_window"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.actor_org_id": "uuid",
+        "payload.price": "numeric_string_or_number",
+        "payload.quantity": "numeric_string_or_number",
+        "payload.delivery_window": "non_empty_string"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER"] },
+      "state_prerequisites": [
+        "trade.state = DRAFT",
+        "at least one prior TERMS_SUBMITTED event exists",
+        "if trade.commercial_round >= 3, at least one prior CONTACT_INITIATED event exists",
+        "trade.dispute_status != OPEN"
+      ],
+      "replay_obligations": ["TERMS_SUBMITTED", "CONTACT_INITIATED when commercial_round >= 3"],
+      "pilot_alias": null
+    },
+    "DISPUTE_OPENED": {
+      "required_fields": ["trade_id", "payload.reason"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.reason": "non_empty_string_max_1000"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE", "TRADE_CREATOR"] },
+      "state_prerequisites": ["trade.state in {PENDING_CONFIRMATION, PENDING_GATE_A, AUTHORIZED}", "trade.dispute_status != OPEN"],
+      "replay_obligations": [],
+      "pilot_alias": null
+    },
+    "DISPUTE_RESOLVED": {
+      "required_fields": ["trade_id"],
+      "field_formats": {
+        "trade_id": "uuid"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE", "TRADE_CREATOR"] },
+      "state_prerequisites": ["trade.dispute_status = OPEN"],
+      "replay_obligations": ["DISPUTE_OPENED"],
+      "pilot_alias": null
+    },
+    "GATE_A_AUTHORIZED": {
+      "required_fields": ["trade_id"],
+      "field_formats": {
+        "trade_id": "uuid"
+      },
+      "auth": { "allowed_roles": ["HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.state = PENDING_GATE_A", "trade.gate_a = PENDING", "trade.dispute_status != OPEN"],
+      "replay_obligations": ["BUYER_CONFIRMED", "SELLER_CONFIRMED"],
+      "pilot_alias": null
+    },
+    "HOLD_PLACED": {
+      "required_fields": ["trade_id", "payload.scope"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.scope": "literal_BLOCK_GATE_A"
+      },
+      "auth": { "allowed_roles": ["HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.state = PENDING_GATE_A", "trade.gate_a = PENDING", "trade.dispute_status != OPEN"],
+      "replay_obligations": ["BUYER_CONFIRMED", "SELLER_CONFIRMED"],
+      "pilot_alias": null
+    },
+    "HOLD_RELEASED": {
+      "required_fields": ["trade_id", "payload.scope"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.scope": "literal_BLOCK_GATE_A"
+      },
+      "auth": { "allowed_roles": ["HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.state = PENDING_GATE_A", "trade.gate_a = HELD", "trade.dispute_status != OPEN"],
+      "replay_obligations": ["HOLD_PLACED"],
+      "pilot_alias": null
+    },
+    "CONTRACT_CANCELLED": {
+      "required_fields": ["trade_id"],
+      "field_formats": {
+        "trade_id": "uuid"
+      },
+      "auth": { "allowed_roles": ["TRADE_CREATOR"] },
+      "state_prerequisites": [],
+      "replay_obligations": [],
+      "pilot_alias": "DREP_CONTRACT_CANCELLED"
+    },
+    "COVERAGE_INSTRUMENT_ATTACHED": {
+      "required_fields": ["trade_id", "payload.instrument_type", "payload.amount"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.instrument_type": "enum[RESERVE_ALLOCATION,BANK_GUARANTEE]",
+        "payload.amount": "numeric_string_or_number_gt_0",
+        "payload.status": "optional_enum[POSTED,ACTIVE]",
+        "payload.currency": "optional_non_empty_string",
+        "payload.expires_at": "optional_parseable_datetime"
+      },
+      "auth": { "allowed_roles": ["HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.dispute_status != OPEN"],
+      "replay_obligations": [],
+      "pilot_alias": null
+    },
+    "EVIDENCE_SUBMITTED": {
+      "required_fields": ["trade_id", "payload.scope", "payload.url_or_evidence_urls_or_shipment_contract"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.scope": "enum[TRADE,SHIPMENT] (defaults by payload)",
+        "payload.shipment_id": "required_uuid_v4_when_scope=SHIPMENT_or_when_input_is_shipment_scoped_alias",
+        "payload.milestone_type": "required_enum[CREATED,DISPATCHED,ARRIVED,ACCEPTED,REJECTED]_when_scope=SHIPMENT",
+        "payload.url": "required_non_empty_string_when_scope=TRADE_unless_evidence_urls[0] present",
+        "payload.evidence_urls": "optional_string_array"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE", "TRADE_CREATOR"] },
+      "state_prerequisites": [
+        "trade.dispute_status != OPEN",
+        "when scope=SHIPMENT: shipment_id must be linked to trade",
+        "when scope=TRADE: milestone (if provided) must be one of GATE_A, DELIVERY, PAYMENT, OTHER"
+      ],
+      "replay_obligations": ["SHIPMENT_CREATED for shipment-scoped evidence"],
+      "pilot_alias": "DREP_DELIVERY_PLAN_BUILT|DREP_DELIVERY_PLAN_UPDATED|DREP_DELIVERY_PLAN_APPROVED|DREP_COA_RECORDED|DREP_PROOF_PACK_GENERATED|DREP_SETTLEMENT_SUGGESTION_APPLIED|DREP_PAYMENT_RECORDED|DREP_CONTRACT_CLOSED|DREP_CONTRACT_STATE_REFRESHED|DREP_EXCEPTION_DECIDED|DREP_EXCEPTION_RESOLVED"
+    },
+    "EVIDENCE_ACCEPTED": {
+      "required_fields": ["trade_id", "payload.shipment_milestone_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_milestone_id": "uuid_v4"
+      },
+      "auth": { "allowed_roles": ["HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.dispute_status != OPEN", "shipment_milestone_id must be linked to trade", "evidence_verification must not already exist"],
+      "replay_obligations": ["EVIDENCE_SUBMITTED (SHIPMENT scope)"],
+      "pilot_alias": null
+    },
+    "EVIDENCE_REJECTED": {
+      "required_fields": ["trade_id", "payload.shipment_milestone_id", "payload.reason"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_milestone_id": "uuid_v4",
+        "payload.reason": "non_empty_string_max_1000"
+      },
+      "auth": { "allowed_roles": ["HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.dispute_status != OPEN", "shipment_milestone_id must be linked to trade", "evidence_verification must not already exist"],
+      "replay_obligations": ["EVIDENCE_SUBMITTED (SHIPMENT scope)"],
+      "pilot_alias": null
+    },
+    "SEAL_APPLIED": {
+      "required_fields": ["trade_id", "payload.shipment_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_id": "uuid_v4"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE", "TRADE_CREATOR"] },
+      "state_prerequisites": ["trade.dispute_status != OPEN", "shipment_id must be linked to trade"],
+      "replay_obligations": ["SHIPMENT_CREATED"],
+      "pilot_alias": null
+    },
+    "SEAL_VERIFIED": {
+      "required_fields": ["trade_id", "payload.shipment_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_id": "uuid_v4"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE", "TRADE_CREATOR"] },
+      "state_prerequisites": ["trade.dispute_status != OPEN", "shipment_id must be linked to trade"],
+      "replay_obligations": ["SHIPMENT_CREATED"],
+      "pilot_alias": null
+    },
+    "TANKER_PRECHECK_RECORDED": {
+      "required_fields": ["trade_id", "payload.shipment_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_id": "uuid_v4"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE", "TRADE_CREATOR"] },
+      "state_prerequisites": ["trade.dispute_status != OPEN", "shipment_id must be linked to trade"],
+      "replay_obligations": ["SHIPMENT_CREATED"],
+      "pilot_alias": null
+    },
+    "SEALS_RECORDED_AT_LOADING": {
+      "required_fields": ["trade_id", "payload.shipment_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_id": "uuid_v4"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE", "TRADE_CREATOR"] },
+      "state_prerequisites": ["trade.dispute_status != OPEN", "shipment_id must be linked to trade"],
+      "replay_obligations": ["SHIPMENT_CREATED"],
+      "pilot_alias": null
+    },
+    "SEALS_VERIFIED_AT_DELIVERY": {
+      "required_fields": ["trade_id", "payload.shipment_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_id": "uuid_v4"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE", "TRADE_CREATOR"] },
+      "state_prerequisites": ["trade.dispute_status != OPEN", "shipment_id must be linked to trade"],
+      "replay_obligations": ["SHIPMENT_CREATED"],
+      "pilot_alias": null
+    },
+    "SHIPMENT_CREATED": {
+      "required_fields": ["trade_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.driver_id": "optional_uuid_v4",
+        "payload.vehicle_id": "optional_uuid_v4",
+        "payload.logistics_partner_id": "optional_uuid_v4",
+        "payload.origin_location_id": "optional_uuid_v4",
+        "payload.destination_location_id": "optional_uuid_v4"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.state = AUTHORIZED", "caller must be buyer/seller member or house_finance"],
+      "replay_obligations": ["BUYER_CONFIRMED", "SELLER_CONFIRMED", "GATE_A_AUTHORIZED"],
+      "pilot_alias": "DREP_DELIVERY_MATERIALIZED"
+    },
+    "SHIPMENT_DISPATCHED": {
+      "required_fields": ["trade_id", "payload.shipment_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_id": "uuid_v4",
+        "payload.evidence_urls": "optional_non_empty_string_array",
+        "payload.gps_lat": "optional_numeric",
+        "payload.gps_lng": "optional_numeric"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.state = AUTHORIZED", "trade.dispute_status != OPEN", "shipment_id must be linked to trade"],
+      "replay_obligations": ["SHIPMENT_CREATED (link prerequisite); no strict prior milestone ordering in DB"],
+      "pilot_alias": "DREP_DELIVERY_DISPATCHED"
+    },
+    "SHIPMENT_ARRIVED": {
+      "required_fields": ["trade_id", "payload.shipment_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_id": "uuid_v4",
+        "payload.evidence_urls": "optional_non_empty_string_array",
+        "payload.gps_lat": "optional_numeric",
+        "payload.gps_lng": "optional_numeric"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.state = AUTHORIZED", "trade.dispute_status != OPEN", "shipment_id must be linked to trade"],
+      "replay_obligations": ["SHIPMENT_CREATED (link prerequisite); no strict prior milestone ordering in DB"],
+      "pilot_alias": "DREP_DELIVERY_DELIVERED"
+    },
+    "SHIPMENT_ACCEPTED": {
+      "required_fields": ["trade_id", "payload.shipment_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_id": "uuid_v4",
+        "payload.evidence_urls": "optional_non_empty_string_array"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.state = AUTHORIZED", "trade.dispute_status != OPEN", "shipment_id must be linked to trade"],
+      "replay_obligations": ["SHIPMENT_CREATED (link prerequisite); no strict prior milestone ordering in DB"],
+      "pilot_alias": null
+    },
+    "SHIPMENT_REJECTED": {
+      "required_fields": ["trade_id", "payload.shipment_id"],
+      "field_formats": {
+        "trade_id": "uuid",
+        "payload.shipment_id": "uuid_v4",
+        "payload.evidence_urls": "optional_non_empty_string_array"
+      },
+      "auth": { "allowed_roles": ["BUYER_MEMBER", "SELLER_MEMBER", "HOUSE_FINANCE"] },
+      "state_prerequisites": ["trade.state = AUTHORIZED", "trade.dispute_status != OPEN", "shipment_id must be linked to trade"],
+      "replay_obligations": ["SHIPMENT_CREATED (link prerequisite); no strict prior milestone ordering in DB"],
+      "pilot_alias": null
+    }
+  }
+}
