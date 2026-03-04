@@ -1,0 +1,3 @@
+vendor_of_record_id,buyer_id,payment_date,amount_received,currency,payment_method,idempotency_key,receipt_no,external_reference
+ananta_flows,buyer_nycil,2026-03-10,100000,NGN,Bank Transfer,PAY-CSV-001,RCPT-CSV-001,EXT-CSV-001
+ananta_flows,buyer_nycil,2026-03-10,100000,NGN,Bank Transfer,PAY-CSV-001,RCPT-CSV-001,EXT-CSV-001-DUP

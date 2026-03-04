@@ -1,0 +1,5 @@
+contract_ref,lpo_no,buyer_id,vendor_of_record_id,operator_id,issue_date,due_date,product_code,description,expected_qty,unit,unit_price
+LPO-MIX-001,MIX-001,buyer_nycil,ananta_flows,guildgate,2026-03-03,2026-03-16,RBDSO,Good row one,20000,kgs,2200
+LPO-MIX-002,MIX-002,buyer_nycil,ananta_flows,guildgate,2026-03-03,2026-03-16,RBDSO,Bad qty row,-5,kgs,2200
+LPO-MIX-003,MIX-003,buyer_unknown,ananta_flows,guildgate,2026-03-03,2026-03-16,RBDSO,Unknown buyer row,10000,kgs,2200
+LPO-MIX-004,MIX-004,buyer_nycil,guildgate,guildgate,2026-03-03,2026-03-16,RBDSO,Good row two,12000,kgs,2250
