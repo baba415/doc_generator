@@ -379,7 +379,7 @@ def _extract_key_values(text: str) -> dict[str, Any]:
     payload.setdefault("lpo_no", _regex_pick(text, r"\b(?:LPO|PO)\s*(?:NO|NUMBER|#)?\s*[:\-]?\s*([A-Z0-9\-\/]+)"))
     payload.setdefault("buyer_name", _regex_pick(text, r"\bBUYER\s*[:\-]?\s*([A-Z0-9 \-().,&]+)"))
     payload.setdefault("supplier_name", _regex_pick(text, r"\b(?:SUPPLIER|VENDOR)\s*[:\-]?\s*([A-Z0-9 \-().,&]+)"))
-    payload.setdefault("product_code", _regex_pick(text, r"\b(RBDPO|RBDPKO|RBDSO|CPKO)\b"))
+    payload.setdefault("product_code", _regex_pick(text, r"\b(RBDPO|RBDPKO|RBDSO|RBDSFNO|CPKO)\b"))
     payload.setdefault("quantity", _regex_number(text, r"\bQTY(?:UANTITY)?\s*[:\-]?\s*([0-9,]+(?:\.[0-9]+)?)"))
     payload.setdefault("unit_price", _regex_number(text, r"\b(?:PRICE|RATE)\s*[:\-]?\s*(?:NGN|₦)?\s*([0-9,]+(?:\.[0-9]+)?)"))
     payload.setdefault("lpo_date", _regex_date(text))

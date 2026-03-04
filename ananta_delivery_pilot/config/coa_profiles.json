@@ -301,6 +301,102 @@
       }
     }
   },
+  "RBDPO": {
+    "coa_template_name": "Quality Control Certificate",
+    "coa_document_no": "GG/FGRMQC/SPEC/RPO/001",
+    "coa_version_no": "01",
+    "material_identification_code": "BCRPOST01",
+    "quality_parameters": [
+      {
+        "parameter": "Appearance",
+        "standard": "Clear and Bright",
+        "result": ""
+      },
+      {
+        "parameter": "Odour",
+        "standard": "Neutral",
+        "result": ""
+      },
+      {
+        "parameter": "Free Fatty Acid",
+        "standard": "0.10% max",
+        "result": ""
+      },
+      {
+        "parameter": "Moisture & Impurities",
+        "standard": "0.10% max",
+        "result": ""
+      },
+      {
+        "parameter": "Iodine Value",
+        "standard": "56 - 64",
+        "result": ""
+      },
+      {
+        "parameter": "Color (Lovibond 5.25\")",
+        "standard": "3.0 Red max",
+        "result": ""
+      },
+      {
+        "parameter": "Peroxide Value",
+        "standard": "10 meq/kg max",
+        "result": ""
+      },
+      {
+        "parameter": "Slip Melting Point",
+        "standard": "24°C max",
+        "result": ""
+      },
+      {
+        "parameter": "Cloud Point",
+        "standard": "10°C max",
+        "result": ""
+      }
+    ]
+  },
+  "RBDSFNO": {
+    "coa_template_name": "Quality Control Certificate",
+    "coa_document_no": "GG/FGRMQC/SPEC/RSFNO/001",
+    "coa_version_no": "01",
+    "material_identification_code": "BCRSFNOST01",
+    "quality_parameters": [
+      {
+        "parameter": "Appearance",
+        "standard": "Clear and Bright",
+        "result": ""
+      },
+      {
+        "parameter": "Odour",
+        "standard": "Neutral",
+        "result": ""
+      },
+      {
+        "parameter": "Free Fatty Acid",
+        "standard": "0.10% max",
+        "result": ""
+      },
+      {
+        "parameter": "Moisture & Impurities",
+        "standard": "0.10% max",
+        "result": ""
+      },
+      {
+        "parameter": "Iodine Value",
+        "standard": "118 - 141",
+        "result": ""
+      },
+      {
+        "parameter": "Color (Lovibond 5.25\")",
+        "standard": "1.5 Red max",
+        "result": ""
+      },
+      {
+        "parameter": "Peroxide Value",
+        "standard": "10 meq/kg max",
+        "result": ""
+      }
+    ]
+  },
   "RBDPKO": {
     "coa_template_name": "Quality Control Certificate",
     "coa_document_no": "GG/FGRMQC/SPEC/RPKO/001",
