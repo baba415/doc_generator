@@ -1,0 +1,2 @@
+contract_ref,lpo_no,buyer_id,vendor_of_record_id,operator_id,issue_date,due_date,product_code,description,expected_qty,unit,unit_price
+LPO-SAMPLE-001,SAMPLE-001,buyer_nycil,ananta_flows,guildgate,2026-03-01,2026-03-14,RBDSO,Sample CSV trade import row,30000,kgs,2270
