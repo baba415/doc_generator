@@ -32,12 +32,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _print_evented_mode_banner() -> None:
+    print("EVENTED MODE: All imports go through the event ledger.", file=sys.stderr)
+    print("  Contract: contracts/pilot_event_contract.md v0.1", file=sys.stderr)
+    print("  Idempotency: csv:{file_sha256}:{row_number}", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     file_path = Path(args.file).expanduser().resolve()
     root_dir = Path(args.root_dir).expanduser().resolve()
     db_path = Path(args.db_path).expanduser().resolve() if str(args.db_path).strip() else None
+    _print_evented_mode_banner()
 
     try:
         summary = run_csv_import(
