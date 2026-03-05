@@ -1123,6 +1123,45 @@ class TestEnrichment(unittest.TestCase):
         self.assertTrue(enrichment["skipped"])
         self.assertEqual(enrichment["reason"], "dedup_precheck")
 
+    # -------------------------------------------------------------------
+    # Test 26: API receipt includes validation_explanation when schema_ok=0
+    # -------------------------------------------------------------------
+    def test_26_receipt_includes_validation_explanation_on_schema_ok_0(self) -> None:
+        """Unknown event_type → schema_ok=0 → receipt includes validation_explanation."""
+        idem_key = "explain-api:unknown:{}".format(uuid.uuid4())
+        body = {
+            "work_item_id": self.enrich_id,
+            "action_type": "TRANSITION",
+            "event_type": "PILOT:UNKNOWN_TYPE",   # not in catalog → schema_ok=0
+            "new_state": "ACTIVE",
+            "payload": {"note": "test"},
+            "idempotency_key": idem_key,
+        }
+        resp = self.client.post("/api/v1/actions/apply", json=body, headers=self.headers)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+
+        self.assertEqual(data["schema_ok"], 0)
+        self.assertIn("validation_explanation", data)
+        exp = data["validation_explanation"]
+        self.assertEqual(exp["validator_version"], "validator_v1")
+        self.assertFalse(exp["catalog_matched"])
+        self.assertEqual(exp["schema_ok_reason"], "not_in_catalog")
+        self.assertIn("catalog_hash", exp)
+
+    # -------------------------------------------------------------------
+    # Test 27: API receipt omits validation_explanation when schema_ok=1
+    # -------------------------------------------------------------------
+    def test_27_receipt_omits_validation_explanation_on_schema_ok_1(self) -> None:
+        """Valid known event → schema_ok=1 → receipt has NO validation_explanation key."""
+        resp, data = self._apply(
+            self.enrich_id,
+            {"payload": {"delivery_term": "FOB", "delivery_location": "Lagos"}},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(data["schema_ok"], 1)
+        self.assertNotIn("validation_explanation", data)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -716,3 +716,208 @@ class Phase1CEventLedgerTests(unittest.TestCase):
         self.assertTrue(conflicts_path.exists())
         entries = [json.loads(line) for line in conflicts_path.read_text().splitlines() if line]
         self.assertTrue(any(e.get("idempotency_key") == key for e in entries))
+
+
+# ===========================================================================
+# Validator Explainability tests (tests 15–20)
+# ===========================================================================
+
+class ValidatorExplainabilityTests(unittest.TestCase):
+    """Tests for ValidationExplanation + event_validation_log (Part 1 & 2)."""
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parents[1]
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="explain-tests-"))
+        shutil.copytree(self.repo_root / "config", self.temp_dir / "config")
+        (self.temp_dir / ".state").mkdir(parents=True, exist_ok=True)
+        self.config = RuntimeConfig.load(self.temp_dir)
+        self.repo = SQLiteRepo(self.config.state_dir / "drep.sqlite")
+        self.repo.init_db(self.config)
+        self.validator = self.repo._validator
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _insert_contract(self) -> str:
+        contract_id = new_ulid()
+        now = utc_now_iso_z()
+        with self.repo.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO contracts(
+                    contract_id, contract_ref, lpo_no, lpo_date,
+                    buyer_id, vendor_of_record_id, operator_id,
+                    source_id, processor_id, lane, currency,
+                    issue_date, due_date, due_terms,
+                    expected_total_qty, expected_total_qty_kg,
+                    expected_total_value,
+                    lpo_state, created_at, updated_at
+                ) VALUES (
+                    ?, 'LPO-EXP-1', 'LPO-EXP-001', '2026-01-01',
+                    'buyer_nycil', 'ananta_flows', 'guildgate',
+                    'ananta_flows', 'processor_partner_refinery', 'B', 'NGN',
+                    '2026-01-01', '2026-03-01', '60 days',
+                    30000.0, 30000000, 68100000.0,
+                    'ACTIVE', ?, ?
+                )
+                """,
+                (contract_id, now, now),
+            )
+        return contract_id
+
+    # ------------------------------------------------------------------
+    # Test 15: Validator populates fields_missing for incomplete payload
+    # ------------------------------------------------------------------
+    def test_15_explanation_fields_missing(self) -> None:
+        """validate() with missing required fields → explanation.fields_missing non-empty."""
+        from domain.event_ledger import ValidationExplanation
+        result = self.validator.validate("TERMS_SUBMITTED", {})
+        self.assertFalse(result.valid)
+        self.assertIsNotNone(result.explanation)
+        exp = result.explanation
+        self.assertIsInstance(exp, ValidationExplanation)
+        self.assertGreater(len(exp.fields_missing), 0)
+        self.assertIn("trade_id", exp.fields_missing)
+        self.assertEqual(exp.schema_ok_reason, "missing_fields")
+        self.assertTrue(exp.catalog_matched)
+        self.assertEqual(exp.validator_version, "validator_v1")
+
+    # ------------------------------------------------------------------
+    # Test 16: Validator populates fields_invalid_format for bad UUID
+    # ------------------------------------------------------------------
+    def test_16_explanation_fields_invalid_format(self) -> None:
+        """validate() with non-UUID trade_id → explanation.fields_invalid_format populated."""
+        payload = {
+            "trade_id": "not-a-uuid",
+            "payload": {
+                "actor_org_id": str(uuid.uuid4()),
+                "payment_terms": "NET30",
+                "delivery_term": "DAP",
+                "delivery_location": "Lagos",
+            },
+        }
+        result = self.validator.validate("TERMS_SUBMITTED", payload)
+        self.assertFalse(result.valid)
+        exp = result.explanation
+        self.assertIsNotNone(exp)
+        self.assertGreater(len(exp.fields_invalid_format), 0)
+        field_names = [f["field"] for f in exp.fields_invalid_format]
+        self.assertIn("trade_id", field_names)
+        inv = next(f for f in exp.fields_invalid_format if f["field"] == "trade_id")
+        self.assertEqual(inv["expected"], "uuid")
+        self.assertEqual(inv["got"], "not-a-uuid")
+        self.assertEqual(exp.schema_ok_reason, "format_errors")
+
+    # ------------------------------------------------------------------
+    # Test 17: Validator populates fields_unexpected for extra fields
+    # ------------------------------------------------------------------
+    def test_17_explanation_fields_unexpected(self) -> None:
+        """Fields in payload not in catalog appear in explanation.fields_unexpected."""
+        payload = {
+            "trade_id": str(uuid.uuid4()),
+            "mystery_field": "unexpected_value",
+            "payload": {
+                "actor_org_id": str(uuid.uuid4()),
+                "payment_terms": "NET30",
+                "delivery_term": "DAP",
+                "delivery_location": "Lagos",
+            },
+        }
+        result = self.validator.validate("TERMS_SUBMITTED", payload)
+        exp = result.explanation
+        self.assertIsNotNone(exp)
+        self.assertIn("mystery_field", exp.fields_unexpected)
+
+    # ------------------------------------------------------------------
+    # Test 18: schema_ok=0 event has explanation in event_validation_log
+    # ------------------------------------------------------------------
+    def test_18_schema_ok_0_explanation_persisted(self) -> None:
+        """Unknown event_type → schema_ok=0 → explanation written to event_validation_log."""
+        contract_id = self._insert_contract()
+        result = self.repo.apply_transition(
+            event_type="PILOT:UNKNOWN_TYPE",   # not in catalog → schema_ok=0
+            entity_type="trade",
+            entity_id=contract_id,
+            payload={"note": "unknown"},
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=f"explain:unknown:{contract_id}",
+        )
+        event_id = result["event_id"]
+
+        # event_log must show schema_ok=0
+        conn = self.repo._connect()
+        try:
+            erow = conn.execute(
+                "SELECT schema_ok FROM event_log WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            vrow = conn.execute(
+                "SELECT validator_version, catalog_hash, explanation_json "
+                "FROM event_validation_log WHERE event_id = ?", (event_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(erow["schema_ok"], 0)
+        self.assertIsNotNone(vrow, "event_validation_log must have a row for schema_ok=0 event")
+        exp = json.loads(vrow["explanation_json"])
+        self.assertEqual(exp["schema_ok_reason"], "not_in_catalog")
+        self.assertFalse(exp["catalog_matched"])
+        self.assertEqual(vrow["validator_version"], "validator_v1")
+        self.assertIsNotNone(vrow["catalog_hash"])
+
+    # ------------------------------------------------------------------
+    # Test 19: schema_ok=1 event has NO row in event_validation_log
+    # ------------------------------------------------------------------
+    def test_19_schema_ok_1_no_validation_log(self) -> None:
+        """Valid event → schema_ok=1 → NO row written to event_validation_log."""
+        contract_id = self._insert_contract()
+        result = self.repo.apply_transition(
+            event_type="TERMS_SUBMITTED",
+            entity_type="trade",
+            entity_id=contract_id,
+            payload=_valid_terms_submitted_payload(),
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=f"explain:valid:{contract_id}",
+        )
+        event_id = result["event_id"]
+
+        conn = self.repo._connect()
+        try:
+            erow = conn.execute(
+                "SELECT schema_ok FROM event_log WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            vcount = conn.execute(
+                "SELECT COUNT(*) AS n FROM event_validation_log WHERE event_id = ?",
+                (event_id,)
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+        self.assertEqual(erow["schema_ok"], 1)
+        self.assertEqual(vcount, 0, "No event_validation_log row for schema_ok=1 events")
+
+    # ------------------------------------------------------------------
+    # Test 20: Explanation includes validator_version and catalog_hash
+    # ------------------------------------------------------------------
+    def test_20_explanation_includes_version_and_hash(self) -> None:
+        """ValidationExplanation always includes validator_version and catalog_hash."""
+        # Unknown type
+        result = self.validator.validate("UNKNOWN:TYPE", {})
+        exp = result.explanation
+        self.assertIsNotNone(exp)
+        self.assertEqual(exp.validator_version, "validator_v1")
+        self.assertIsNotNone(exp.catalog_hash)
+        self.assertNotEqual(exp.catalog_hash, "")
+
+        # Known type (valid payload)
+        result2 = self.validator.validate("TERMS_SUBMITTED", _valid_terms_submitted_payload())
+        exp2 = result2.explanation
+        self.assertIsNotNone(exp2)
+        self.assertEqual(exp2.validator_version, "validator_v1")
+        self.assertEqual(exp2.catalog_hash, exp.catalog_hash)  # same catalog

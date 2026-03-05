@@ -83,19 +83,29 @@ def _fetch_entity_row(repo, table: str, pk_column: str, entity_id: str) -> dict:
 def _build_receipt(
     repo, event_id: str, deduped: bool, meta: dict, new_state=None
 ) -> dict:
-    """Fetch event row and build full API receipt (§2.2 + enrichments)."""
+    """Fetch event row and build full API receipt (§2.2 + enrichments).
+
+    When schema_ok=0, also fetches validation_explanation from event_validation_log
+    and includes it in the receipt so callers can see exactly why validation failed.
+    """
     conn = repo._connect()
     try:
         row = conn.execute(
             "SELECT * FROM event_log WHERE event_id = ?", (event_id,)
         ).fetchone()
+        vrow = None
+        if row is not None and row["schema_ok"] == 0:
+            vrow = conn.execute(
+                "SELECT explanation_json FROM event_validation_log WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
     finally:
         conn.close()
 
     if row is None:
         raise ValueError(f"event_id {event_id!r} not found in event_log")
 
-    return {
+    receipt = {
         # §2.2 fields
         "event_id": row["event_id"],
         "event_type": row["event_type"],
@@ -117,6 +127,9 @@ def _build_receipt(
         "core_requirements_ref": meta["core_requirements_ref"],
         "core_event_requirements_hash": meta["core_event_requirements_hash"],
     }
+    if vrow is not None:
+        receipt["validation_explanation"] = _json.loads(vrow["explanation_json"])
+    return receipt
 
 
 @router.post("/api/v1/actions/apply")

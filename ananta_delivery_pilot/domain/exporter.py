@@ -18,6 +18,28 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
+# Unified replay-readiness definition (shared with proof_lite.py)
+# ---------------------------------------------------------------------------
+
+# Phase 1C merge date — events before this epoch may have weaker validation
+EPOCH_TIMESTAMP = "2026-03-04T00:00:00Z"
+
+
+def is_replay_ready(event_row: dict) -> bool:
+    """Single canonical definition of replay-readiness.
+
+    Used by BOTH build_replay_readiness_report (here) and proof_lite.py.
+    An event is replay-ready when:
+      - schema_ok=1 (passed catalog validation)
+      - validated_against_hash is not None (provenance recorded)
+    """
+    return (
+        event_row.get("schema_ok") == 1
+        and event_row.get("validated_against_hash") is not None
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entity table registry
 # ---------------------------------------------------------------------------
 
@@ -375,7 +397,7 @@ def build_replay_readiness_report(
             try:
                 raw = conn.execute(
                     "SELECT event_id, event_type, entity_type, entity_id, "
-                    "validated_against_ref, schema_ok "
+                    "validated_against_ref, validated_against_hash, schema_ok, created_at "
                     "FROM event_log"
                 ).fetchall()
                 rows = [dict(r) for r in raw]
@@ -395,17 +417,17 @@ def build_replay_readiness_report(
                 known_obligations.add(ob)
 
     total = len(rows)
+    post_epoch = [r for r in rows if (r.get("created_at") or "") >= EPOCH_TIMESTAMP]
     by_type: dict[str, dict] = {}
     issues: list[dict] = []
 
-    # Stricter definition (same as build_event_manifest):
-    # replay-ready = in catalog AND schema_ok=1.
-    # Events not in catalog are NOT ready (counted as errors here, consistent
-    # with the events_not_catalog_matched bucket in the event manifest).
-    ready_count = 0
+    # Unified definition: is_replay_ready() — schema_ok=1 AND validated_against_hash set.
+    # Not-in-catalog events are NOT ready (consistent with build_event_manifest).
+    ready_all = sum(1 for r in rows if is_replay_ready(r))
+    ready_post_epoch = sum(1 for r in post_epoch if is_replay_ready(r))
+
     for row in rows:
         etype = row.get("event_type", "UNKNOWN")
-        schema_ok = row.get("schema_ok", 1)
         entry = by_type.setdefault(etype, {"count": 0, "warnings": 0, "errors": 0})
         entry["count"] += 1
 
@@ -413,28 +435,34 @@ def build_replay_readiness_report(
         if spec is None:
             issues.append({"class": "UNKNOWN_FIELD", "event_type": etype,
                            "message": f"event_type={etype!r} not in core catalog"})
-            entry["errors"] += 1  # not-in-catalog = not replay-ready
-        elif not schema_ok:
-            issues.append({"class": "SCHEMA_INVALID", "event_type": etype,
-                           "message": f"schema_ok=0 for event_type={etype!r}"})
             entry["errors"] += 1
-        else:
-            ready_count += 1
+        elif not is_replay_ready(row):
+            issues.append({"class": "NOT_REPLAY_READY", "event_type": etype,
+                           "message": f"schema_ok=0 or missing validated_against_hash"})
+            entry["errors"] += 1
 
     total_errors = sum(e["errors"] for e in by_type.values())
     total_warnings = sum(e["warnings"] for e in by_type.values())
-    readiness_pct = round(ready_count / max(total, 1) * 100.0, 1) if total > 0 else 100.0
+    readiness_pct_all = round(ready_all / max(total, 1) * 100.0, 1) if total > 0 else 100.0
+    readiness_pct_post = round(
+        ready_post_epoch / max(len(post_epoch), 1) * 100.0, 1
+    ) if post_epoch else 100.0
 
     return {
         "generated_at": generated_at,
         "core_requirements_ref": ref,
         "core_requirements_hash": cat_hash,
         "total_events": total,
+        "post_epoch_events": len(post_epoch),
+        "epoch_timestamp": EPOCH_TIMESTAMP,
         "summary": {
             "replay_ready": total_errors == 0,
             "has_warnings": total_warnings > 0,
             "has_errors": total_errors > 0,
-            "replay_readiness_pct": readiness_pct,
+            "replay_readiness_pct": readiness_pct_all,
+            "replay_readiness_pct_post_epoch": readiness_pct_post,
+            "replay_ready_count": ready_all,
+            "replay_ready_post_epoch_count": ready_post_epoch,
         },
         "by_canonical_event_type": by_type,
         "issues": issues,
