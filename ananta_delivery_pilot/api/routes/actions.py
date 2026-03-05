@@ -219,6 +219,7 @@ async def apply_action(body: ApplyActionRequest, request: Request) -> dict:
                              new_state=receipt_new_state)
     if enrichment_report is not None:
         receipt["enrichment"] = {
+            "enrichment_version": enrichment_report.enrichment_version,
             "fields_added": enrichment_report.fields_added,
             "missing_after_enrichment": enrichment_report.missing_after_enrichment,
         }

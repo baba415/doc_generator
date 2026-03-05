@@ -20,6 +20,7 @@ from typing import Any, List
 @dataclass
 class EnrichmentReport:
     """What enrichment did — included in the receipt for auditability."""
+    enrichment_version: str = "enrich_v1"  # bump when enrichment logic changes
     fields_added: dict = field(default_factory=dict)
     # e.g., {"trade_id": "entity.core_uuid", "actor_org_id": "entity.operator_uuid"}
     missing_after_enrichment: list = field(default_factory=list)
@@ -71,9 +72,8 @@ def enrich_common_fields(payload: dict, entity_row: dict) -> tuple:
         if org_val:
             nested['actor_org_id'] = org_val
             added['actor_org_id'] = 'entity.{}'.format(src)
-        else:
-            nested['actor_org_id'] = 'ORG-PILOT-DEFAULT'
-            added['actor_org_id'] = 'default (no entity org found)'
+        # If no org found: leave missing — validator will reject (fail-closed).
+        # Do NOT invent a default like 'ORG-PILOT-DEFAULT' — that's not entity data.
         enriched['payload'] = nested
 
     return enriched, added
@@ -96,10 +96,10 @@ def enrich_event_specific_fields(
 
     if event_type == 'TERMS_SUBMITTED':
         nested = enriched.get('payload') if isinstance(enriched.get('payload'), dict) else {}
-        for field_name, entity_fields, default in [
-            ('payment_terms', ['payment_terms', 'due_terms'], 'NET30'),
-            ('delivery_term', ['delivery_term', 'incoterm'], 'FOB'),
-            ('delivery_location', ['delivery_location', 'destination'], 'Lagos'),
+        for field_name, entity_fields in [
+            ('payment_terms', ['payment_terms', 'due_terms']),
+            ('delivery_term', ['delivery_term', 'incoterm']),
+            ('delivery_location', ['delivery_location', 'destination']),
         ]:
             if field_name not in nested:
                 entity_val = _first_available(entity_row, entity_fields)
@@ -108,9 +108,8 @@ def enrich_event_specific_fields(
                     added[field_name] = 'entity.{}'.format(
                         _source_field(entity_row, entity_fields)
                     )
-                else:
-                    nested[field_name] = default
-                    added[field_name] = 'default ({})'.format(default)
+                # else: leave missing — validator will reject (fail-closed).
+                # Do NOT invent defaults like "NET30" — that's an assumption, not data.
         enriched['payload'] = nested
 
     elif event_type == 'SHIPMENT_DISPATCHED':

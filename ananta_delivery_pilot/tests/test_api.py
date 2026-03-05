@@ -771,16 +771,20 @@ class TestEnrichment(unittest.TestCase):
         return resp, resp.json()
 
     # -------------------------------------------------------------------
-    # Test 14: Minimal payload succeeds — enrichment fills required fields
+    # Test 14: Minimal payload succeeds — enrichment fills entity references
     # -------------------------------------------------------------------
     def test_14_minimal_payload_succeeds(self) -> None:
-        """POST with only {commodity: RBDPO} succeeds; enrichment fills trade_id,
-        actor_org_id, payment_terms, delivery_term, delivery_location."""
-        resp, data = self._apply(self.enrich_id, {"commodity": "RBDPO"})
+        """Caller provides only semantic data (delivery_term, delivery_location);
+        enrichment fills entity references: trade_id, actor_org_id, payment_terms."""
+        # Caller provides the 'what' (semantic terms); enrichment fills the 'who/which'
+        resp, data = self._apply(
+            self.enrich_id,
+            {"payload": {"delivery_term": "FOB", "delivery_location": "Lagos"}},
+        )
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(data["applied"])
         self.assertFalse(data["deduped"])
-        # Enrichment report shows fields were added
+        # Enrichment report shows entity references were added
         self.assertIn("enrichment", data)
         enrichment = data["enrichment"]
         self.assertIn("fields_added", enrichment)
@@ -792,7 +796,10 @@ class TestEnrichment(unittest.TestCase):
     # -------------------------------------------------------------------
     def test_15_trade_id_auto_populated_as_uuid(self) -> None:
         """trade_id in event_log matches entity's core_uuid (UUID format), not ULID."""
-        resp, data = self._apply(self.enrich_id, {"commodity": "RBDPO"})
+        resp, data = self._apply(
+            self.enrich_id,
+            {"payload": {"delivery_term": "FOB", "delivery_location": "Lagos"}},
+        )
         self.assertEqual(resp.status_code, 200, resp.text)
 
         # Fetch the event payload from event_log
@@ -857,12 +864,17 @@ class TestEnrichment(unittest.TestCase):
     # Test 17: Enrichment report included in receipt
     # -------------------------------------------------------------------
     def test_17_enrichment_report_in_receipt(self) -> None:
-        """Receipt includes enrichment.fields_added showing what was populated and from where."""
-        resp, data = self._apply(self.enrich_id, {})
+        """Receipt includes enrichment_version, fields_added, missing_after_enrichment."""
+        resp, data = self._apply(
+            self.enrich_id,
+            {"payload": {"delivery_term": "FOB", "delivery_location": "Lagos"}},
+        )
         self.assertEqual(resp.status_code, 200, resp.text)
 
         self.assertIn("enrichment", data)
         enrichment = data["enrichment"]
+        self.assertIn("enrichment_version", enrichment)
+        self.assertEqual(enrichment["enrichment_version"], "enrich_v1")
         self.assertIn("fields_added", enrichment)
         self.assertIn("missing_after_enrichment", enrichment)
         self.assertIsInstance(enrichment["fields_added"], dict)
@@ -880,8 +892,14 @@ class TestEnrichment(unittest.TestCase):
     # Test 18: schema_ok=1 after enrichment for TERMS_SUBMITTED
     # -------------------------------------------------------------------
     def test_18_schema_ok_1_after_enrichment(self) -> None:
-        """Enriched payload for TERMS_SUBMITTED passes full validation → schema_ok=1."""
-        resp, data = self._apply(self.enrich_id, {})
+        """Enriched payload for TERMS_SUBMITTED passes full validation → schema_ok=1.
+        Caller provides delivery_term + delivery_location (entity has no such field);
+        enrichment fills trade_id (core_uuid), actor_org_id (operator_uuid), payment_terms (due_terms).
+        """
+        resp, data = self._apply(
+            self.enrich_id,
+            {"payload": {"delivery_term": "FOB", "delivery_location": "Lagos"}},
+        )
         self.assertEqual(resp.status_code, 200, resp.text)
 
         # Verify schema_ok=1 in the event_log row
@@ -903,13 +921,17 @@ class TestEnrichment(unittest.TestCase):
     # Test 19: Fail-closed — validator rejects if enrichment can't fill all fields
     # -------------------------------------------------------------------
     def test_19_fail_closed_missing_fields(self) -> None:
-        """If entity has no core_uuid, trade_id enrichment falls back to ULID (not UUID)
-        → UUID validation fails → 422. Enrichment doesn't invent data it doesn't have."""
-        # plain_id contract has no core_uuid → trade_id enrichment gives ULID
-        resp, data = self._apply(self.plain_id, {})
+        """Empty payload for TERMS_SUBMITTED: enrichment fills trade_id, actor_org_id,
+        payment_terms — but cannot fill delivery_term or delivery_location (entity has
+        no such columns, no defaults used). Validator rejects → 422."""
+        # {} → enrichment fills what it can, leaves delivery_term + delivery_location missing
+        resp, data = self._apply(self.enrich_id, {})
         self.assertEqual(resp.status_code, 422, resp.text)
-        # Must be a schema validation error (not a generic error)
-        self.assertIn("errors", data.get("detail", {}))
+        detail = data.get("detail", {})
+        self.assertIn("errors", detail)
+        # Errors must mention the missing delivery fields
+        errors_str = str(detail["errors"])
+        self.assertIn("delivery_term", errors_str)
 
     # -------------------------------------------------------------------
     # Test 20: Enrichment doesn't break existing TRANSITION flow
@@ -950,8 +972,9 @@ class TestEnrichment(unittest.TestCase):
         self.assertTrue(data["applied"])
         self.assertFalse(data["deduped"])
         self.assertEqual(data["schema_ok"], 1)
-        # Enrichment report present but fields_added is empty (caller provided everything)
+        # Enrichment report present with version; fields_added empty (caller provided everything)
         self.assertIn("enrichment", data)
+        self.assertEqual(data["enrichment"]["enrichment_version"], "enrich_v1")
         self.assertNotIn("trade_id", data["enrichment"]["fields_added"])
         self.assertNotIn("actor_org_id", data["enrichment"]["fields_added"])
 
