@@ -7,6 +7,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from api.auth import verify_api_key
+from api.enrichment import (
+    build_enrichment_report,
+    enrich_common_fields,
+    enrich_event_specific_fields,
+)
 from api.models.requests import ApplyActionRequest
 
 router = APIRouter(dependencies=[Depends(verify_api_key)])
@@ -20,7 +25,7 @@ _ENTITY_MAP = {
 }
 
 
-def _resolve_entity(repo, work_item_id: str) -> tuple[str, str, str, str] | None:
+def _resolve_entity(repo, work_item_id: str) -> tuple:
     """Return (entity_type, table, pk_column, state_column) or None."""
     conn = repo._connect()
     try:
@@ -40,6 +45,36 @@ def _resolve_entity(repo, work_item_id: str) -> tuple[str, str, str, str] | None
     finally:
         conn.close()
     return None
+
+
+def _fetch_entity_row(repo, table: str, pk_column: str, entity_id: str) -> dict:
+    """Fetch the full entity row as a dict (column_name → value).
+
+    For contracts: joins with parties to include operator_uuid (UUID from core_uuid),
+    so enrichment can fill actor_org_id with a valid UUID.
+    """
+    conn = repo._connect()
+    try:
+        if table == "contracts":
+            cursor = conn.execute(
+                """
+                SELECT c.*, p.core_uuid AS operator_uuid
+                FROM contracts c
+                LEFT JOIN parties p ON p.party_id = c.operator_id
+                WHERE c.{} = ?
+                """.format(pk_column),
+                (entity_id,),
+            )
+        else:
+            cursor = conn.execute(
+                "SELECT * FROM {} WHERE {} = ?".format(table, pk_column),
+                (entity_id,),
+            )
+        columns = [desc[0] for desc in cursor.description]
+        row = cursor.fetchone()
+        return dict(zip(columns, row)) if row else {}
+    finally:
+        conn.close()
 
 
 def _build_receipt(
@@ -97,6 +132,21 @@ async def apply_action(body: ApplyActionRequest, request: Request) -> dict:
 
     entity_type, table, pk_column, state_column = resolved
 
+    # Fetch full entity row for enrichment
+    entity_row = _fetch_entity_row(repo, table, pk_column, body.work_item_id)
+
+    # Three-step enrichment (TRANSITION actions only)
+    enrichment_report = None
+    if body.action_type == "TRANSITION":
+        payload_after_common, common_added = enrich_common_fields(body.payload, entity_row)
+        payload_after_specific, specific_added = enrich_event_specific_fields(
+            payload_after_common, entity_row, body.event_type
+        )
+        enriched_payload = payload_after_specific
+        enrichment_report = build_enrichment_report(common_added, specific_added, missing=[])
+    else:
+        enriched_payload = body.payload
+
     try:
         if body.action_type == "TRANSITION":
             if body.new_state is None:
@@ -108,7 +158,7 @@ async def apply_action(body: ApplyActionRequest, request: Request) -> dict:
                 event_type=body.event_type,
                 entity_type=entity_type,
                 entity_id=body.work_item_id,
-                payload=body.payload,
+                payload=enriched_payload,
                 table=table,
                 pk_column=pk_column,
                 state_column=state_column,
@@ -165,5 +215,11 @@ async def apply_action(body: ApplyActionRequest, request: Request) -> dict:
         raise HTTPException(status_code=500, detail=str(exc))
 
     receipt_new_state = body.new_state if body.action_type == "TRANSITION" else None
-    return _build_receipt(repo, result["event_id"], result["deduped"], meta,
-                          new_state=receipt_new_state)
+    receipt = _build_receipt(repo, result["event_id"], result["deduped"], meta,
+                             new_state=receipt_new_state)
+    if enrichment_report is not None:
+        receipt["enrichment"] = {
+            "fields_added": enrichment_report.fields_added,
+            "missing_after_enrichment": enrichment_report.missing_after_enrichment,
+        }
+    return receipt

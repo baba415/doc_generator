@@ -645,5 +645,316 @@ class TestMerchantPilotAPI(unittest.TestCase):
         self.assertEqual(item["status"], "UNLINKED")
 
 
+
+# ---------------------------------------------------------------------------
+# Enrichment test helper
+# ---------------------------------------------------------------------------
+
+def _insert_enrichable_contract(repo) -> tuple:
+    """Insert a contract WITH core_uuid and an operator party WITH core_uuid.
+
+    Returns (contract_id, contract_core_uuid, operator_core_uuid).
+    These are needed so enrichment can fill trade_id and actor_org_id as UUIDs.
+    """
+    import uuid as uuid_module
+    from core.ids import new_ulid
+    from core.time import utc_now_iso_z
+
+    contract_id = new_ulid()
+    contract_uuid = str(uuid_module.uuid4())
+    operator_uuid = str(uuid_module.uuid4())
+    now = utc_now_iso_z()
+
+    with repo.transaction() as conn:
+        # Insert operator party with a valid UUID core_uuid
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO parties(
+                party_id, legal_name, aliases_json, created_at, updated_at, core_uuid
+            ) VALUES (?, ?, '[]', ?, ?, ?)
+            """,
+            ("enrich-test-operator", "Enrich Test Operator Ltd", now, now, operator_uuid),
+        )
+        # Insert contract with core_uuid and the enrichable operator
+        conn.execute(
+            """
+            INSERT INTO contracts(
+                contract_id, contract_ref, lpo_no, lpo_date,
+                buyer_id, vendor_of_record_id, operator_id,
+                source_id, processor_id, lane, currency,
+                issue_date, due_date, due_terms,
+                expected_total_qty, expected_total_qty_kg, expected_total_value,
+                lpo_state, created_at, updated_at, core_uuid
+            ) VALUES (
+                ?, 'LPO-ENRICH-TEST', 'LPO-ENR-001', '2026-01-01',
+                'buyer_nycil', 'ananta_flows', 'enrich-test-operator',
+                'ananta_flows', 'processor_partner_refinery', 'B', 'NGN',
+                '2026-01-01', '2026-03-01', 'NET30',
+                30000.0, 30000000, 68100000.0,
+                'ACTIVE', ?, ?, ?
+            )
+            """,
+            (contract_id, now, now, contract_uuid),
+        )
+    return contract_id, contract_uuid, operator_uuid
+
+
+class TestEnrichment(unittest.TestCase):
+    """7 enrichment tests covering auto-population of required fields from entity data."""
+
+    def setUp(self) -> None:
+        self.tmp_dir = Path(tempfile.mkdtemp(prefix="enrich-test-"))
+        config_dir = Path(__file__).resolve().parents[1] / "config"
+        db_path = self.tmp_dir / ".state" / "drep.sqlite"
+        (self.tmp_dir / ".state").mkdir(parents=True, exist_ok=True)
+        shutil.copytree(config_dir, self.tmp_dir / "config", dirs_exist_ok=True)
+
+        import os
+        os.environ["ANANTA_DB_PATH"] = str(db_path)
+        os.environ["ANANTA_EVIDENCE_DIR"] = str(self.tmp_dir / ".state" / "evidence")
+        os.environ["ANANTA_CONFIG_DIR"] = str(config_dir)
+        os.environ["ANANTA_API_KEY"] = "test-key"
+
+        import importlib
+        import api.config as api_config
+        import api.auth as api_auth
+        api_config.settings.db_path = str(db_path)
+        api_config.settings.evidence_dir = str(self.tmp_dir / ".state" / "evidence")
+        api_config.settings.config_dir = str(config_dir)
+        api_auth.API_KEY = "test-key"
+
+        from adapters.sqlite_repo import SQLiteRepo
+        from core.config import RuntimeConfig
+        cfg = RuntimeConfig.load(self.tmp_dir)
+        self.repo = SQLiteRepo(db_path)
+        self.repo.init_db(cfg)
+
+        import api.app as api_app
+        importlib.reload(api_app)
+        from domain.event_ledger import EnvelopeValidator
+        self.repo._validator = EnvelopeValidator(config_dir / "core_event_requirements.json")
+        from api.config import load_catalog_meta
+        meta = load_catalog_meta(str(config_dir))
+
+        api_app.app.state.repo = self.repo
+        api_app.app.state.meta = meta
+        api_app.app.state.evidence_dir = str(self.tmp_dir / ".state" / "evidence")
+
+        self.client = TestClient(api_app.app, raise_server_exceptions=False)
+        self.headers = {"X-API-Key": "test-key"}
+
+        # Enrichable contract (has core_uuid + operator party with core_uuid)
+        self.enrich_id, self.enrich_uuid, self.operator_uuid = (
+            _insert_enrichable_contract(self.repo)
+        )
+        # Plain contract (no core_uuid, for fail-closed test)
+        self.plain_id = _insert_contract(self.repo, self.tmp_dir)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _apply(self, contract_id, payload, event_type="TERMS_SUBMITTED",
+               new_state="SUBMITTED", idem_suffix=None):
+        """Helper: POST /actions/apply and return (response, data)."""
+        idem_key = "enrich:{}:{}:{}".format(
+            event_type, contract_id, idem_suffix or str(uuid.uuid4())
+        )
+        body = {
+            "work_item_id": contract_id,
+            "action_type": "TRANSITION",
+            "event_type": event_type,
+            "new_state": new_state,
+            "payload": payload,
+            "idempotency_key": idem_key,
+        }
+        resp = self.client.post("/api/v1/actions/apply", json=body, headers=self.headers)
+        return resp, resp.json()
+
+    # -------------------------------------------------------------------
+    # Test 14: Minimal payload succeeds — enrichment fills required fields
+    # -------------------------------------------------------------------
+    def test_14_minimal_payload_succeeds(self) -> None:
+        """POST with only {commodity: RBDPO} succeeds; enrichment fills trade_id,
+        actor_org_id, payment_terms, delivery_term, delivery_location."""
+        resp, data = self._apply(self.enrich_id, {"commodity": "RBDPO"})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertTrue(data["applied"])
+        self.assertFalse(data["deduped"])
+        # Enrichment report shows fields were added
+        self.assertIn("enrichment", data)
+        enrichment = data["enrichment"]
+        self.assertIn("fields_added", enrichment)
+        self.assertIn("trade_id", enrichment["fields_added"])
+        self.assertIn("actor_org_id", enrichment["fields_added"])
+
+    # -------------------------------------------------------------------
+    # Test 15: trade_id auto-populated as UUID from entity core_uuid
+    # -------------------------------------------------------------------
+    def test_15_trade_id_auto_populated_as_uuid(self) -> None:
+        """trade_id in event_log matches entity's core_uuid (UUID format), not ULID."""
+        resp, data = self._apply(self.enrich_id, {"commodity": "RBDPO"})
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        # Fetch the event payload from event_log
+        conn = self.repo._connect()
+        try:
+            row = conn.execute(
+                "SELECT payload_json FROM event_log WHERE event_id = ?",
+                (data["event_id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        payload_recorded = json.loads(row["payload_json"])
+        recorded_trade_id = payload_recorded.get("trade_id", "")
+        # Must match the entity's core_uuid (UUID format)
+        self.assertEqual(recorded_trade_id, self.enrich_uuid)
+        # Must be a valid UUID format (dashes, 36 chars)
+        self.assertEqual(len(recorded_trade_id), 36)
+        self.assertEqual(recorded_trade_id.count("-"), 4)
+
+    # -------------------------------------------------------------------
+    # Test 16: Caller-provided values are NOT overwritten
+    # -------------------------------------------------------------------
+    def test_16_caller_values_not_overwritten(self) -> None:
+        """Explicit trade_id and actor_org_id from caller are preserved, not replaced."""
+        caller_trade_id = str(uuid.uuid4())
+        caller_org_id = str(uuid.uuid4())
+        payload = {
+            "trade_id": caller_trade_id,
+            "payload": {
+                "actor_org_id": caller_org_id,
+                "payment_terms": "NET60",
+                "delivery_term": "CIF",
+                "delivery_location": "Abuja",
+            },
+        }
+        resp, data = self._apply(self.enrich_id, payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        # Fetch recorded payload
+        conn = self.repo._connect()
+        try:
+            row = conn.execute(
+                "SELECT payload_json FROM event_log WHERE event_id = ?",
+                (data["event_id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        recorded = json.loads(row["payload_json"])
+        # Caller's values must be preserved
+        self.assertEqual(recorded["trade_id"], caller_trade_id)
+        self.assertEqual(recorded["payload"]["actor_org_id"], caller_org_id)
+        self.assertEqual(recorded["payload"]["payment_terms"], "NET60")
+        self.assertEqual(recorded["payload"]["delivery_term"], "CIF")
+
+        # Enrichment report should show no fields were added for these
+        self.assertNotIn("trade_id", data["enrichment"]["fields_added"])
+        self.assertNotIn("actor_org_id", data["enrichment"]["fields_added"])
+
+    # -------------------------------------------------------------------
+    # Test 17: Enrichment report included in receipt
+    # -------------------------------------------------------------------
+    def test_17_enrichment_report_in_receipt(self) -> None:
+        """Receipt includes enrichment.fields_added showing what was populated and from where."""
+        resp, data = self._apply(self.enrich_id, {})
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        self.assertIn("enrichment", data)
+        enrichment = data["enrichment"]
+        self.assertIn("fields_added", enrichment)
+        self.assertIn("missing_after_enrichment", enrichment)
+        self.assertIsInstance(enrichment["fields_added"], dict)
+        self.assertIsInstance(enrichment["missing_after_enrichment"], list)
+
+        # trade_id must be attributed to entity.core_uuid
+        self.assertIn("trade_id", enrichment["fields_added"])
+        self.assertIn("core_uuid", enrichment["fields_added"]["trade_id"])
+
+        # actor_org_id must be attributed to entity.operator_uuid
+        self.assertIn("actor_org_id", enrichment["fields_added"])
+        self.assertIn("operator_uuid", enrichment["fields_added"]["actor_org_id"])
+
+    # -------------------------------------------------------------------
+    # Test 18: schema_ok=1 after enrichment for TERMS_SUBMITTED
+    # -------------------------------------------------------------------
+    def test_18_schema_ok_1_after_enrichment(self) -> None:
+        """Enriched payload for TERMS_SUBMITTED passes full validation → schema_ok=1."""
+        resp, data = self._apply(self.enrich_id, {})
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        # Verify schema_ok=1 in the event_log row
+        conn = self.repo._connect()
+        try:
+            row = conn.execute(
+                "SELECT schema_ok FROM event_log WHERE event_id = ?",
+                (data["event_id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(row["schema_ok"], 1)
+        self.assertEqual(data["schema_ok"], 1)
+        # No missing fields in the enrichment report
+        self.assertEqual(data["enrichment"]["missing_after_enrichment"], [])
+
+    # -------------------------------------------------------------------
+    # Test 19: Fail-closed — validator rejects if enrichment can't fill all fields
+    # -------------------------------------------------------------------
+    def test_19_fail_closed_missing_fields(self) -> None:
+        """If entity has no core_uuid, trade_id enrichment falls back to ULID (not UUID)
+        → UUID validation fails → 422. Enrichment doesn't invent data it doesn't have."""
+        # plain_id contract has no core_uuid → trade_id enrichment gives ULID
+        resp, data = self._apply(self.plain_id, {})
+        self.assertEqual(resp.status_code, 422, resp.text)
+        # Must be a schema validation error (not a generic error)
+        self.assertIn("errors", data.get("detail", {}))
+
+    # -------------------------------------------------------------------
+    # Test 20: Enrichment doesn't break existing TRANSITION flow
+    # -------------------------------------------------------------------
+    def test_20_enrichment_doesnt_break_existing_flow(self) -> None:
+        """Existing fully-specified payloads still work correctly under enrichment.
+
+        When the caller provides all required fields, enrichment is a no-op
+        and the response is identical in structure to pre-enrichment behaviour.
+        """
+        caller_trade_id = str(uuid.uuid4())
+        caller_org_id = str(uuid.uuid4())
+        payload = {
+            "trade_id": caller_trade_id,
+            "payload": {
+                "actor_org_id": caller_org_id,
+                "payment_terms": "NET30",
+                "delivery_term": "DAP",
+                "delivery_location": "Lagos",
+            },
+        }
+        idem_key = "enrich:compat:{}:{}".format(self.enrich_id, uuid.uuid4())
+        body = {
+            "work_item_id": self.enrich_id,
+            "action_type": "TRANSITION",
+            "event_type": "TERMS_SUBMITTED",
+            "new_state": "SUBMITTED",
+            "payload": payload,
+            "idempotency_key": idem_key,
+        }
+        resp = self.client.post("/api/v1/actions/apply", json=body, headers=self.headers)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+        # Core receipt fields present
+        for f in ["event_id", "event_type", "entity_type", "entity_id",
+                  "content_hash", "idempotency_key", "schema_ok", "created_at"]:
+            self.assertIn(f, data)
+        self.assertTrue(data["applied"])
+        self.assertFalse(data["deduped"])
+        self.assertEqual(data["schema_ok"], 1)
+        # Enrichment report present but fields_added is empty (caller provided everything)
+        self.assertIn("enrichment", data)
+        self.assertNotIn("trade_id", data["enrichment"]["fields_added"])
+        self.assertNotIn("actor_org_id", data["enrichment"]["fields_added"])
+
+
 if __name__ == "__main__":
     unittest.main()
