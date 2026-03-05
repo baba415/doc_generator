@@ -54,6 +54,7 @@ class Receipt(CanonicalBase):
     applied: bool
     deduped: bool
     data_source: str = "PILOT"
+    new_state: Optional[str] = None  # populated for TRANSITION actions
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +77,23 @@ class EvidenceLinkResponse(BaseModel):
     evidence_id: str
     url: str
     expires_at: Optional[str] = None
+
+
+class EvidenceItem(BaseModel):
+    evidence_id: str
+    evidence_kind: str
+    status: str
+    content_hash: Optional[str] = None
+    filename: Optional[str] = None
+    submitted_at: Optional[str] = None
+    verified_at: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class EvidenceListResponse(CanonicalBase):
+    entity_id: str
+    items: list[EvidenceItem]
+    total: int
 
 
 # ---------------------------------------------------------------------------

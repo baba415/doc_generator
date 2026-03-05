@@ -1,14 +1,17 @@
-"""POST /api/v1/evidence — multipart upload.
-GET  /api/v1/evidence/{evidence_id}/link — evidence URL (pilot-only).
+"""POST /api/v1/evidence         — multipart upload.
+GET  /api/v1/evidence           — list evidence items for an entity (?entity_id=X).
+GET  /api/v1/evidence/{id}/link — evidence URL (pilot-only).
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import uuid
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 
 from api.auth import verify_api_key
 
@@ -44,6 +47,71 @@ def _build_receipt(repo, event_id: str, deduped: bool, meta: dict) -> dict:
         "schema_version": meta["schema_version"],
         "core_requirements_ref": meta["core_requirements_ref"],
         "core_event_requirements_hash": meta["core_event_requirements_hash"],
+    }
+
+
+@router.get("/api/v1/evidence")
+async def list_evidence(
+    entity_id: str = Query(..., description="Entity ID to fetch evidence for"),
+    request: Request = None,
+) -> dict:
+    """Return all evidence items for an entity with event-sourced metadata."""
+    repo = request.app.state.repo
+    meta = request.app.state.meta
+
+    conn = repo._connect()
+    try:
+        ev_rows = conn.execute(
+            "SELECT * FROM evidence_originals "
+            "WHERE contract_id = ? OR delivery_id = ?",
+            (entity_id, entity_id),
+        ).fetchall()
+        # All PREP_EVIDENCE events for this entity (to get submitted_at and notes)
+        event_rows = conn.execute(
+            "SELECT payload_json, created_at FROM event_log "
+            "WHERE entity_id = ? AND event_type LIKE 'pilot:evidence:%' "
+            "ORDER BY created_at ASC",
+            (entity_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # Build evidence_id → event metadata lookup
+    ev_event_map = {}
+    for er in event_rows:
+        try:
+            p = json.loads(er["payload_json"] or "{}")
+            eid = p.get("evidence_id")
+            if eid and eid not in ev_event_map:
+                ev_event_map[eid] = {
+                    "note": p.get("note"),
+                    "submitted_at": er["created_at"],
+                }
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    items = []
+    for row in ev_rows:
+        ev_id = row["evidence_id"]
+        ev_meta = ev_event_map.get(ev_id, {})
+        items.append({
+            "evidence_id": ev_id,
+            "evidence_kind": row["doc_type"] or "",
+            "status": row["link_status"] or "UNLINKED",
+            "content_hash": row["sha256"],
+            "filename": row["file_name"],
+            "submitted_at": ev_meta.get("submitted_at") or row["created_at"],
+            "verified_at": None,
+            "notes": ev_meta.get("note"),
+        })
+
+    return {
+        "schema_version": meta["schema_version"],
+        "core_requirements_ref": meta["core_requirements_ref"],
+        "core_event_requirements_hash": meta["core_event_requirements_hash"],
+        "entity_id": entity_id,
+        "items": items,
+        "total": len(items),
     }
 
 

@@ -42,7 +42,9 @@ def _resolve_entity(repo, work_item_id: str) -> tuple[str, str, str, str] | None
     return None
 
 
-def _build_receipt(repo, event_id: str, deduped: bool, meta: dict) -> dict:
+def _build_receipt(
+    repo, event_id: str, deduped: bool, meta: dict, new_state=None
+) -> dict:
     """Fetch event row and build full API receipt (§2.2 + enrichments)."""
     conn = repo._connect()
     try:
@@ -71,6 +73,7 @@ def _build_receipt(repo, event_id: str, deduped: bool, meta: dict) -> dict:
         "applied": True,
         "deduped": deduped,
         "data_source": "PILOT",
+        "new_state": new_state,
         # canonical trio
         "schema_version": meta["schema_version"],
         "core_requirements_ref": meta["core_requirements_ref"],
@@ -161,4 +164,6 @@ async def apply_action(body: ApplyActionRequest, request: Request) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return _build_receipt(repo, result["event_id"], result["deduped"], meta)
+    receipt_new_state = body.new_state if body.action_type == "TRANSITION" else None
+    return _build_receipt(repo, result["event_id"], result["deduped"], meta,
+                          new_state=receipt_new_state)

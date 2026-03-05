@@ -271,6 +271,9 @@ class TestMerchantPilotAPI(unittest.TestCase):
         self.assertTrue(data["applied"])
         self.assertFalse(data["deduped"])
         self.assertEqual(data["data_source"], "PILOT")
+        # new_state present and matches what was requested
+        self.assertIn("new_state", data)
+        self.assertEqual(data["new_state"], "ACTIVE")
         # canonical trio
         self.assertIn("schema_version", data)
         self.assertIn("core_requirements_ref", data)
@@ -549,6 +552,49 @@ class TestMerchantPilotAPI(unittest.TestCase):
         }
         resp = self.client.post("/api/v1/actions/apply", json=body, headers=self.headers)
         self.assertEqual(resp.status_code, 404)
+
+    # -----------------------------------------------------------------------
+    # Test 13: Evidence list returns items for a known entity
+    # -----------------------------------------------------------------------
+    def test_13_evidence_list_returns_items(self) -> None:
+        """GET /evidence?entity_id=X returns EvidenceItem[] with required fields."""
+        # Upload evidence first so there's at least one item
+        idem_key = f"ui:{self.contract_id}:ev-list:{uuid.uuid4()}"
+        file_content = b"Evidence list test document"
+        upload_resp = self.client.post(
+            "/api/v1/evidence",
+            headers=self.headers,
+            data={
+                "entity_type": "trade",
+                "entity_id": self.contract_id,
+                "evidence_kind": "waybill",
+                "idempotency_key": idem_key,
+                "note": "list test note",
+            },
+            files={"file": ("waybill.pdf", file_content, "application/pdf")},
+        )
+        self.assertEqual(upload_resp.status_code, 200, upload_resp.text)
+
+        # Now list evidence for this entity
+        resp = self.client.get(
+            f"/api/v1/evidence?entity_id={self.contract_id}", headers=self.headers
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        data = resp.json()
+
+        # canonical trio present
+        self.assertIn("schema_version", data)
+        self.assertIn("core_requirements_ref", data)
+        self.assertIn("core_event_requirements_hash", data)
+        self.assertEqual(data["entity_id"], self.contract_id)
+        self.assertGreater(data["total"], 0)
+
+        # Each item has required EvidenceItem fields
+        item = data["items"][0]
+        for field in ["evidence_id", "evidence_kind", "status", "filename", "submitted_at"]:
+            self.assertIn(field, item, f"Missing EvidenceItem field: {field}")
+        self.assertEqual(item["evidence_kind"], "waybill")
+        self.assertEqual(item["status"], "UNLINKED")
 
 
 if __name__ == "__main__":
