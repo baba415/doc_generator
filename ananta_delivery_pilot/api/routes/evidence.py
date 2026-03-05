@@ -1,15 +1,23 @@
-"""POST /api/v1/evidence         — multipart upload.
+"""POST /api/v1/evidence         — multipart upload (PREP_EVIDENCE).
 GET  /api/v1/evidence           — list evidence items for an entity (?entity_id=X).
-GET  /api/v1/evidence/{id}/link — evidence URL (pilot-only).
+GET  /api/v1/evidence/{id}/link — short-lived evidence URL (pilot-only, §5.2).
+
+§1.4 compliance: no direct SQL for operational data. apply_prep_evidence()
+writes the event atomically; file is stored on disk as a binary blob.
+
+§3.2 compliance: idempotency is checked BEFORE any file or DB write. Evidence_id
+is derived deterministically from idempotency_key so the payload hash is stable
+across retries — enabling true dedup instead of conflict.
+
+Event_log IS the truth for evidence metadata. evidence_originals is not used
+by this API.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
 import uuid
 from pathlib import Path
-from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 
@@ -18,8 +26,42 @@ from api.auth import verify_api_key
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _deterministic_uuid(key: str) -> str:
+    """Derive a stable UUID from a string (SHA-256 → first 16 bytes).
+
+    Same key always produces the same UUID — required so that evidence_id is
+    stable across retries and the payload canonical hash doesn't drift.
+    """
+    h = hashlib.sha256(key.encode()).digest()[:16]
+    return str(uuid.UUID(bytes=h))
+
+
+def _entity_exists(repo, entity_type: str, entity_id: str) -> bool:
+    """Return True if the entity exists in the appropriate truth table."""
+    _TABLE_MAP = {
+        "trade": ("contracts", "contract_id"),
+        "contract": ("contracts", "contract_id"),
+        "delivery": ("deliveries", "delivery_id"),
+    }
+    entry = _TABLE_MAP.get(entity_type)
+    if entry is None:
+        return False
+    table, pk = entry
+    conn = repo._connect()
+    try:
+        return conn.execute(
+            f"SELECT 1 FROM {table} WHERE {pk} = ?", (entity_id,)
+        ).fetchone() is not None
+    finally:
+        conn.close()
 
 
 def _build_receipt(repo, event_id: str, deduped: bool, meta: dict) -> dict:
@@ -44,29 +86,32 @@ def _build_receipt(repo, event_id: str, deduped: bool, meta: dict) -> dict:
         "applied": True,
         "deduped": deduped,
         "data_source": "PILOT",
+        "new_state": None,
         "schema_version": meta["schema_version"],
         "core_requirements_ref": meta["core_requirements_ref"],
         "core_event_requirements_hash": meta["core_event_requirements_hash"],
     }
 
 
+# ---------------------------------------------------------------------------
+# GET /api/v1/evidence
+# ---------------------------------------------------------------------------
+
 @router.get("/api/v1/evidence")
 async def list_evidence(
     entity_id: str = Query(..., description="Entity ID to fetch evidence for"),
     request: Request = None,
 ) -> dict:
-    """Return all evidence items for an entity with event-sourced metadata."""
+    """Return all evidence items for an entity, sourced from event_log.
+
+    Evidence metadata lives in PREP_EVIDENCE event payloads — the event IS
+    the authoritative record (§1.3, §1.4).
+    """
     repo = request.app.state.repo
     meta = request.app.state.meta
 
     conn = repo._connect()
     try:
-        ev_rows = conn.execute(
-            "SELECT * FROM evidence_originals "
-            "WHERE contract_id = ? OR delivery_id = ?",
-            (entity_id, entity_id),
-        ).fetchall()
-        # All PREP_EVIDENCE events for this entity (to get submitted_at and notes)
         event_rows = conn.execute(
             "SELECT payload_json, created_at FROM event_log "
             "WHERE entity_id = ? AND event_type LIKE 'pilot:evidence:%' "
@@ -76,33 +121,21 @@ async def list_evidence(
     finally:
         conn.close()
 
-    # Build evidence_id → event metadata lookup
-    ev_event_map = {}
+    items = []
     for er in event_rows:
         try:
             p = json.loads(er["payload_json"] or "{}")
-            eid = p.get("evidence_id")
-            if eid and eid not in ev_event_map:
-                ev_event_map[eid] = {
-                    "note": p.get("note"),
-                    "submitted_at": er["created_at"],
-                }
         except (json.JSONDecodeError, TypeError):
-            pass
-
-    items = []
-    for row in ev_rows:
-        ev_id = row["evidence_id"]
-        ev_meta = ev_event_map.get(ev_id, {})
+            continue
         items.append({
-            "evidence_id": ev_id,
-            "evidence_kind": row["doc_type"] or "",
-            "status": row["link_status"] or "UNLINKED",
-            "content_hash": row["sha256"],
-            "filename": row["file_name"],
-            "submitted_at": ev_meta.get("submitted_at") or row["created_at"],
+            "evidence_id": p.get("evidence_id", ""),
+            "evidence_kind": p.get("evidence_kind", ""),
+            "status": "UNLINKED",
+            "content_hash": p.get("content_hash"),
+            "filename": p.get("filename"),
+            "submitted_at": er["created_at"],
             "verified_at": None,
-            "notes": ev_meta.get("note"),
+            "notes": p.get("note"),
         })
 
     return {
@@ -115,6 +148,10 @@ async def list_evidence(
     }
 
 
+# ---------------------------------------------------------------------------
+# POST /api/v1/evidence
+# ---------------------------------------------------------------------------
+
 @router.post("/api/v1/evidence")
 async def upload_evidence(
     request: Request,
@@ -125,71 +162,81 @@ async def upload_evidence(
     idempotency_key: str = Form(...),
     note: str = Form(""),
 ) -> dict:
-    from domain.event_ledger import IdempotencyConflictError, SchemaValidationError
+    from domain.event_ledger import (
+        IdempotencyConflictError,
+        SchemaValidationError,
+        canonical_hash,
+    )
 
     repo = request.app.state.repo
     meta = request.app.state.meta
-    evidence_dir = Path(request.app.state.evidence_dir)
-    evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    # FIX 4: check entity exists before any processing
+    if not _entity_exists(repo, entity_type, entity_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Entity {entity_type}:{entity_id!r} not found",
+        )
 
     content = await file.read()
-    content_hash = _sha256_bytes(content)
+    file_hash = _sha256_bytes(content)
     size_bytes = len(content)
-    evidence_id = str(uuid.uuid4())
     original_filename = file.filename or "upload"
-    stored_filename = f"{evidence_id}_{original_filename}"
-    stored_path = evidence_dir / stored_filename
-    stored_path.write_bytes(content)
 
-    # Insert evidence_originals record (entity creation, not a state mutation)
-    now_str = _now_iso()
-    conn = repo._connect()
-    try:
-        contract_id_val = entity_id if entity_type in ("trade", "contract") else None
-        delivery_id_val = entity_id if entity_type == "delivery" else None
-        conn.execute(
-            """
-            INSERT INTO evidence_originals (
-                evidence_id, contract_id, delivery_id,
-                file_name, doc_type, link_status,
-                source_path, stored_path, sha256,
-                captured_at, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'UNLINKED', ?, ?, ?, ?, ?)
-            """,
-            (
-                evidence_id,
-                contract_id_val,
-                delivery_id_val,
-                original_filename,
-                evidence_kind,
-                str(stored_path),
-                str(stored_path),
-                content_hash,
-                now_str,
-                now_str,
-            ),
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass  # duplicate evidence_id — tolerate
-    finally:
-        conn.close()
+    # FIX 2: deterministic evidence_id — same idempotency_key → same UUID
+    evidence_id = _deterministic_uuid(idempotency_key)
+    evidence_dir = Path(request.app.state.evidence_dir)
+    stored_path = evidence_dir / f"{evidence_id}_{original_filename}"
 
-    # Record PREP_EVIDENCE event
+    # Build payload deterministically before any I/O
     payload = {
         "evidence_id": evidence_id,
         "entity_type": entity_type,
         "entity_id": entity_id,
         "evidence_kind": evidence_kind,
         "filename": original_filename,
-        "content_hash": content_hash,
+        "content_hash": file_hash,
         "size_bytes": size_bytes,
         "storage_ref": str(stored_path),
         "note": note or None,
         "source_system": "api",
     }
 
+    # FIX 2: idempotency check BEFORE any file or DB write
+    c_hash = canonical_hash(payload)
+    idem_status, idem_val = repo._check_idempotency(idempotency_key, c_hash)
+
+    if idem_status == "dedup":
+        # Return original receipt with no file write and no DB write (§3.2)
+        receipt = _build_receipt(repo, idem_val, True, meta)
+        receipt["evidence_ref"] = {
+            "evidence_id": evidence_id,
+            "storage_ref": str(stored_path),
+            "filename": original_filename,
+            "content_hash": file_hash,
+            "size_bytes": size_bytes,
+        }
+        return receipt
+
+    if idem_status == "conflict":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Idempotency conflict",
+                "idempotency_key": idempotency_key,
+                "existing_hash": idem_val,
+                "new_hash": c_hash,
+            },
+        )
+
+    # NEW path: write file, then record event atomically (FIX 1 — no direct SQL)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    stored_path.write_bytes(content)
+
     try:
+        # FIX 1: apply_prep_evidence with evidence_updates={} records the event
+        # atomically without any direct SQL INSERT/UPDATE on truth tables.
+        # The event payload IS the authoritative evidence record.
         result = repo.apply_prep_evidence(
             event_type="pilot:evidence:uploaded",
             entity_type=entity_type,
@@ -221,21 +268,29 @@ async def upload_evidence(
         "evidence_id": evidence_id,
         "storage_ref": str(stored_path),
         "filename": original_filename,
-        "content_hash": content_hash,
+        "content_hash": file_hash,
         "size_bytes": size_bytes,
     }
     return receipt
 
 
+# ---------------------------------------------------------------------------
+# GET /api/v1/evidence/{evidence_id}/link
+# ---------------------------------------------------------------------------
+
 @router.get("/api/v1/evidence/{evidence_id}/link")
 async def evidence_link(evidence_id: str, request: Request) -> dict:
+    """Return file URL for evidence — looked up from event_log payload (§5.2)."""
     repo = request.app.state.repo
-    evidence_dir = Path(request.app.state.evidence_dir)
+    meta = request.app.state.meta
 
     conn = repo._connect()
     try:
         row = conn.execute(
-            "SELECT stored_path, file_name FROM evidence_originals WHERE evidence_id = ?",
+            "SELECT payload_json FROM event_log "
+            "WHERE event_type LIKE 'pilot:evidence:%' "
+            "AND json_extract(payload_json, '$.evidence_id') = ? "
+            "LIMIT 1",
             (evidence_id,),
         ).fetchone()
     finally:
@@ -244,15 +299,17 @@ async def evidence_link(evidence_id: str, request: Request) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail=f"Evidence {evidence_id!r} not found")
 
-    stored_path = row["stored_path"]
-    url = f"file://{stored_path}"
+    try:
+        storage_ref = json.loads(row["payload_json"] or "{}").get("storage_ref", "")
+    except (json.JSONDecodeError, TypeError):
+        storage_ref = ""
+
     return {
         "evidence_id": evidence_id,
-        "url": url,
+        "url": f"file://{storage_ref}",
         "expires_at": None,
+        # FIX 3: canonical trio on every response (§6.3)
+        "schema_version": meta["schema_version"],
+        "core_requirements_ref": meta["core_requirements_ref"],
+        "core_event_requirements_hash": meta["core_event_requirements_hash"],
     }
-
-
-def _now_iso() -> str:
-    from core.time import utc_now_iso_z
-    return utc_now_iso_z()

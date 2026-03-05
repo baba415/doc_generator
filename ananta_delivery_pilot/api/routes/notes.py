@@ -7,6 +7,25 @@ from api.models.requests import NoteRequest
 router = APIRouter(dependencies=[Depends(verify_api_key)])
 
 
+def _entity_exists(repo, entity_type: str, entity_id: str) -> bool:
+    _TABLE_MAP = {
+        "trade": ("contracts", "contract_id"),
+        "contract": ("contracts", "contract_id"),
+        "delivery": ("deliveries", "delivery_id"),
+    }
+    entry = _TABLE_MAP.get(entity_type)
+    if entry is None:
+        return False
+    table, pk = entry
+    conn = repo._connect()
+    try:
+        return conn.execute(
+            f"SELECT 1 FROM {table} WHERE {pk} = ?", (entity_id,)
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
 def _build_receipt(repo, event_id: str, deduped: bool, meta: dict) -> dict:
     conn = repo._connect()
     try:
@@ -29,6 +48,7 @@ def _build_receipt(repo, event_id: str, deduped: bool, meta: dict) -> dict:
         "applied": True,
         "deduped": deduped,
         "data_source": "PILOT",
+        "new_state": None,
         "schema_version": meta["schema_version"],
         "core_requirements_ref": meta["core_requirements_ref"],
         "core_event_requirements_hash": meta["core_event_requirements_hash"],
@@ -41,6 +61,13 @@ async def add_note(body: NoteRequest, request: Request) -> dict:
 
     repo = request.app.state.repo
     meta = request.app.state.meta
+
+    # FIX 4: check entity exists before processing
+    if not _entity_exists(repo, body.entity_type, body.entity_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Entity {body.entity_type}:{body.entity_id!r} not found",
+        )
 
     payload = {
         "entity_type": body.entity_type,

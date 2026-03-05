@@ -392,40 +392,77 @@ class TestMerchantPilotAPI(unittest.TestCase):
         self.assertGreater(len(detail["errors"]), 0)
 
     # -----------------------------------------------------------------------
-    # Test 8: Evidence upload
+    # Test 8: Evidence upload (+ dedup + entity 404 + link canonical trio)
     # -----------------------------------------------------------------------
     def test_8_evidence_upload(self) -> None:
-        """POST /evidence with file → receipt + evidence_ref block."""
+        """POST /evidence with file → receipt + evidence_ref block.
+
+        Also covers:
+        - Same idempotency_key twice → deduped=true on second call (FIX 2)
+        - Nonexistent entity → 404 (FIX 4)
+        - GET /evidence/{id}/link → includes canonical trio (FIX 3)
+        """
         idem_key = f"ui:{self.contract_id}:evidence:{uuid.uuid4()}"
         file_content = b"Test evidence document content"
+        common_data = {
+            "entity_type": "trade",
+            "entity_id": self.contract_id,
+            "evidence_kind": "invoice",
+            "idempotency_key": idem_key,
+            "note": "Test evidence upload",
+        }
+
+        # First upload
         resp = self.client.post(
             "/api/v1/evidence",
             headers=self.headers,
-            data={
-                "entity_type": "trade",
-                "entity_id": self.contract_id,
-                "evidence_kind": "invoice",
-                "idempotency_key": idem_key,
-                "note": "Test evidence upload",
-            },
+            data=common_data,
             files={"file": ("test_invoice.pdf", file_content, "application/pdf")},
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         data = resp.json()
-        # §2.2 receipt fields
         self.assertIn("event_id", data)
         self.assertTrue(data["applied"])
         self.assertFalse(data["deduped"])
         self.assertEqual(data["data_source"], "PILOT")
-        # evidence_ref block (§5.1)
         self.assertIn("evidence_ref", data)
         ev_ref = data["evidence_ref"]
-        self.assertIn("evidence_id", ev_ref)
-        self.assertIn("storage_ref", ev_ref)
-        self.assertIn("filename", ev_ref)
-        self.assertIn("content_hash", ev_ref)
-        self.assertIn("size_bytes", ev_ref)
+        for field in ["evidence_id", "storage_ref", "filename", "content_hash", "size_bytes"]:
+            self.assertIn(field, ev_ref, f"Missing evidence_ref field: {field}")
         self.assertEqual(ev_ref["size_bytes"], len(file_content))
+        evidence_id = ev_ref["evidence_id"]
+
+        # Second upload — same key → deduped (FIX 2: deterministic id, pre-flight check)
+        resp2 = self.client.post(
+            "/api/v1/evidence",
+            headers=self.headers,
+            data=common_data,
+            files={"file": ("test_invoice.pdf", file_content, "application/pdf")},
+        )
+        self.assertEqual(resp2.status_code, 200, resp2.text)
+        data2 = resp2.json()
+        self.assertTrue(data2["deduped"])
+        self.assertEqual(data2["event_id"], data["event_id"])
+
+        # Nonexistent entity → 404 (FIX 4)
+        resp3 = self.client.post(
+            "/api/v1/evidence",
+            headers=self.headers,
+            data={**common_data, "entity_id": "no-such-entity"},
+            files={"file": ("x.pdf", b"x", "application/pdf")},
+        )
+        self.assertEqual(resp3.status_code, 404)
+
+        # GET /evidence/{id}/link includes canonical trio (FIX 3)
+        resp4 = self.client.get(
+            f"/api/v1/evidence/{evidence_id}/link", headers=self.headers
+        )
+        self.assertEqual(resp4.status_code, 200, resp4.text)
+        link_data = resp4.json()
+        for trio_field in ["schema_version", "core_requirements_ref", "core_event_requirements_hash"]:
+            self.assertIn(trio_field, link_data, f"Missing canonical trio field: {trio_field}")
+        self.assertEqual(link_data["evidence_id"], evidence_id)
+        self.assertIn("url", link_data)
 
     # -----------------------------------------------------------------------
     # Test 9: Event trace
@@ -538,10 +575,11 @@ class TestMerchantPilotAPI(unittest.TestCase):
         self.assertEqual(violations, [], f"Settlement fields in action receipt: {violations}")
 
     # -----------------------------------------------------------------------
-    # Test 12: Entity not found
+    # Test 12: Entity not found — apply, notes, evidence all return 404
     # -----------------------------------------------------------------------
     def test_12_entity_not_found(self) -> None:
-        """Apply action on nonexistent entity → 404."""
+        """Apply / notes / evidence upload on nonexistent entity → 404 (FIX 4)."""
+        # actions/apply → 404
         body = {
             "work_item_id": "nonexistent-entity-id-xyz",
             "action_type": "TRANSITION",
@@ -552,6 +590,16 @@ class TestMerchantPilotAPI(unittest.TestCase):
         }
         resp = self.client.post("/api/v1/actions/apply", json=body, headers=self.headers)
         self.assertEqual(resp.status_code, 404)
+
+        # notes → 404
+        note_body = {
+            "entity_type": "trade",
+            "entity_id": "no-such-contract",
+            "note": "This should 404",
+            "idempotency_key": f"cli:nonexistent:note:{uuid.uuid4()}",
+        }
+        resp2 = self.client.post("/api/v1/notes", json=note_body, headers=self.headers)
+        self.assertEqual(resp2.status_code, 404)
 
     # -----------------------------------------------------------------------
     # Test 13: Evidence list returns items for a known entity

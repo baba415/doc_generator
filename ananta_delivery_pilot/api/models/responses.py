@@ -73,7 +73,7 @@ class EvidenceReceipt(Receipt):
     evidence_ref: EvidenceRef
 
 
-class EvidenceLinkResponse(BaseModel):
+class EvidenceLinkResponse(CanonicalBase):
     evidence_id: str
     url: str
     expires_at: Optional[str] = None
