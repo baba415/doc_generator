@@ -4,6 +4,8 @@ All state mutations go through apply_transition / apply_prep_evidence / apply_pr
 """
 from __future__ import annotations
 
+import json as _json
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from api.auth import verify_api_key
@@ -11,6 +13,7 @@ from api.enrichment import (
     build_enrichment_report,
     enrich_common_fields,
     enrich_event_specific_fields,
+    validate_required_after_enrichment,
 )
 from api.models.requests import ApplyActionRequest
 
@@ -118,7 +121,7 @@ def _build_receipt(
 
 @router.post("/api/v1/actions/apply")
 async def apply_action(body: ApplyActionRequest, request: Request) -> dict:
-    from domain.event_ledger import IdempotencyConflictError, SchemaValidationError
+    from domain.event_ledger import IdempotencyConflictError, SchemaValidationError, canonical_hash
 
     repo = request.app.state.repo
     meta = request.app.state.meta
@@ -138,12 +141,55 @@ async def apply_action(body: ApplyActionRequest, request: Request) -> dict:
     # Three-step enrichment (TRANSITION actions only)
     enrichment_report = None
     if body.action_type == "TRANSITION":
+        # FIX 3: Pre-enrichment idempotency check using caller's raw payload hash.
+        # This ensures retries dedup correctly even when entity data has changed
+        # (which would otherwise produce a different enriched hash).
+        raw_hash = canonical_hash(body.payload)
+        conn = repo._connect()
+        try:
+            existing_row = conn.execute(
+                "SELECT event_id, payload_json FROM event_log WHERE idempotency_key = ?",
+                (body.idempotency_key,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if existing_row is not None:
+            stored = _json.loads(existing_row["payload_json"]) if existing_row["payload_json"] else {}
+            stored_caller_hash = stored.get("_caller_payload_hash")
+            if stored_caller_hash is not None:
+                if stored_caller_hash == raw_hash:
+                    # Same caller intent → DEDUP (skip enrichment + apply_transition)
+                    return _build_receipt(
+                        repo, existing_row["event_id"], True, meta,
+                        new_state=body.new_state,
+                    )
+                else:
+                    # Different caller payload for same key → CONFLICT
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "message": "Idempotency conflict",
+                            "idempotency_key": body.idempotency_key,
+                        },
+                    )
+            # stored_caller_hash is None (old event, pre-FIX3) → fall through to apply_transition
+
         payload_after_common, common_added = enrich_common_fields(body.payload, entity_row)
         payload_after_specific, specific_added = enrich_event_specific_fields(
             payload_after_common, entity_row, body.event_type
         )
         enriched_payload = payload_after_specific
-        enrichment_report = build_enrichment_report(common_added, specific_added, missing=[])
+
+        # FIX 2: Populate missing_after_enrichment for observable error reporting
+        missing_after = validate_required_after_enrichment(
+            enriched_payload, body.event_type, repo._validator
+        )
+        enrichment_report = build_enrichment_report(common_added, specific_added, missing=missing_after)
+
+        # FIX 3: Embed caller's raw hash in stored payload so retries can dedup
+        # by caller intent rather than enriched content (entity data may change).
+        enriched_payload["_caller_payload_hash"] = raw_hash
     else:
         enriched_payload = body.payload
 
@@ -195,10 +241,16 @@ async def apply_action(body: ApplyActionRequest, request: Request) -> dict:
             )
 
     except SchemaValidationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail={"errors": exc.errors, "message": str(exc)},
-        )
+        # FIX 2: include enrichment report in 422 detail so caller can see
+        # what was filled and what is still missing after enrichment
+        detail: dict = {"errors": exc.errors, "message": str(exc)}
+        if enrichment_report is not None:
+            detail["enrichment"] = {
+                "enrichment_version": enrichment_report.enrichment_version,
+                "fields_added": enrichment_report.fields_added,
+                "missing_after_enrichment": enrichment_report.missing_after_enrichment,
+            }
+        raise HTTPException(status_code=422, detail=detail)
     except IdempotencyConflictError as exc:
         raise HTTPException(
             status_code=409,

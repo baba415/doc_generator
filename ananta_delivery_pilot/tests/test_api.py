@@ -978,6 +978,82 @@ class TestEnrichment(unittest.TestCase):
         self.assertNotIn("trade_id", data["enrichment"]["fields_added"])
         self.assertNotIn("actor_org_id", data["enrichment"]["fields_added"])
 
+    # -------------------------------------------------------------------
+    # Test 21 (FIX 2): 422 detail includes enrichment report with missing fields
+    # -------------------------------------------------------------------
+    def test_21_422_includes_enrichment_missing_fields(self) -> None:
+        """When enrichment can't fill all required fields, the 422 detail includes
+        enrichment_version, fields_added, and missing_after_enrichment."""
+        # Empty payload for TERMS_SUBMITTED:
+        # enrichment fills trade_id + actor_org_id + payment_terms from entity,
+        # but cannot fill delivery_term or delivery_location (entity has no such columns).
+        resp, data = self._apply(self.enrich_id, {})
+        self.assertEqual(resp.status_code, 422, resp.text)
+        detail = data.get("detail", {})
+
+        # Enrichment report must be in the 422 detail
+        self.assertIn("enrichment", detail)
+        enrichment = detail["enrichment"]
+        self.assertIn("enrichment_version", enrichment)
+        self.assertEqual(enrichment["enrichment_version"], "enrich_v1")
+
+        # missing_after_enrichment must list the fields still missing
+        self.assertIn("missing_after_enrichment", enrichment)
+        missing_str = str(enrichment["missing_after_enrichment"])
+        self.assertIn("delivery_term", missing_str)
+
+        # fields_added shows what WAS successfully enriched
+        self.assertIn("fields_added", enrichment)
+        self.assertIn("trade_id", enrichment["fields_added"])
+
+    # -------------------------------------------------------------------
+    # Test 22 (FIX 3): Entity data change + retry → dedup (not conflict)
+    # -------------------------------------------------------------------
+    def test_22_entity_change_retry_deduplicates(self) -> None:
+        """Same caller payload + same key → DEDUP even if entity data changed between calls.
+
+        Without FIX 3: entity change produces different enriched payload → different hash →
+        apply_transition raises IdempotencyConflictError (409).
+        With FIX 3: pre-enrichment check compares caller's raw hash → same → DEDUP.
+        """
+        suffix = "fix3-entity-change-{}".format(uuid.uuid4())
+        minimal_payload = {"payload": {"delivery_term": "FOB", "delivery_location": "Lagos"}}
+
+        # First call succeeds
+        resp1, data1 = self._apply(self.enrich_id, minimal_payload, idem_suffix=suffix)
+        self.assertEqual(resp1.status_code, 200, resp1.text)
+        event_id_1 = data1["event_id"]
+
+        # Mutate entity data (payment terms changed — would change enriched payload)
+        with self.repo.transaction() as conn:
+            conn.execute(
+                "UPDATE contracts SET due_terms = 'NET60' WHERE contract_id = ?",
+                (self.enrich_id,),
+            )
+
+        # Retry with same key + same caller payload → must DEDUP (not conflict)
+        resp2, data2 = self._apply(self.enrich_id, minimal_payload, idem_suffix=suffix)
+        self.assertEqual(resp2.status_code, 200, resp2.text)
+        self.assertTrue(data2["deduped"], "Expected deduped=true on retry after entity change")
+        self.assertEqual(data2["event_id"], event_id_1, "Dedup must return same event_id")
+
+    # -------------------------------------------------------------------
+    # Test 23 (FIX 3): Different caller payload → conflict (correctly detected)
+    # -------------------------------------------------------------------
+    def test_23_different_payload_same_key_conflicts(self) -> None:
+        """Same key + different caller payload → 409 conflict (correct behaviour)."""
+        suffix = "fix3-conflict-{}".format(uuid.uuid4())
+        payload_a = {"payload": {"delivery_term": "FOB", "delivery_location": "Lagos"}}
+        payload_b = {"payload": {"delivery_term": "CIF", "delivery_location": "Abuja"}}  # different
+
+        resp1, _ = self._apply(self.enrich_id, payload_a, idem_suffix=suffix)
+        self.assertEqual(resp1.status_code, 200, resp1.text)
+
+        resp2, data2 = self._apply(self.enrich_id, payload_b, idem_suffix=suffix)
+        self.assertEqual(resp2.status_code, 409, resp2.text)
+        detail = data2.get("detail", {})
+        self.assertIn("idempotency_key", detail)
+
 
 if __name__ == "__main__":
     unittest.main()
