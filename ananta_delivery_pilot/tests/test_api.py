@@ -1054,6 +1054,75 @@ class TestEnrichment(unittest.TestCase):
         detail = data2.get("detail", {})
         self.assertIn("idempotency_key", detail)
 
+    # -------------------------------------------------------------------
+    # Test 24 (FIX 4): Pre-check conflict path writes JSONL conflict log
+    # -------------------------------------------------------------------
+    def test_24_conflict_writes_jsonl_log(self) -> None:
+        """Pre-enrichment conflict → 409 AND .state/conflicts.jsonl contains the entry.
+
+        §3.5: conflict logs must be written outside the transaction.
+        The pre-enrichment shortcut previously bypassed this logging.
+        """
+        suffix = "fix4-conflict-log-{}".format(uuid.uuid4())
+        payload_a = {"payload": {"delivery_term": "FOB", "delivery_location": "Lagos"}}
+        payload_b = {"payload": {"delivery_term": "CIF", "delivery_location": "Abuja"}}
+
+        # First apply succeeds
+        resp1, _ = self._apply(self.enrich_id, payload_a, idem_suffix=suffix)
+        self.assertEqual(resp1.status_code, 200, resp1.text)
+
+        # Retry with different payload → conflict
+        resp2, data2 = self._apply(self.enrich_id, payload_b, idem_suffix=suffix)
+        self.assertEqual(resp2.status_code, 409, resp2.text)
+
+        # conflicts.jsonl must exist and contain the conflict entry
+        conflicts_path = self.tmp_dir / ".state" / "conflicts.jsonl"
+        self.assertTrue(conflicts_path.exists(), "conflicts.jsonl was not created")
+
+        entries = [json.loads(line) for line in conflicts_path.read_text().splitlines() if line.strip()]
+        # Find entry matching our idempotency_key
+        idem_key = "enrich:TERMS_SUBMITTED:{}:{}".format(self.enrich_id, suffix)
+        matching = [e for e in entries if e.get("idempotency_key") == idem_key]
+        self.assertEqual(len(matching), 1, f"Expected 1 conflict entry, got {len(matching)}")
+
+        entry = matching[0]
+        self.assertIn("timestamp", entry)
+        self.assertIn("action_name", entry)
+        self.assertEqual(entry["entity_id"], self.enrich_id)
+        self.assertIn("existing_content_hash", entry)
+        self.assertIn("new_content_hash", entry)
+        self.assertNotEqual(entry["existing_content_hash"], entry["new_content_hash"])
+
+    # -------------------------------------------------------------------
+    # Test 25 (FIX 5): Dedup receipt includes enrichment block
+    # -------------------------------------------------------------------
+    def test_25_dedup_receipt_includes_enrichment_block(self) -> None:
+        """Pre-enrichment dedup return includes enrichment block (skipped=true).
+
+        Receipt shape must be stable across all outcomes so the UI doesn't
+        need to branch on whether an enrichment key exists.
+        """
+        suffix = "fix5-dedup-enrich-{}".format(uuid.uuid4())
+        payload = {"payload": {"delivery_term": "FOB", "delivery_location": "Lagos"}}
+
+        # First call
+        resp1, _ = self._apply(self.enrich_id, payload, idem_suffix=suffix)
+        self.assertEqual(resp1.status_code, 200, resp1.text)
+
+        # Second call (dedup)
+        resp2, data2 = self._apply(self.enrich_id, payload, idem_suffix=suffix)
+        self.assertEqual(resp2.status_code, 200, resp2.text)
+        self.assertTrue(data2["deduped"])
+
+        # Enrichment block must be present on dedup receipt
+        self.assertIn("enrichment", data2)
+        enrichment = data2["enrichment"]
+        self.assertEqual(enrichment["enrichment_version"], "enrich_v1")
+        self.assertEqual(enrichment["fields_added"], {})
+        self.assertEqual(enrichment["missing_after_enrichment"], [])
+        self.assertTrue(enrichment["skipped"])
+        self.assertEqual(enrichment["reason"], "dedup_precheck")
+
 
 if __name__ == "__main__":
     unittest.main()

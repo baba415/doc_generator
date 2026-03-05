@@ -160,12 +160,34 @@ async def apply_action(body: ApplyActionRequest, request: Request) -> dict:
             if stored_caller_hash is not None:
                 if stored_caller_hash == raw_hash:
                     # Same caller intent → DEDUP (skip enrichment + apply_transition)
-                    return _build_receipt(
+                    # FIX 5: include enrichment block so receipt shape is stable across outcomes
+                    receipt = _build_receipt(
                         repo, existing_row["event_id"], True, meta,
                         new_state=body.new_state,
                     )
+                    receipt["enrichment"] = {
+                        "enrichment_version": "enrich_v1",
+                        "fields_added": {},
+                        "missing_after_enrichment": [],
+                        "skipped": True,
+                        "reason": "dedup_precheck",
+                    }
+                    return receipt
                 else:
                     # Different caller payload for same key → CONFLICT
+                    # FIX 4: write conflict log (§3.5) before returning 409
+                    from core.time import utc_now_iso_z
+                    conflict_entry = {
+                        "timestamp": utc_now_iso_z(),
+                        "idempotency_key": body.idempotency_key,
+                        "action_name": body.event_type,
+                        "entity_id": body.work_item_id,
+                        "existing_content_hash": stored_caller_hash,
+                        "new_content_hash": raw_hash,
+                    }
+                    log_path = repo.db_path.parent / "conflicts.jsonl"
+                    with log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(_json.dumps(conflict_entry) + "\n")
                     raise HTTPException(
                         status_code=409,
                         detail={
