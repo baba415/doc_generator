@@ -20,6 +20,19 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# Import shared replay-readiness definition from domain (same as exporter.py)
+sys.path.insert(0, str(REPO_ROOT))
+try:
+    from domain.exporter import is_replay_ready, EPOCH_TIMESTAMP
+except ImportError:
+    EPOCH_TIMESTAMP = "2026-03-04T00:00:00Z"
+
+    def is_replay_ready(event_row: dict) -> bool:  # type: ignore[misc]
+        return (
+            event_row.get("schema_ok") == 1
+            and event_row.get("validated_against_hash") is not None
+        )
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -39,6 +52,7 @@ def build_report(rows: list[dict], catalog: dict) -> dict:
     event_types_spec = catalog.get("event_types", {})
 
     total = len(rows)
+    post_epoch = [r for r in rows if (r.get("created_at") or "") >= EPOCH_TIMESTAMP]
     issues: list[dict] = []
     by_type: dict[str, dict] = {}
     known_obligations: set[str] = set()
@@ -47,6 +61,10 @@ def build_report(rows: list[dict], catalog: dict) -> dict:
         for ob in spec.get("replay_obligations", []):
             if ob:
                 known_obligations.add(ob)
+
+    # Unified readiness counts using shared is_replay_ready() definition
+    ready_all = sum(1 for r in rows if is_replay_ready(r))
+    ready_post_epoch = sum(1 for r in post_epoch if is_replay_ready(r))
 
     for row in rows:
         etype = row.get("event_type", "UNKNOWN")
@@ -85,37 +103,38 @@ def build_report(rows: list[dict], catalog: dict) -> dict:
                 })
                 entry["warnings"] += 1
 
-            # Check UUID format of event_id
-            event_id = row.get("event_id", "")
-            try:
-                import uuid as _uuid
-                _uuid.UUID(event_id)
-            except (ValueError, AttributeError):
+            # Flag events that are not replay-ready
+            if not is_replay_ready(row):
                 issues.append({
-                    "class": "UUID_FORMAT",
+                    "class": "NOT_REPLAY_READY",
                     "event_type": etype,
-                    "event_id": event_id,
-                    "message": f"event_id={event_id!r} is not a valid UUID",
+                    "event_id": row.get("event_id"),
+                    "message": "schema_ok=0 or missing validated_against_hash",
                 })
                 entry["errors"] += 1
 
     has_errors = any(e["errors"] > 0 for e in by_type.values())
     has_warnings = any(e["warnings"] > 0 for e in by_type.values())
-    total_errors = sum(e["errors"] for e in by_type.values())
-    total_count = max(total, 1)
-    ready_count = total - total_errors
-    readiness_pct = round(ready_count / total_count * 100.0, 1) if total > 0 else 100.0
+    readiness_pct_all = round(ready_all / max(total, 1) * 100.0, 1) if total > 0 else 100.0
+    readiness_pct_post = round(
+        ready_post_epoch / max(len(post_epoch), 1) * 100.0, 1
+    ) if post_epoch else 100.0
 
     return {
         "generated_at": utc_now(),
         "core_requirements_ref": ref,
         "core_requirements_hash": cat_hash,
         "total_events": total,
+        "post_epoch_events": len(post_epoch),
+        "epoch_timestamp": EPOCH_TIMESTAMP,
         "summary": {
             "replay_ready": not has_errors,
             "has_warnings": has_warnings,
             "has_errors": has_errors,
-            "replay_readiness_pct": readiness_pct,
+            "replay_readiness_pct": readiness_pct_all,
+            "replay_readiness_pct_post_epoch": readiness_pct_post,
+            "replay_ready_count": ready_all,
+            "replay_ready_post_epoch_count": ready_post_epoch,
         },
         "by_canonical_event_type": by_type,
         "issues": issues,
@@ -157,8 +176,8 @@ def main() -> None:
             try:
                 raw = conn.execute(
                     "SELECT event_id, event_type, entity_type, entity_id, "
-                    "validated_against_ref, validated_against_hash, replay_obligations, "
-                    "idempotency_key "
+                    "schema_ok, validated_against_ref, validated_against_hash, "
+                    "replay_obligations, idempotency_key, created_at "
                     "FROM event_log WHERE idempotency_key IS NOT NULL"
                 ).fetchall()
                 rows = [dict(r) for r in raw]
@@ -181,8 +200,10 @@ def main() -> None:
 
     print(f"Report written to: {output_path}")
     print(f"Total events: {report['total_events']}")
+    print(f"Post-epoch events: {report['post_epoch_events']}")
     print(f"Replay ready: {report['summary']['replay_ready']}")
-    print(f"Readiness: {report['summary']['replay_readiness_pct']}%")
+    print(f"Readiness (all): {report['summary']['replay_readiness_pct']}%")
+    print(f"Readiness (post-epoch): {report['summary']['replay_readiness_pct_post_epoch']}%")
 
 
 if __name__ == "__main__":

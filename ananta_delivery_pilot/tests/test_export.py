@@ -288,3 +288,111 @@ class ExportTests(unittest.TestCase):
             self.assertTrue(path.exists(), f"{fname} missing on empty DB export")
             data = json.loads(path.read_text())
             self.assertIsInstance(data, dict)
+
+    # ------------------------------------------------------------------
+    # Test 9: Proof-lite and export report identical replay_readiness_pct
+    # ------------------------------------------------------------------
+    def test_9_proof_lite_and_export_agree_on_readiness(self) -> None:
+        """build_replay_readiness_report and proof_lite.build_report must give same readiness %."""
+        import sys
+        from pathlib import Path as _Path
+        repo_root = _Path(__file__).resolve().parents[1]
+        sys.path.insert(0, str(repo_root))
+        from scripts.proof_lite import build_report, load_catalog
+        from domain.exporter import build_replay_readiness_report
+
+        contract_id = self._insert_contract()
+        self._apply_event(contract_id, "agree-1")
+        # Also insert an unknown event type to get schema_ok=0
+        unknown_payload = {"note": "unknown event"}
+        self.repo.apply_transition(
+            event_type="PILOT:UNKNOWN_AGREE",
+            entity_type="contract",
+            entity_id=contract_id,
+            payload=unknown_payload,
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=f"agree-unknown:{contract_id}",
+        )
+
+        # Get exporter readiness
+        export_report = build_replay_readiness_report(self.db_path, self.config_dir)
+        export_pct = export_report["summary"]["replay_readiness_pct"]
+
+        # Get proof_lite readiness
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(str(self.db_path))
+        conn.row_factory = _sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT event_id, event_type, schema_ok, validated_against_ref, "
+            "validated_against_hash, created_at FROM event_log WHERE idempotency_key IS NOT NULL"
+        ).fetchall()]
+        conn.close()
+        catalog = load_catalog(self.config_dir)
+        pl_report = build_report(rows, catalog)
+        pl_pct = pl_report["summary"]["replay_readiness_pct"]
+
+        self.assertEqual(export_pct, pl_pct,
+                         f"Exporter={export_pct}% vs proof_lite={pl_pct}% must match")
+
+    # ------------------------------------------------------------------
+    # Test 10: Epoch-aware metrics: post_epoch_events differs from total
+    # ------------------------------------------------------------------
+    def test_10_epoch_aware_metrics_present(self) -> None:
+        """build_replay_readiness_report includes post_epoch_events and epoch readiness %."""
+        from domain.exporter import build_replay_readiness_report, EPOCH_TIMESTAMP
+
+        contract_id = self._insert_contract()
+        self._apply_event(contract_id, "epoch-1")
+
+        report = build_replay_readiness_report(self.db_path, self.config_dir)
+
+        self.assertIn("post_epoch_events", report)
+        self.assertIn("epoch_timestamp", report)
+        self.assertEqual(report["epoch_timestamp"], EPOCH_TIMESTAMP)
+        self.assertIn("replay_readiness_pct_post_epoch", report["summary"])
+        self.assertIsInstance(report["summary"]["replay_readiness_pct_post_epoch"], float)
+
+    # ------------------------------------------------------------------
+    # Test 11: Diagnostic — existing schema_ok=0 events have useful explanation
+    # ------------------------------------------------------------------
+    def test_11_diagnostic_schema_ok_0_has_explanation(self) -> None:
+        """Schema_ok=0 events (unknown types) get explanation in event_validation_log."""
+        import sqlite3 as _sqlite3
+
+        contract_id = self._insert_contract()
+        self.repo.apply_transition(
+            event_type="TERMS_AUTHORIZED",   # known pilot type, may be unknown in catalog
+            entity_type="contract",
+            entity_id=contract_id,
+            payload={"note": "terms authorized"},
+            table="contracts",
+            pk_column="contract_id",
+            state_column="lpo_state",
+            new_state="ACTIVE",
+            idempotency_key=f"diagnostic:TERMS_AUTHORIZED:{contract_id}",
+        )
+
+        conn = _sqlite3.connect(str(self.db_path))
+        conn.row_factory = _sqlite3.Row
+        rows = conn.execute(
+            "SELECT e.event_type, e.schema_ok, v.explanation_json "
+            "FROM event_log e "
+            "LEFT JOIN event_validation_log v ON e.event_id = v.event_id "
+            "WHERE e.idempotency_key LIKE 'diagnostic:%'"
+        ).fetchall()
+        conn.close()
+
+        self.assertGreater(len(rows), 0)
+        for row in rows:
+            if row["schema_ok"] == 0:
+                # Must have explanation
+                self.assertIsNotNone(
+                    row["explanation_json"],
+                    f"schema_ok=0 event '{row['event_type']}' has no explanation"
+                )
+                exp = json.loads(row["explanation_json"])
+                self.assertIn("schema_ok_reason", exp)
+                self.assertIn("validator_version", exp)

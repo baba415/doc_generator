@@ -797,6 +797,17 @@ CREATE INDEX IF NOT EXISTS idx_human_decisions_case ON human_decisions(exception
 CREATE INDEX IF NOT EXISTS idx_decision_outcomes_case ON decision_outcomes(exception_case_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_event_log_entity ON event_log(entity_type, entity_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_event_log_type_date ON event_log(event_type, as_of_date, created_at);
+
+CREATE TABLE IF NOT EXISTS event_validation_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    validator_version TEXT NOT NULL,
+    catalog_hash TEXT NOT NULL,
+    explanation_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (event_id) REFERENCES event_log(event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_evl_event ON event_validation_log(event_id);
 CREATE INDEX IF NOT EXISTS idx_transport_trucks_partner ON transport_trucks(transport_partner_id, truck_no);
 CREATE INDEX IF NOT EXISTS idx_transport_drivers_partner ON transport_drivers(transport_partner_id, full_name);
 CREATE INDEX IF NOT EXISTS idx_truck_driver_effective ON truck_driver_assignments(transport_truck_id, effective_from, effective_to);
@@ -3475,11 +3486,14 @@ class SQLiteRepo:
         validated_against_hash: str,
         replay_obligations: list[Any] | None = None,
         catalog_match: bool = True,
+        explanation: Any = None,  # ValidationExplanation | None
     ) -> dict[str, Any]:
         """INSERT a new event into event_log. Caller guarantees key is new.
 
         catalog_match=False → schema_ok=0 (pilot-internal / unknown event type).
         The UNIQUE index on idempotency_key is the safety net for races.
+        When schema_ok=0, also writes explanation to event_validation_log.
+        event_log is NOT modified — diagnostics live in event_validation_log.
         """
         event_id = generate_pilot_uuid()
         now = utc_now_iso_z()
@@ -3504,6 +3518,30 @@ class SQLiteRepo:
                 obligations_json, now,
             ),
         )
+        # Persist explanation for schema_ok=0 events (separate table — event_log unchanged)
+        if schema_ok_val == 0 and explanation is not None:
+            exp_dict = {
+                "event_type": explanation.event_type,
+                "validator_version": explanation.validator_version,
+                "catalog_hash": explanation.catalog_hash,
+                "catalog_matched": explanation.catalog_matched,
+                "catalog_required_fields": explanation.catalog_required_fields,
+                "catalog_format_rules": explanation.catalog_format_rules,
+                "fields_present": explanation.fields_present,
+                "fields_missing": explanation.fields_missing,
+                "fields_invalid_format": explanation.fields_invalid_format,
+                "fields_unexpected": explanation.fields_unexpected,
+                "schema_ok_reason": explanation.schema_ok_reason,
+            }
+            conn.execute(
+                """
+                INSERT INTO event_validation_log(
+                    event_id, validator_version, catalog_hash, explanation_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (event_id, explanation.validator_version, explanation.catalog_hash,
+                 json.dumps(exp_dict), now),
+            )
         return {"event_id": event_id, "deduped": False}
 
     def apply_transition(
@@ -3588,6 +3626,7 @@ class SQLiteRepo:
                 validated_against_hash=result.core_requirements_hash,
                 replay_obligations=obligations,
                 catalog_match=result.catalog_match,
+                explanation=result.explanation,
             )
 
     def apply_prep_evidence(
@@ -3676,6 +3715,7 @@ class SQLiteRepo:
                 validated_against_hash=result.core_requirements_hash,
                 replay_obligations=obligations,
                 catalog_match=result.catalog_match,
+                explanation=result.explanation,
             )
 
     def apply_prep_note(
@@ -3748,6 +3788,7 @@ class SQLiteRepo:
                 validated_against_hash=result.core_requirements_hash,
                 replay_obligations=obligations,
                 catalog_match=result.catalog_match,
+                explanation=result.explanation,
             )
 
 
